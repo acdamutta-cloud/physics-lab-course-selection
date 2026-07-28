@@ -1,5 +1,6 @@
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import quote_plus
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -31,14 +32,20 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
     ]
 
-    database_url: str = (
-        "postgresql+asyncpg://physics_lab:physics_lab_dev_password"
-        "@127.0.0.1:5432/physics_lab"
-    )
-    langgraph_database_url: str = (
-        "postgresql://physics_lab:physics_lab_dev_password"
-        "@127.0.0.1:5432/physics_lab"
-    )
+    postgres_host: str = "127.0.0.1"
+    postgres_port: int = Field(default=5432, ge=1, le=65535)
+    postgres_user: str = "postgres"
+    postgres_password: SecretStr = SecretStr("")
+    postgres_db: str = "physics_lab"
+    database_echo: bool = False
+    postgres_sslmode: Literal[
+        "disable",
+        "allow",
+        "prefer",
+        "require",
+        "verify-ca",
+        "verify-full",
+    ] = "disable"
 
     redis_url: str = "redis://127.0.0.1:6379/0"
     celery_broker_url: str = "redis://127.0.0.1:6379/1"
@@ -62,6 +69,33 @@ class Settings(BaseSettings):
     log_json: bool = False
     log_dir: str = "logs"
 
+    @property
+    def sqlalchemy_database_url(self) -> str:
+        username = quote_plus(self.postgres_user)
+        password = quote_plus(self.postgres_password.get_secret_value())
+        database = quote_plus(self.postgres_db)
+        return (
+            f"postgresql+asyncpg://{username}:{password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{database}"
+        )
+
+    @property
+    def sqlalchemy_connect_args(self) -> dict[str, object]:
+        if self.postgres_sslmode == "disable":
+            return {"ssl": False}
+        return {"ssl": self.postgres_sslmode}
+
+    @property
+    def langgraph_database_url(self) -> str:
+        username = quote_plus(self.postgres_user)
+        password = quote_plus(self.postgres_password.get_secret_value())
+        database = quote_plus(self.postgres_db)
+        return (
+            f"postgresql://{username}:{password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{database}"
+            f"?sslmode={self.postgres_sslmode}"
+        )
+
     def validate_runtime_secrets(self) -> None:
         """在需要真实外部服务时检查密钥，避免模块导入阶段直接失败。"""
 
@@ -76,6 +110,8 @@ class Settings(BaseSettings):
         jwt_secret = self.jwt_secret_key.get_secret_value().strip()
         if self.app_env == "production" and not jwt_secret:
             raise ValueError("生产环境必须设置安全的 JWT_SECRET_KEY")
+        if not self.postgres_password.get_secret_value().strip():
+            raise ValueError("必须通过环境变量设置 POSTGRES_PASSWORD")
 
 
 @lru_cache

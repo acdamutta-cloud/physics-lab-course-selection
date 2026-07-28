@@ -1,7 +1,7 @@
 # 物理实验智能排课系统后端
 
 当前目录为 FastAPI + PostgreSQL + Redis + LangGraph + OR-Tools 的后端框架。
-现阶段只完成项目结构和基础环境配置，尚未实现具体业务接口。
+现阶段已包含初始数据库模型与模拟数据脚本，尚未实现具体业务接口。
 
 ## 1. 环境要求
 
@@ -61,7 +61,22 @@ python -m pip install --upgrade pip
 pip install -r requirements-dev.txt
 ```
 
-## 5. 启动 PostgreSQL 和 Redis
+## 5. PostgreSQL 配置
+
+数据库连接由以下环境变量组合生成，代码和日志均不得输出密码：
+
+```dotenv
+POSTGRES_HOST=127.0.0.1
+POSTGRES_PORT=5432
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=
+POSTGRES_DB=physics_lab
+POSTGRES_SSLMODE=disable
+```
+
+如使用本机已经安装的 PostgreSQL，无需启动 Compose。
+
+如使用容器，在 `.env` 中配置密码后执行：
 
 ```powershell
 docker compose up -d postgres redis
@@ -80,7 +95,31 @@ docker compose stop
 docker compose down -v
 ```
 
-## 6. 配置文件位置
+## 6. 初始化数据库
+
+以下命令均在 `backend` 目录执行。建库脚本只会在目标数据库不存在时创建
+数据库，不会删除、清空或覆盖已有数据库。
+
+```powershell
+python -m scripts.init_database
+alembic revision --autogenerate -m "initial schema"
+alembic upgrade head
+python -m scripts.seed_demo_data
+python -m scripts.verify_demo_data
+```
+
+模拟数据使用固定 UUID，可重复执行：
+
+- 10 个明确标注为模拟数据的工科专业；
+- 每个专业 5 个班，每班 40 人；
+- 每个专业 200 人，共 2000 名模拟学生；
+- 同步生成演示所需的课程、实验项目、教师、实验室、设备、规则和草稿排课数据。
+
+如果数据库中只存在一部分模拟数据，脚本会中止并提示人工检查，不会自动
+覆盖或删除已有记录。演示账号初始密码可通过 `DEMO_ACCOUNT_PASSWORD`
+注入，不应写入版本库。
+
+## 7. 配置文件位置
 
 ```text
 app/core/config/settings.py
@@ -90,7 +129,7 @@ app/db/redis_client.py
 app/db/langgraph_checkpoint.py
 ```
 
-## 7. 安全约定
+## 8. 安全约定
 
 - API Key、JWT Secret 和数据库生产密码只通过环境变量或密钥服务注入；
 - 日志不得输出 API Key、JWT、密码或验证码；
