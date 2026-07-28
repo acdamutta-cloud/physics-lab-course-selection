@@ -1,0 +1,68 @@
+# =========================
+# 密钥、环境变量和本地凭据
+# =========================
+.env
+.env.*
+!.env.example
+
+secrets/
+.secrets/
+credentials/
+.credentials/
+
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+credentials*.json
+*_credentials.json
+service-account*.json
+service_account*.json
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# =========================
+# Node / 前端
+# =========================
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# =========================
+# 日志、缓存和本地数据
+# =========================
+logs/
+*.log
+*.pid
+*.sqlite3
+*.db
+tmp/
+temp/
+
+# =========================
+# IDE、系统和本地 Agent 配置
+# =========================
+.idea/
+.vscode/
+.agents/
+.DS_Store
+Thumbs.db

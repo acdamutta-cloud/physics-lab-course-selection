@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+
+# 本地凭据和证书
+secrets/
+.secrets/
+credentials/
+.credentials/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials*.json
+*_credentials.json
+service-account*.json
+service_account*.json
+
+# 测试与检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 构建产物
+build/
+dist/
+*.egg-info/
+
+# 日志和运行文件
+logs/
+*.log
+*.pid
+
+# IDE
+.idea/
+.vscode/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 本地数据库和临时文件
+*.sqlite3
+*.db
+tmp/
+temp/

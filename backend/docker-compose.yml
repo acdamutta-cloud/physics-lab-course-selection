@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: physics-lab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-physics_lab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-physics_lab_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-physics_lab}
+      TZ: Asia/Shanghai
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - physics_lab_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-physics_lab} -d ${POSTGRES_DB:-physics_lab}
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - physics_lab_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: physics-lab-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "6379:6379"
+    volumes:
+      - physics_lab_redis_data:/data
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - physics_lab_network
+
+volumes:
+  physics_lab_postgres_data:
+  physics_lab_redis_data:
+
+networks:
+  physics_lab_network:
+    driver: bridge
