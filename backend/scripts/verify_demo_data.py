@@ -123,14 +123,20 @@ async def main() -> None:
                 indent=2,
             )
         )
-        if counts["majors"] != 10:
-            raise RuntimeError("模拟专业数量应为 10")
-        if counts["students"] != 2000:
-            raise RuntimeError("模拟学生数量应为 2000")
-        if counts["classes"] != 50:
-            raise RuntimeError("模拟班级数量应为 50")
-        if len(students_per_major) != 10 or any(
-            item["student_count"] != 200 for item in students_per_major
+        if counts["majors"] != 15:
+            raise RuntimeError("模拟专业数量应为 15")
+        if counts["students"] != 1200:
+            raise RuntimeError("模拟学生数量应为 1200")
+        if counts["classes"] != 30:
+            raise RuntimeError("模拟班级数量应为 30")
+        if counts["teachers"] != 10:
+            raise RuntimeError("模拟教师数量应为 10")
+        if counts["courses"] != 3:
+            raise RuntimeError("模拟实验课程数量应为 3")
+        if counts["projects"] != 30:
+            raise RuntimeError("模拟实验项目数量应为 30")
+        if len(students_per_major) != 15 or any(
+            item["student_count"] != 80 for item in students_per_major
         ):
             raise RuntimeError("每个模拟专业都应恰好包含 200 名学生")
         if schema_state["business_tables"] != 41:

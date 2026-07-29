@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     deepseek_temperature: float = Field(default=0.1, ge=0, le=2)
     deepseek_max_tokens: int = Field(default=4096, ge=1)
 
+    sms_code_ttl_seconds: int = Field(default=300, ge=60, le=600)
+    sms_send_interval_seconds: int = Field(default=60, ge=30)
+
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_json: bool = False
     log_dir: str = "logs"

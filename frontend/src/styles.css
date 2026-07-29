@@ -682,3 +682,36 @@ button {
     grid-template-columns: 1fr 110px;
   }
 }
+
+/* 忘记密码弹窗 */
+.reset-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 999;
+}
+.reset-dialog {
+  background: #fff;
+  border-radius: 12px;
+  padding: 2rem 1.8rem;
+  width: 400px;
+  max-width: 92vw;
+  box-shadow: 0 16px 48px rgba(0,0,0,.18);
+}
+.reset-dialog-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+.reset-dialog-header h3 { font-size: 1.2rem; margin: 0; }
+.reset-dialog-header button {
+  background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #888;
+}
+.reset-desc {
+  color: #666; font-size: .9rem; margin-bottom: 1rem;
+}
+.reset-desc .link-button { margin-left: .5rem; }

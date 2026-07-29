@@ -1,6 +1,7 @@
 import asyncio
 import math
 import os
+import random
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import UUID, uuid5
@@ -44,8 +45,8 @@ from app.models import (
 
 DEMO_NAMESPACE = UUID("a869341b-7477-4d3a-81b9-57e212579ec9")
 DEMO_ENROLLMENT_YEAR = 2024
-STUDENTS_PER_MAJOR = 200
-CLASSES_PER_MAJOR = 5
+STUDENTS_PER_MAJOR = 80
+CLASSES_PER_MAJOR = 2
 STUDENTS_PER_CLASS = STUDENTS_PER_MAJOR // CLASSES_PER_MAJOR
 
 MAJOR_SPECS = [
@@ -59,69 +60,60 @@ MAJOR_SPECS = [
     ("DEMO-CH", "化学工程与工艺"),
     ("DEMO-AU", "自动化"),
     ("DEMO-EPE", "能源与动力工程"),
+    ("DEMO-VE", "车辆工程"),
+    ("DEMO-IOT", "物联网工程"),
+    ("DEMO-AI", "人工智能"),
+    ("DEMO-OPTO", "光电信息科学与工程"),
+    ("DEMO-AP", "应用物理学"),
 ]
 
+COURSE_SPECS = [
+    ("DEMO-PHY101", "大学物理实验", "基础测量、力热电光综合训练"),
+    ("DEMO-PHY201", "工程物理实验", "面向工程应用的综合物理实验"),
+    ("DEMO-PHY301", "近代物理实验", "近代物理与前沿测量实验"),
+]
+
+PROJECT_NAMES = {
+    "DEMO-PHY101": [
+        ("长度与密度测量", "BASIC"), ("单摆测重力加速度", "MECHANICS"),
+        ("气垫导轨碰撞", "MECHANICS"), ("杨氏模量测量", "MECHANICS"),
+        ("液体表面张力", "BASIC"), ("金属比热容测量", "BASIC"),
+        ("示波器原理与使用", "ELECTRICITY"), ("伏安法测电阻", "ELECTRICITY"),
+        ("薄透镜焦距测量", "OPTICS"), ("光的干涉与衍射", "OPTICS"),
+    ],
+    "DEMO-PHY201": [
+        ("霍尔效应与磁场测量", "ELECTRICITY"), ("RLC暂态过程", "ELECTRICITY"),
+        ("交流电桥", "ELECTRICITY"), ("传感器特性研究", "ELECTRICITY"),
+        ("超声波声速测量", "BASIC"), ("热电偶定标", "BASIC"),
+        ("太阳能电池特性", "MODERN"), ("光纤传输特性", "OPTICS"),
+        ("振动系统频率响应", "MECHANICS"), ("真空获得与测量", "MODERN"),
+    ],
+    "DEMO-PHY301": [
+        ("光电效应与普朗克常量", "MODERN"), ("弗兰克—赫兹实验", "MODERN"),
+        ("密立根油滴实验", "MODERN"), ("电子衍射", "MODERN"),
+        ("塞曼效应", "MODERN"), ("核磁共振", "MODERN"),
+        ("微波布拉格衍射", "MODERN"), ("激光全息照相", "OPTICS"),
+        ("单光子计数", "MODERN"), ("X射线特征谱", "MODERN"),
+    ],
+}
+
 PROJECT_SPECS = [
-    (
-        "DEMO-PHY101-P01",
-        "DEMO-PHY101",
-        "用单摆测量重力加速度",
-        "MECHANICS",
-        "REQUIRED",
-        "0.9000",
-    ),
-    (
-        "DEMO-PHY101-P02",
-        "DEMO-PHY101",
-        "示波器的原理与使用",
-        "ELECTRICITY",
-        "REQUIRED",
-        "0.9000",
-    ),
-    (
-        "DEMO-PHY101-P03",
-        "DEMO-PHY101",
-        "霍尔效应及磁场测量",
-        "ELECTRICITY",
-        "OPTIONAL",
-        "0.6000",
-    ),
-    (
-        "DEMO-PHY203-P01",
-        "DEMO-PHY203",
-        "光电效应与普朗克常量测定",
-        "OPTICS",
-        "REQUIRED",
-        "0.9000",
-    ),
-    (
-        "DEMO-PHY203-P02",
-        "DEMO-PHY203",
-        "弗兰克—赫兹实验",
-        "MODERN",
-        "REQUIRED",
-        "0.9000",
-    ),
-    (
-        "DEMO-PHY203-P03",
-        "DEMO-PHY203",
-        "密立根油滴实验",
-        "MODERN",
-        "OPTIONAL",
-        "0.6000",
-    ),
+    (f"{course_code}-P{index:02d}", course_code, name, category, "0.6000")
+    for course_code, items in PROJECT_NAMES.items()
+    for index, (name, category) in enumerate(items, start=1)
 ]
 
 EQUIPMENT_SPECS = [
-    ("DEMO-EQ-PENDULUM", "单摆实验仪", "DP-DEMO"),
-    ("DEMO-EQ-TIMER", "光电计时器", "GD-DEMO"),
-    ("DEMO-EQ-OSC", "数字示波器", "OSC-DEMO"),
-    ("DEMO-EQ-SIGNAL", "信号发生器", "SG-DEMO"),
-    ("DEMO-EQ-HALL", "霍尔效应实验仪", "HALL-DEMO"),
-    ("DEMO-EQ-PHOTO", "光电效应实验箱", "PHOTO-DEMO"),
-    ("DEMO-EQ-FH", "弗兰克—赫兹实验仪", "FH-DEMO"),
-    ("DEMO-EQ-OILDROP", "密立根油滴仪", "OIL-DEMO"),
+    ("DEMO-EQ-BASIC", "基础测量组合仪", "PHY-BASIC"),
+    ("DEMO-EQ-MECH", "力学综合实验仪", "PHY-MECH"),
+    ("DEMO-EQ-ELEC", "电学综合实验箱", "PHY-ELEC"),
+    ("DEMO-EQ-OSC", "数字示波器", "DSO-1000"),
+    ("DEMO-EQ-OPT", "光学综合实验平台", "PHY-OPT"),
+    ("DEMO-EQ-MODERN", "近代物理综合实验仪", "PHY-MODERN"),
 ]
+
+SURNAMES = "张王李赵陈刘杨黄周吴徐孙胡朱高林何郭马罗梁宋郑谢韩唐冯于董萧程曹袁邓许傅沈曾彭吕苏卢蒋蔡贾丁魏薛叶阎余潘杜戴夏钟汪田任姜范方石姚谭廖邹熊金陆郝孔白崔康毛邱秦江史顾侯邵孟龙万段雷钱汤尹黎易常武乔贺赖龚文"
+GIVEN_NAMES = ["小明","小红","子涵","雨桐","浩然","欣怡","宇轩","思琪","嘉豪","梦瑶","梓涵","俊杰","诗涵","晨曦","文博","佳宁","明轩","若彤","天宇","雅婷"]
 
 
 def demo_id(entity: str, code: str) -> UUID:
@@ -245,7 +237,8 @@ async def seed_demo_data() -> None:
 
         teachers: list[Teacher] = []
         teacher_accounts: list[UserAccount] = []
-        for index in range(1, 21):
+        teacher_names = ["张伟", "王芳", "李强", "赵敏", "陈杰", "刘洋", "杨静", "黄磊", "周颖", "吴昊"]
+        for index, teacher_name in enumerate(teacher_names, start=1):
             employee_no = f"DEMO-T{index:03d}"
             account = UserAccount(
                 id=demo_id("user", employee_no),
@@ -258,8 +251,8 @@ async def seed_demo_data() -> None:
                 id=demo_id("teacher", employee_no),
                 user_id=account.id,
                 employee_no=employee_no,
-                name=f"模拟教师{index:02d}",
-                campus_id=main_campus.id if index <= 14 else east_campus.id,
+                name=teacher_name,
+                campus_id=main_campus.id if index <= 7 else east_campus.id,
                 department="物理实验中心（模拟）",
                 title="实验教师",
                 status="ACTIVE",
@@ -276,6 +269,7 @@ async def seed_demo_data() -> None:
         students: list[Student] = []
         busy_bitmaps: list[StudentBusyBitmap] = []
         global_student_index = 0
+        name_rng = random.Random(20260728)
 
         for major_index, major in enumerate(majors, start=1):
             major_classes: list[StudentClass] = []
@@ -321,11 +315,8 @@ async def seed_demo_data() -> None:
                     id=demo_id("student", student_no),
                     user_id=account.id,
                     student_no=student_no,
-                    name=(
-                        f"{MAJOR_SPECS[major_index - 1][1]}"
-                        f"模拟学生{local_index:03d}"
-                    ),
-                    gender="UNSPECIFIED",
+                    name=f"{name_rng.choice(SURNAMES)}{name_rng.choice(GIVEN_NAMES)}",
+                    gender="MALE" if global_student_index % 2 else "FEMALE",
                     enrollment_year=DEMO_ENROLLMENT_YEAR,
                     major_id=major.id,
                     class_id=student_class.id,
@@ -360,36 +351,26 @@ async def seed_demo_data() -> None:
 
         courses = [
             ExperimentCourse(
-                id=demo_id("course", "DEMO-PHY101"),
-                course_code="DEMO-PHY101",
-                course_name="大学物理实验（上）（模拟）",
+                id=demo_id("course", course_code),
+                course_code=course_code,
+                course_name=course_name,
                 credits=Decimal("1.0"),
                 default_slots=4,
-                description="模拟基础实验课程",
+                description=description,
                 status="ACTIVE",
-            ),
-            ExperimentCourse(
-                id=demo_id("course", "DEMO-PHY203"),
-                course_code="DEMO-PHY203",
-                course_name="近代物理实验（模拟）",
-                credits=Decimal("1.0"),
-                default_slots=4,
-                description="模拟近代物理实验课程",
-                status="ACTIVE",
-            ),
+            )
+            for course_code, course_name, description in COURSE_SPECS
         ]
         course_by_code = {course.course_code: course for course in courses}
         session.add_all(courses)
         await session.flush()
 
         projects: list[ExperimentProject] = []
-        requirement_by_project: dict[str, str] = {}
         for (
             project_code,
             course_code,
             project_name,
             category,
-            requirement_type,
             historical_ratio,
         ) in PROJECT_SPECS:
             project = ExperimentProject(
@@ -404,7 +385,6 @@ async def seed_demo_data() -> None:
                 status="ACTIVE",
             )
             projects.append(project)
-            requirement_by_project[project_code] = requirement_type
         project_by_code = {
             project.project_code: project for project in projects
         }
@@ -428,7 +408,10 @@ async def seed_demo_data() -> None:
             )
             training_plans.append(plan)
 
+            major_index = majors.index(major)
             for course_index, course in enumerate(courses, start=1):
+                required_count = 6 if major_index in {0, 1, 2, 8, 12, 13, 14} else 5 if major_index in {5, 6, 7, 9, 10} else 4
+                optional_min = 2 if required_count >= 5 else 3
                 plan_course = TrainingPlanCourse(
                     id=demo_id(
                         "plan_course", f"{major.code}:{course.course_code}"
@@ -438,9 +421,9 @@ async def seed_demo_data() -> None:
                     course_nature="REQUIRED",
                     study_year=course_index,
                     semester_no=2 if course_index == 1 else 1,
-                    required_project_count=2,
-                    optional_project_min_count=1,
-                    order_rule_text="模拟规则：必做项目优先，项目不得重复修读。",
+                    required_project_count=required_count,
+                    optional_project_min_count=optional_min,
+                    order_rule_text=f"本专业本课程前{required_count}项必做，其余选做且至少完成{optional_min}项。",
                 )
                 plan_courses.append(plan_course)
 
@@ -460,9 +443,11 @@ async def seed_demo_data() -> None:
                             ),
                             plan_course_id=plan_course.id,
                             project_id=project.id,
-                            requirement_type=requirement_by_project[
-                                project.project_code
-                            ],
+                            requirement_type=(
+                                "REQUIRED"
+                                if display_order <= required_count
+                                else "OPTIONAL"
+                            ),
                             display_order=display_order,
                         )
                     )
@@ -530,21 +515,27 @@ async def seed_demo_data() -> None:
         inventories: list[LabEquipmentInventory] = []
         equipment_requirements: list[ProjectEquipmentRequirement] = []
 
+        category_lab = {
+            "BASIC": laboratories[0],
+            "MECHANICS": laboratories[0],
+            "ELECTRICITY": laboratories[1],
+            "OPTICS": laboratories[2],
+            "MODERN": laboratories[2],
+        }
+        category_equipment = {
+            "BASIC": ["DEMO-EQ-BASIC"],
+            "MECHANICS": ["DEMO-EQ-MECH"],
+            "ELECTRICITY": ["DEMO-EQ-ELEC", "DEMO-EQ-OSC"],
+            "OPTICS": ["DEMO-EQ-OPT"],
+            "MODERN": ["DEMO-EQ-MODERN", "DEMO-EQ-OSC"],
+        }
         project_lab_map = {
-            "DEMO-PHY101-P01": laboratories[0],
-            "DEMO-PHY101-P02": laboratories[1],
-            "DEMO-PHY101-P03": laboratories[1],
-            "DEMO-PHY203-P01": laboratories[2],
-            "DEMO-PHY203-P02": laboratories[2],
-            "DEMO-PHY203-P03": laboratories[2],
+            project.project_code: category_lab[project.category]
+            for project in projects
         }
         project_equipment_map = {
-            "DEMO-PHY101-P01": ["DEMO-EQ-PENDULUM", "DEMO-EQ-TIMER"],
-            "DEMO-PHY101-P02": ["DEMO-EQ-OSC", "DEMO-EQ-SIGNAL"],
-            "DEMO-PHY101-P03": ["DEMO-EQ-HALL"],
-            "DEMO-PHY203-P01": ["DEMO-EQ-PHOTO"],
-            "DEMO-PHY203-P02": ["DEMO-EQ-FH", "DEMO-EQ-OSC"],
-            "DEMO-PHY203-P03": ["DEMO-EQ-OILDROP"],
+            project.project_code: category_equipment[project.category]
+            for project in projects
         }
 
         for project_code, laboratory in project_lab_map.items():
@@ -605,8 +596,9 @@ async def seed_demo_data() -> None:
         availabilities: list[TeacherAvailability] = []
         for teacher_index, teacher in enumerate(teachers):
             assigned_projects = [
-                projects[teacher_index % len(projects)],
-                projects[(teacher_index + 2) % len(projects)],
+                projects[teacher_index],
+                projects[teacher_index + 10],
+                projects[teacher_index + 20],
             ]
             for project in assigned_projects:
                 qualifications.append(
@@ -736,13 +728,19 @@ async def seed_demo_data() -> None:
             for project in [
                 item for item in projects if item.course_id == course.id
             ]:
-                requirement_type = requirement_by_project[
-                    project.project_code
-                ]
-                prediction_ratio = (
-                    Decimal("1.0")
-                    if requirement_type == "REQUIRED"
-                    else Decimal("0.6")
+                required_major_count = sum(
+                    1
+                    for item in plan_projects
+                    if item.project_id == project.id
+                    and item.requirement_type == "REQUIRED"
+                )
+                requirement_type = (
+                    "REQUIRED"
+                    if required_major_count >= math.ceil(len(majors) / 2)
+                    else "OPTIONAL"
+                )
+                prediction_ratio = Decimal(
+                    str(round(0.6 + 0.4 * required_major_count / len(majors), 4))
                 )
                 base_demand = len(students)
                 required_capacity = math.ceil(
@@ -793,17 +791,7 @@ async def seed_demo_data() -> None:
         for project_index, project in enumerate(projects):
             task = next(item for item in tasks if item.course_id == project.course_id)
             laboratory = project_lab_map[project.project_code]
-            qualified_teachers = [
-                teacher
-                for teacher_index, teacher in enumerate(teachers)
-                if (
-                    project
-                    in [
-                        projects[teacher_index % len(projects)],
-                        projects[(teacher_index + 2) % len(projects)],
-                    ]
-                )
-            ]
+            qualified_teachers = [teachers[project_index % len(teachers)]]
             for session_index in range(1, 4):
                 session_code = (
                     f"DEMO-S-{project_index + 1:02d}-{session_index:02d}"
@@ -815,7 +803,7 @@ async def seed_demo_data() -> None:
                         session_code=session_code,
                         task_id=task.id,
                         project_id=project.id,
-                        week_no=2 + project_index * 2,
+                        week_no=2 + project_index % 15,
                         day_of_week=session_index + 1,
                         start_slot=1 if session_index == 1 else 5,
                         end_slot=4 if session_index == 1 else 8,

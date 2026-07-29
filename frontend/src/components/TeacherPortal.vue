@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import type { UserProfile } from '../api/auth'
 
 type TeacherView = 'home' | 'schedule' | 'classes' | 'adjustments' | 'resources'
 type AdjustmentType = '调课申请' | '场地调整申请' | '停课申请'
 
+const props = defineProps<{ user: UserProfile | null }>()
 const emit = defineEmits<{ logout: [] }>()
 const activeView = ref<TeacherView>('home')
 const sidebarOpen = ref(false)
@@ -27,8 +29,15 @@ const navItems: Array<{ id: TeacherView; label: string; icon: string }> = [
   { id: 'resources', label: '资源异常上报', icon: '△' },
 ]
 
+const teacherName = computed(() => props.user?.name || '老师')
+const employeeNo = computed(() => props.user?.employee_no || '****')
+const department = computed(() => props.user?.department || '物理实验中心')
+const teacherTitle = computed(() => props.user?.title || '教师')
+const teacherGreeting = computed(() => `下午好，${teacherName.value}`)
+const teacherInitial = computed(() => teacherName.value.slice(0, 1))
+
 const viewMeta: Record<TeacherView, { title: string; subtitle: string }> = {
-  home: { title: '下午好，李老师', subtitle: '第 6 教学周 · 今日有 2 个实验教学任务' },
+  home: { title: teacherGreeting.value, subtitle: '第 6 教学周 · 今日有 2 个实验教学任务' },
   schedule: { title: '教师课表', subtitle: '按教学周查看个人实验教学安排' },
   classes: { title: '项目学生管理', subtitle: '按实验项目场次查看自主选课学生的基本信息' },
   adjustments: { title: '教学调整申请', subtitle: '提交并跟踪调课、场地调整及停课申请' },
@@ -215,7 +224,7 @@ function submitResourceReport() {
         <div class="teacher-top-actions">
           <span class="teacher-demo-badge">演示数据</span>
           <button class="teacher-notice" type="button" @click="showToast('你有 3 条教学事项提醒')">♢<i>3</i></button>
-          <div class="teacher-profile"><span>李</span><div><strong>李老师</strong><small>工号 T****026</small></div></div>
+          <div class="teacher-profile"><span>{{ teacherInitial }}</span><div><strong>{{ teacherName }}</strong><small>工号 {{ employeeNo }}</small></div></div>
         </div>
       </header>
 
@@ -229,14 +238,14 @@ function submitResourceReport() {
         <template v-if="activeView === 'home'">
           <section class="teacher-hero">
             <div class="teacher-hero-profile">
-              <span class="teacher-big-avatar">李</span>
-              <div><small>TEACHING OVERVIEW</small><h2>李老师，欢迎回来</h2><p>物理实验中心 · 实验教学岗</p></div>
+              <span class="teacher-big-avatar">{{ teacherInitial }}</span>
+              <div><small>TEACHING OVERVIEW</small><h2>{{ teacherName }}，欢迎回来</h2><p>{{ department }} · 实验教学岗</p></div>
             </div>
             <div class="teacher-info-grid">
-              <div><span>教师姓名</span><strong>李老师</strong></div>
-              <div><span>工号</span><strong>T****026</strong></div>
-              <div><span>所属单位</span><strong>物理实验中心</strong></div>
-              <div><span>教师职称</span><strong>副教授</strong></div>
+              <div><span>教师姓名</span><strong>{{ teacherName }}</strong></div>
+              <div><span>工号</span><strong>{{ employeeNo }}</strong></div>
+              <div><span>所属单位</span><strong>{{ department }}</strong></div>
+              <div><span>教师职称</span><strong>{{ teacherTitle }}</strong></div>
             </div>
             <span class="teacher-sample-tag">示例信息</span>
             <div class="teacher-hero-rings" aria-hidden="true"><i></i><b></b></div>

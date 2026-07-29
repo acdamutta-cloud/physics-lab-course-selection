@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import type { UserProfile } from '../api/auth'
 
 type SystemView = 'plans' | 'courses' | 'labs' | 'schedule' | 'approvals'
 type ApprovalStatus = '待审批' | '已审批' | 'AI 自动审批' | '已驳回'
@@ -16,6 +17,7 @@ type PlanCourseRequirement = {
   orderRule: string
 }
 
+const props = defineProps<{ user: UserProfile | null }>()
 const emit = defineEmits<{ logout: [] }>()
 const activeView = ref<SystemView>('plans')
 const sidebarOpen = ref(false)
@@ -68,6 +70,10 @@ const navItems: Array<{ id: SystemView; label: string; icon: string }> = [
   { id: 'schedule', label: '实验课表管理', icon: '▦' },
   { id: 'approvals', label: '申请审批管理', icon: '✓' },
 ]
+
+const adminName = computed(() => props.user?.name || '系统管理员')
+const adminLoginId = computed(() => props.user?.login_name || 'ADMIN-001')
+const adminInitial = computed(() => adminName.value.slice(0, 1))
 
 const viewMeta: Record<SystemView, { title: string; subtitle: string }> = {
   plans: { title: '培养方案管理', subtitle: '按专业与培养年份维护物理实验课程修读要求' },
@@ -275,7 +281,7 @@ function generateSchedule() {
       <header class="system-topbar">
         <button class="system-menu" @click="sidebarOpen = true">☰</button>
         <div class="system-breadcrumb"><span>系统端</span><b>/</b>{{ viewMeta[activeView].title }}</div>
-        <div class="system-top-actions"><span class="system-demo-badge">演示数据</span><button class="system-notice" @click="showToast('当前有 4 条申请需要关注')">♢<i>4</i></button><div class="system-profile"><span>管</span><div><strong>系统管理员</strong><small>ADMIN-001</small></div></div></div>
+        <div class="system-top-actions"><span class="system-demo-badge">演示数据</span><button class="system-notice" @click="showToast('当前有 4 条申请需要关注')">♢<i>4</i></button><div class="system-profile"><span>{{ adminInitial }}</span><div><strong>{{ adminName }}</strong><small>{{ adminLoginId }}</small></div></div></div>
       </header>
 
       <main class="system-content">

@@ -4,14 +4,34 @@ import LoginPage from './components/LoginPage.vue'
 import StudentPortal from './components/StudentPortal.vue'
 import TeacherPortal from './components/TeacherPortal.vue'
 import SystemPortal from './components/SystemPortal.vue'
+import type { UserProfile } from './api/auth'
 
 type Portal = 'student' | 'teacher' | 'admin' | null
+
 const activePortal = ref<Portal>(null)
+const currentUser = ref<UserProfile | null>(null)
+
+function handleLoginSuccess(user: UserProfile) {
+  currentUser.value = user
+  const portalMap: Record<string, Portal> = {
+    STUDENT: 'student',
+    TEACHER: 'teacher',
+    ADMIN: 'admin',
+  }
+  activePortal.value = portalMap[user.user_type] ?? null
+}
+
+function handleLogout() {
+  currentUser.value = null
+  activePortal.value = null
+  localStorage.removeItem('access_token')
+  localStorage.removeItem('refresh_token')
+}
 </script>
 
 <template>
-  <StudentPortal v-if="activePortal === 'student'" @logout="activePortal = null" />
-  <TeacherPortal v-else-if="activePortal === 'teacher'" @logout="activePortal = null" />
-  <SystemPortal v-else-if="activePortal === 'admin'" @logout="activePortal = null" />
-  <LoginPage v-else @role-login="activePortal = $event" />
+  <StudentPortal v-if="activePortal === 'student'" :user="currentUser" @logout="handleLogout" />
+  <TeacherPortal v-else-if="activePortal === 'teacher'" :user="currentUser" @logout="handleLogout" />
+  <SystemPortal v-else-if="activePortal === 'admin'" :user="currentUser" @logout="handleLogout" />
+  <LoginPage v-else @login-success="handleLoginSuccess" />
 </template>

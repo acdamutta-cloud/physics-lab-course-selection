@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from 'vue'
+import type { UserProfile } from '../api/auth'
 
 type View = 'home' | 'schedule' | 'selection' | 'applications' | 'ai'
 type ApplicationType = '调课申请' | '换组申请' | '补做申请'
 
+const props = defineProps<{ user: UserProfile | null }>()
 const emit = defineEmits<{ logout: [] }>()
 const activeView = ref<View>('home')
 const sidebarOpen = ref(false)
@@ -28,8 +30,18 @@ const navItems: Array<{ id: View; label: string; icon: string }> = [
   { id: 'ai', label: 'AI 智能咨询', icon: '✺' },
 ]
 
+const studentName = computed(() => props.user?.name || '同学')
+const studentNo = computed(() => props.user?.student_no || '****')
+const studentMajor = computed(() => props.user?.major_name || '未知专业')
+const studentGrade = computed(() => {
+  if (props.user?.enrollment_year) return `${props.user.enrollment_year} 级`
+  return '未知年级'
+})
+const greetingText = computed(() => `下午好，${studentName.value}`)
+const userInitial = computed(() => studentName.value.slice(0, 1))
+
 const viewMeta: Record<View, { title: string; subtitle: string }> = {
-  home: { title: '下午好，张同学', subtitle: '今天是第 6 教学周，查看你的实验学习进度' },
+  home: { title: greetingText.value, subtitle: '今天是第 6 教学周，查看你的实验学习进度' },
   schedule: { title: '实验课表查询', subtitle: '查看本学期已选实验的时间与地点安排' },
   selection: { title: '在线选课', subtitle: '根据培养方案选择必做与选做实验项目' },
   applications: { title: '个人申请', subtitle: '提交并跟踪调课、换组与补做申请' },
@@ -224,11 +236,11 @@ async function askAi(preset?: string) {
     <div class="student-main">
       <header class="student-topbar">
         <button class="menu-button" type="button" aria-label="打开导航" @click="sidebarOpen = true">☰</button>
-        <div class="breadcrumb"><span>学生端</span><b>/</b>{{ viewMeta[activeView].title.replace('下午好，张同学', '首页') }}</div>
+        <div class="breadcrumb"><span>学生端</span><b>/</b>{{ activeView === 'home' ? '首页' : viewMeta[activeView].title }}</div>
         <div class="top-actions">
           <span class="demo-badge">演示数据</span>
           <button class="notice-button" type="button" aria-label="通知" @click="showToast('你有 2 条实验安排提醒')">♢<i>2</i></button>
-          <div class="student-profile"><span>张</span><div><strong>张同学</strong><small>2024****18</small></div></div>
+          <div class="student-profile"><span>{{ userInitial }}</span><div><strong>{{ studentName }}</strong><small>{{ studentNo }}</small></div></div>
         </div>
       </header>
 
@@ -251,11 +263,11 @@ async function askAi(preset?: string) {
           </section>
 
           <section class="profile-strip">
-            <div class="profile-avatar">张</div>
-            <div class="profile-name"><span>学生姓名</span><strong>张同学</strong></div>
-            <div><span>学号</span><strong>2024****18</strong></div>
-            <div><span>专业</span><strong>物理学（师范）</strong></div>
-            <div><span>所在年级</span><strong>2024 级</strong></div>
+            <div class="profile-avatar">{{ userInitial }}</div>
+            <div class="profile-name"><span>学生姓名</span><strong>{{ studentName }}</strong></div>
+            <div><span>学号</span><strong>{{ studentNo }}</strong></div>
+            <div><span>专业</span><strong>{{ studentMajor }}</strong></div>
+            <div><span>所在年级</span><strong>{{ studentGrade }}</strong></div>
             <span class="sample-label">示例信息</span>
           </section>
 
@@ -387,7 +399,7 @@ async function askAi(preset?: string) {
               <header><div><span class="ai-avatar">✦</span><div><strong>物理实验 AI 助手</strong><small><i></i> 在线 · 原型回答</small></div></div><button type="button" @click="messages = messages.slice(0, 1)">清空对话</button></header>
               <div ref="aiThread" class="ai-thread">
                 <div v-for="(item, index) in messages" :key="index" class="ai-message" :class="item.role">
-                  <span>{{ item.role === 'assistant' ? '✦' : '张' }}</span><div><p>{{ item.text }}</p><small>{{ item.role === 'assistant' ? 'AI 助手' : '刚刚' }}</small></div>
+                  <span>{{ item.role === 'assistant' ? '✦' : userInitial }}</span><div><p>{{ item.text }}</p><small>{{ item.role === 'assistant' ? 'AI 助手' : '刚刚' }}</small></div>
                 </div>
               </div>
               <form class="ai-input" @submit.prevent="askAi()">
