@@ -1,5 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import (
@@ -15,9 +16,12 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import AuditMixin, BaseModel
+
+if TYPE_CHECKING:
+    from app.models.identity import Major
 
 
 class AcademicTerm(AuditMixin, BaseModel):
@@ -61,12 +65,20 @@ class ExperimentCourse(AuditMixin, BaseModel):
             name="status_allowed",
         ),
         CheckConstraint("credits >= 0", name="credits_nonnegative"),
+        CheckConstraint(
+            "course_type IN ('EXPERIMENT', 'THEORY')",
+            name="course_type_allowed",
+        ),
     )
 
     course_code: Mapped[str] = mapped_column(
         String(32), nullable=False, unique=True
     )
     course_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    # 理论课程只可作为先修课程；培养方案的修读课程必须为实验课程。
+    course_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="EXPERIMENT"
+    )
     credits: Mapped[Decimal] = mapped_column(
         Numeric(4, 1), nullable=False, default=Decimal("1.0")
     )
@@ -173,6 +185,12 @@ class TrainingPlan(AuditMixin, BaseModel):
         ForeignKey("user_account.id", ondelete="SET NULL")
     )
 
+    # relationships
+    major: Mapped["Major"] = relationship("Major", viewonly=True)
+    courses: Mapped[list["TrainingPlanCourse"]] = relationship(
+        "TrainingPlanCourse", back_populates="plan", viewonly=True,
+    )
+
 
 class TrainingPlanCourse(AuditMixin, BaseModel):
     __tablename__ = "training_plan_course"
@@ -212,6 +230,26 @@ class TrainingPlanCourse(AuditMixin, BaseModel):
         SmallInteger, nullable=False, default=0
     )
     order_rule_text: Mapped[str | None] = mapped_column(Text)
+    allow_order_override: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default=text("false")
+    )
+
+    # relationships
+    plan: Mapped["TrainingPlan"] = relationship(
+        "TrainingPlan", back_populates="courses", viewonly=True,
+    )
+    course: Mapped["ExperimentCourse"] = relationship(
+        "ExperimentCourse", viewonly=True,
+    )
+    projects: Mapped[list["TrainingPlanProject"]] = relationship(
+        "TrainingPlanProject", back_populates="plan_course", viewonly=True,
+    )
+    prerequisites: Mapped[list["CoursePrerequisite"]] = relationship(
+        "CoursePrerequisite", back_populates="plan_course", viewonly=True,
+    )
+    order_constraints: Mapped[list["ProjectOrderConstraint"]] = relationship(
+        "ProjectOrderConstraint", back_populates="plan_course", viewonly=True,
+    )
 
 
 class TrainingPlanProject(BaseModel):
@@ -237,6 +275,14 @@ class TrainingPlanProject(BaseModel):
     requirement_type: Mapped[str] = mapped_column(String(20), nullable=False)
     display_order: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=1
+    )
+
+    # relationships
+    plan_course: Mapped["TrainingPlanCourse"] = relationship(
+        "TrainingPlanCourse", back_populates="projects", viewonly=True,
+    )
+    project: Mapped["ExperimentProject"] = relationship(
+        "ExperimentProject", viewonly=True,
     )
 
 
@@ -266,6 +312,13 @@ class CoursePrerequisite(BaseModel):
         String(20), nullable=False, default="MUST_COMPLETE"
     )
     description: Mapped[str | None] = mapped_column(Text)
+
+    plan_course: Mapped["TrainingPlanCourse"] = relationship(
+        "TrainingPlanCourse", back_populates="prerequisites", viewonly=True,
+    )
+    prerequisite_course: Mapped["ExperimentCourse"] = relationship(
+        "ExperimentCourse", viewonly=True,
+    )
 
 
 class ProjectOrderConstraint(BaseModel):
@@ -297,3 +350,17 @@ class ProjectOrderConstraint(BaseModel):
     )
     allow_override: Mapped[bool] = mapped_column(nullable=False, default=False)
     description: Mapped[str | None] = mapped_column(Text)
+
+    plan_course: Mapped["TrainingPlanCourse"] = relationship(
+        "TrainingPlanCourse", back_populates="order_constraints", viewonly=True,
+    )
+    before_project: Mapped["ExperimentProject"] = relationship(
+        "ExperimentProject",
+        foreign_keys=[before_project_id],
+        viewonly=True,
+    )
+    after_project: Mapped["ExperimentProject"] = relationship(
+        "ExperimentProject",
+        foreign_keys=[after_project_id],
+        viewonly=True,
+    )

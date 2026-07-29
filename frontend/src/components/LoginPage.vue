@@ -119,6 +119,12 @@ const resetSending = ref(false)
 const resetSubmitting = ref(false)
 let resetTimer: number | undefined
 
+function editResetPhone() {
+  resetStep.value = 1
+  window.clearInterval(resetTimer)
+  resetCountdown.value = 0
+}
+
 function openResetDialog() {
   showResetDialog.value = true
   resetStep.value = 1
@@ -306,7 +312,7 @@ onBeforeUnmount(() => {
             </button>
           </template>
           <template v-else>
-            <p class="reset-desc">手机号 {{ resetPhone }} <button type="button" class="link-button" @click="resetStep = 1; window.clearInterval(resetTimer); resetCountdown = 0">修改</button></p>
+            <p class="reset-desc">手机号 {{ resetPhone }} <button type="button" class="link-button" @click="editResetPhone">修改</button></p>
             <label class="field">
               <span>验证码</span>
               <span class="code-row">

@@ -1,23 +1,71 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { api } from '../api/client'
 import type { UserProfile } from '../api/auth'
 
 type SystemView = 'plans' | 'courses' | 'labs' | 'schedule' | 'approvals'
+
+const props = defineProps<{ user: UserProfile | null }>()
+const adminName = computed(() => props.user?.name || '系统管理员')
+const adminLoginId = computed(() => props.user?.login_name || 'ADMIN-001')
+const adminInitial = computed(() => adminName.value.slice(0, 1))
 type ApprovalStatus = '待审批' | '已审批' | 'AI 自动审批' | '已驳回'
 type PlanCourseRequirement = {
   id: number
+  courseId: string
   name: string
   studyYear: string
   semester: string
-  prerequisite: string
+  prerequisites: string[]
   requiredCount: number
   optionalCount: number
   requiredProjects: string[]
   optionalProjects: string[]
   orderRule: string
+  orderConstraints: string[]
+  allowOrderOverride: boolean
+}
+type MajorInfo = { id: string; code: string; name: string }
+type CourseInfo = { id: string; course_code: string; course_name: string; course_type: 'EXPERIMENT' | 'THEORY' }
+type ProjectInfo = { id: string; project_code: string; project_name: string; category: string | null }
+type PlanStatus = 'DRAFT' | 'PUBLISHED' | 'ARCHIVED'
+type PlanCard = {
+  id: string
+  plan_code: string
+  majorInfo: MajorInfo
+  major: string
+  year: string
+  version: number
+  courses: number
+  required: number
+  optional: number
+  prerequisite: string
+  updated: string
+  rawStatus: PlanStatus
+  status: '草稿' | '已发布' | '已停用'
+  completeness: 'COMPLETE' | 'INCOMPLETE'
+}
+type PlanDetail = {
+  id: string
+  major: MajorInfo
+  enrollment_year: number
+  status: PlanStatus
+  courses: Array<{
+    id: string
+    course: CourseInfo
+    study_year: number
+    semester_no: number
+    prerequisite_course: CourseInfo | null
+    prerequisite_courses: CourseInfo[]
+    required_project_count: number
+    optional_project_min_count: number
+    order_rule_text: string | null
+    allow_order_override: boolean
+    projects: Array<{ project: ProjectInfo; requirement_type: 'REQUIRED' | 'OPTIONAL'; display_order: number }>
+    order_constraints: Array<{ before_project: ProjectInfo; after_project: ProjectInfo; description: string | null; allow_override: boolean }>
+  }>
 }
 
-const props = defineProps<{ user: UserProfile | null }>()
 const emit = defineEmits<{ logout: [] }>()
 const activeView = ref<SystemView>('plans')
 const sidebarOpen = ref(false)
@@ -30,32 +78,29 @@ const activePlanCourseId = ref(1)
 const planCourseSeed = ref(3)
 const customRequiredProject = ref('')
 const customOptionalProject = ref('')
-const planCourses = ref<PlanCourseRequirement[]>([
-  {
-    id: 1,
-    name: '大学物理实验（上）',
-    studyYear: '第 1 学年',
-    semester: '第二学期',
-    prerequisite: '大学物理 A（上）',
-    requiredCount: 2,
-    optionalCount: 1,
-    requiredProjects: ['用单摆测量重力加速度', '示波器的原理与使用'],
-    optionalProjects: ['霍尔效应及磁场测量'],
-    orderRule: '先完成基础测量类项目，再进入电磁类实验项目',
-  },
-  {
-    id: 2,
-    name: '近代物理实验',
-    studyYear: '第 2 学年',
-    semester: '第一学期',
-    prerequisite: '大学物理实验（上）',
-    requiredCount: 2,
-    optionalCount: 1,
-    requiredProjects: ['光电效应与普朗克常量测定', '弗兰克—赫兹实验'],
-    optionalProjects: ['密立根油滴实验'],
-    orderRule: '完成大学物理实验（上）后修读；同一项目仅需完成一次',
-  },
-])
+const selectedRequiredProject = ref('')
+const selectedOptionalProject = ref('')
+const planCourses = ref<PlanCourseRequirement[]>([])
+const majors = ref<MajorInfo[]>([])
+const courseCatalog = ref<CourseInfo[]>([])
+const projectCatalog = ref<Record<string, ProjectInfo[]>>({})
+const plans = ref<PlanCard[]>([])
+const planDetails = ref<Record<string, PlanCourseRequirement[]>>({})
+const currentPlanId = ref<string | null>(null)
+const planKeyword = ref('')
+const planYearFilter = ref('全部年份')
+const plansLoading = ref(false)
+const savingPlan = ref(false)
+const projectEditorOpen = ref(false)
+const pendingProjectKind = ref<'required' | 'optional'>('required')
+const newProject = ref({
+  project_code: '',
+  project_name: '',
+  category: '',
+  required_slots: '',
+  default_group_size: '',
+  historical_selection_ratio: '',
+})
 const activeLab = ref('实验楼 A203')
 const scheduleLab = ref('实验楼 A203')
 const aiGenerating = ref(false)
@@ -71,10 +116,6 @@ const navItems: Array<{ id: SystemView; label: string; icon: string }> = [
   { id: 'approvals', label: '申请审批管理', icon: '✓' },
 ]
 
-const adminName = computed(() => props.user?.name || '系统管理员')
-const adminLoginId = computed(() => props.user?.login_name || 'ADMIN-001')
-const adminInitial = computed(() => adminName.value.slice(0, 1))
-
 const viewMeta: Record<SystemView, { title: string; subtitle: string }> = {
   plans: { title: '培养方案管理', subtitle: '按专业与培养年份维护物理实验课程修读要求' },
   courses: { title: '实验课程设置', subtitle: '配置本学期开课课程、项目容量、教师与实验器材' },
@@ -82,13 +123,6 @@ const viewMeta: Record<SystemView, { title: string; subtitle: string }> = {
   schedule: { title: '实验课表管理', subtitle: '按实验室查看课表，或使用 AI 生成排课方案' },
   approvals: { title: '申请审批管理', subtitle: '统一处理学生与教师申请，查看审批方案和驳回理由' },
 }
-
-const plans = ref([
-  { major: '物理学（师范）', year: '2024', courses: 2, required: 10, optional: 4, prerequisite: '大学物理 A（上）', updated: '2026-03-12', status: '已发布' },
-  { major: '应用物理学', year: '2024', courses: 3, required: 12, optional: 6, prerequisite: '普通物理学（上）', updated: '2026-03-08', status: '草稿' },
-  { major: '电子信息科学与技术', year: '2023', courses: 1, required: 6, optional: 2, prerequisite: '大学物理 B', updated: '2026-02-25', status: '已发布' },
-  { major: '材料物理', year: '2023', courses: 2, required: 8, optional: 4, prerequisite: '力学与热学', updated: '2026-02-21', status: '已停用' },
-])
 
 const semesterCourses = [
   {
@@ -153,11 +187,25 @@ const activePlanCourse = computed(() => planCourses.value.find((course) => cours
 const activeProjectCatalog = computed(() => {
   const course = activePlanCourse.value
   if (!course) return []
-  const configuredProjects = semesterCourses
-    .find((item) => item.name === course.name)
-    ?.projects.map((project) => project.name) ?? []
-  return [...new Set([...configuredProjects, ...course.requiredProjects, ...course.optionalProjects])]
+  return (projectCatalog.value[course.courseId] ?? []).map((project) => project.project_name)
 })
+const summary = computed(() => ({
+  plans: plans.value.length,
+  majors: new Set(plans.value.map((item) => item.majorInfo.id)).size,
+  published: plans.value.filter((item) => item.rawStatus === 'PUBLISHED').length,
+  courses: new Set(Object.values(planDetails.value).flat().map((course) => course.courseId).filter(Boolean)).size,
+  projects: new Set(
+    Object.entries(projectCatalog.value)
+      .filter(([courseId]) => courseCatalog.value.find((item) => item.id === courseId)?.course_type === 'EXPERIMENT')
+      .flatMap(([, projects]) => projects.map((project) => project.id)),
+  ).size,
+  incomplete: plans.value.filter((item) => item.completeness === 'INCOMPLETE').length,
+}))
+const planYears = computed(() => [...new Set(plans.value.map((item) => item.year))].sort().reverse())
+const enrollmentYearOptions = computed(() => Array.from(
+  { length: new Date().getFullYear() - 1998 },
+  (_, index) => new Date().getFullYear() + 1 - index,
+))
 const visibleScheduleEvents = computed(() => scheduleEvents.value.filter((event) => event.lab === scheduleLab.value))
 const visibleApprovals = computed(() => approvals.value.filter((item) => approvalFilter.value === '全部状态' || item.status === approvalFilter.value))
 const selectedApproval = computed(() => approvals.value.find((item) => item.id === selectedApprovalId.value) ?? null)
@@ -174,8 +222,183 @@ function showToast(text: string) {
   }, 2800)
 }
 
-function courseDetailsForPlan(plan: { major: string; year: string }) {
-  return plan.major === planMajor.value && plan.year === planYear.value ? planCourses.value : []
+function statusLabel(status: PlanStatus): PlanCard['status'] {
+  return status === 'PUBLISHED' ? '已发布' : status === 'ARCHIVED' ? '已停用' : '草稿'
+}
+
+function formatDate(value: string) {
+  return new Date(value).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\//g, '-')
+}
+
+function normalizeCourse(course: CourseInfo): CourseInfo {
+  return {
+    ...course,
+    course_type: course.course_type ||
+      (course.course_code.startsWith('DEMO-TH-') ? 'THEORY' : 'EXPERIMENT'),
+  }
+}
+
+function courseDetailsForPlan(plan: PlanCard) {
+  return planDetails.value[plan.id] ?? []
+}
+
+function blankPlanCourse(): PlanCourseRequirement {
+  return {
+    id: planCourseSeed.value++,
+    courseId: '',
+    name: '',
+    studyYear: '第 1 学年',
+    semester: '第一学期',
+    prerequisites: [],
+    requiredCount: 0,
+    optionalCount: 0,
+    requiredProjects: [],
+    optionalProjects: [],
+    orderRule: '',
+    orderConstraints: [],
+    allowOrderOverride: false,
+  }
+}
+
+async function loadLookups() {
+  const [majorItems, courseItems] = await Promise.all([
+    api.get<MajorInfo[]>('/admin/majors'),
+    api.get<CourseInfo[]>('/admin/courses'),
+  ])
+  majors.value = majorItems
+  courseCatalog.value = courseItems.map(normalizeCourse)
+  if (!planMajor.value || !majorItems.some((item) => item.name === planMajor.value)) {
+    planMajor.value = majorItems[0]?.name ?? ''
+  }
+  await Promise.all(courseCatalog.value.map(async (course) => {
+    projectCatalog.value[course.id] = await api.get<ProjectInfo[]>(`/admin/courses/${course.id}/projects`)
+  }))
+}
+
+async function loadPlans() {
+  plansLoading.value = true
+  try {
+    const query = new URLSearchParams({ limit: '200' })
+    const selectedMajor = majors.value.find((item) => item.name === selectedPlan.value)
+    if (selectedMajor) query.set('major_id', selectedMajor.id)
+    if (planYearFilter.value !== '全部年份') query.set('enrollment_year', planYearFilter.value)
+    if (planKeyword.value.trim()) query.set('keyword', planKeyword.value.trim())
+    const response = await api.get<{ items: Array<{
+      id: string; plan_code: string; major: MajorInfo; enrollment_year: number; version_no: number
+      status: PlanStatus; updated_at: string; courses_count: number; required_projects_count: number
+      optional_projects_count: number; prerequisite_names: string[]; completeness: 'COMPLETE' | 'INCOMPLETE'
+      courses: PlanDetail['courses']
+    }>; total: number }>(`/training-plans?${query}`)
+    const discoveredCourses = new Map(
+      courseCatalog.value.map((course) => [course.id, course]),
+    )
+    for (const plan of response.items) {
+      for (const planCourse of plan.courses ?? []) {
+        discoveredCourses.set(
+          planCourse.course.id,
+          normalizeCourse(planCourse.course),
+        )
+        for (const prerequisite of planCourse.prerequisite_courses ?? []) {
+          discoveredCourses.set(prerequisite.id, normalizeCourse(prerequisite))
+        }
+        const existingProjects = new Map(
+          (projectCatalog.value[planCourse.course.id] ?? [])
+            .map((project) => [project.id, project]),
+        )
+        for (const item of planCourse.projects ?? []) {
+          existingProjects.set(item.project.id, item.project)
+        }
+        projectCatalog.value[planCourse.course.id] = [...existingProjects.values()]
+      }
+    }
+    courseCatalog.value = [...discoveredCourses.values()]
+      .sort((left, right) => left.course_name.localeCompare(right.course_name, 'zh-CN'))
+    plans.value = response.items.map((item) => ({
+      id: item.id,
+      plan_code: item.plan_code,
+      majorInfo: item.major,
+      major: item.major.name,
+      year: String(item.enrollment_year),
+      version: item.version_no,
+      courses: item.courses_count,
+      required: item.required_projects_count,
+      optional: item.optional_projects_count,
+      prerequisite: item.prerequisite_names.join('、') || '无先修要求',
+      updated: formatDate(item.updated_at),
+      rawStatus: item.status,
+      status: statusLabel(item.status),
+      completeness: item.completeness,
+    }))
+    planDetails.value = Object.fromEntries(
+      response.items.map((item) => [
+        item.id,
+        mapDetailCourses({
+          id: item.id,
+          major: item.major,
+          enrollment_year: item.enrollment_year,
+          status: item.status,
+          courses: item.courses,
+        }),
+      ]),
+    )
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '培养方案加载失败')
+  } finally {
+    plansLoading.value = false
+  }
+}
+
+function mapDetailCourses(detail: PlanDetail): PlanCourseRequirement[] {
+  return detail.courses.map((course) => ({
+    id: planCourseSeed.value++,
+    courseId: course.course.id,
+    name: course.course.course_name,
+    studyYear: `第 ${course.study_year} 学年`,
+    semester: course.semester_no === 1 ? '第一学期' : course.semester_no === 2 ? '第二学期' : '小学期',
+    prerequisites: (course.prerequisite_courses?.length ? course.prerequisite_courses : (course.prerequisite_course ? [course.prerequisite_course] : [])).map((item) => item.id),
+    requiredCount: course.required_project_count,
+    optionalCount: course.optional_project_min_count,
+    requiredProjects: course.projects.filter((item) => item.requirement_type === 'REQUIRED').map((item) => item.project.project_name),
+    optionalProjects: course.projects.filter((item) => item.requirement_type === 'OPTIONAL').map((item) => item.project.project_name),
+    orderRule: course.order_rule_text ?? '',
+    orderConstraints: (course.order_constraints ?? []).map((item) => item.description || `${item.before_project.project_name} → ${item.after_project.project_name}`),
+    allowOrderOverride: course.allow_order_override,
+  }))
+}
+
+async function loadPlanDetail(planId: string) {
+  const detail = await api.get<PlanDetail>(`/training-plans/${planId}`)
+  const courses = mapDetailCourses(detail)
+  planDetails.value[planId] = courses
+  return { detail, courses }
+}
+
+function openNewPlan() {
+  currentPlanId.value = null
+  planYear.value = String(new Date().getFullYear())
+  planCourses.value = [blankPlanCourse()]
+  activePlanCourseId.value = planCourses.value[0].id
+  planEditorOpen.value = true
+}
+
+async function editPlan(plan: PlanCard) {
+  try {
+    let detail: PlanDetail
+    if (plan.rawStatus === 'DRAFT') {
+      detail = (await loadPlanDetail(plan.id)).detail
+    } else {
+      detail = await api.post<PlanDetail>(`/training-plans/${plan.id}/draft-copy`, {})
+      await loadPlans()
+    }
+    currentPlanId.value = detail.id
+    planMajor.value = detail.major.name
+    planYear.value = String(detail.enrollment_year)
+    planCourses.value = mapDetailCourses(detail)
+    activePlanCourseId.value = planCourses.value[0]?.id ?? 0
+    planEditorOpen.value = true
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '培养方案编辑失败')
+  }
 }
 
 function toggleListItem(which: 'required' | 'optional', item: string) {
@@ -202,26 +425,32 @@ function addCustomProject(which: 'required' | 'optional') {
   }
   const course = activePlanCourse.value
   if (!course) return
-  const target = which === 'required' ? course.requiredProjects : course.optionalProjects
-  if (!target.includes(name)) toggleListItem(which, name)
-  input.value = ''
+  if (!course.courseId) {
+    showToast('请先选择实验课程')
+    return
+  }
+  const existing = (projectCatalog.value[course.courseId] ?? []).find((item) => item.project_name === name)
+  if (existing) {
+    toggleListItem(which, existing.project_name)
+    input.value = ''
+    return
+  }
+  pendingProjectKind.value = which
+  newProject.value = {
+    project_code: '',
+    project_name: name,
+    category: '',
+    required_slots: '',
+    default_group_size: '',
+    historical_selection_ratio: '',
+  }
+  projectEditorOpen.value = true
 }
 
 function addPlanCourse() {
-  const id = planCourseSeed.value++
-  planCourses.value.push({
-    id,
-    name: '',
-    studyYear: '第 1 学年',
-    semester: '第一学期',
-    prerequisite: '无先修要求',
-    requiredCount: 0,
-    optionalCount: 0,
-    requiredProjects: [],
-    optionalProjects: [],
-    orderRule: '',
-  })
-  activePlanCourseId.value = id
+  const course = blankPlanCourse()
+  planCourses.value.push(course)
+  activePlanCourseId.value = course.id
 }
 
 function removePlanCourse(id: number) {
@@ -233,14 +462,206 @@ function removePlanCourse(id: number) {
   activePlanCourseId.value = planCourses.value[0].id
 }
 
-function savePlanDraft() {
+function syncCourseSelection(course: PlanCourseRequirement) {
+  const selected = courseCatalog.value.find((item) => item.id === course.courseId)
+  course.name = selected?.course_name ?? ''
+  course.requiredProjects = []
+  course.optionalProjects = []
+  selectedRequiredProject.value = ''
+  selectedOptionalProject.value = ''
+}
+
+function experimentCourseOptions(course: PlanCourseRequirement) {
+  const selectedByOtherRows = new Set(
+    planCourses.value
+      .filter((item) => item.id !== course.id)
+      .map((item) => item.courseId)
+      .filter(Boolean),
+  )
+  return courseCatalog.value
+    .filter((item) =>
+      item.course_type === 'EXPERIMENT' &&
+      (!selectedByOtherRows.has(item.id) || item.id === course.courseId),
+    )
+    .sort((left, right) => left.course_name.localeCompare(right.course_name, 'zh-CN'))
+}
+
+function availableProjectOptions(which: 'required' | 'optional') {
+  const course = activePlanCourse.value
+  if (!course) return []
+  const selectedProjects = new Set(which === 'required'
+    ? [...course.requiredProjects, ...course.optionalProjects]
+    : [...course.optionalProjects, ...course.requiredProjects])
+  return activeProjectCatalog.value.filter((item) => !selectedProjects.has(item))
+}
+
+function addSelectedProject(which: 'required' | 'optional') {
+  const selection = which === 'required'
+    ? selectedRequiredProject
+    : selectedOptionalProject
+  if (!selection.value) {
+    showToast('请先从当前课程的项目库中选择实验项目')
+    return
+  }
+  toggleListItem(which, selection.value)
+  selection.value = ''
+}
+
+function displayPrerequisites(course: PlanCourseRequirement) {
+  const names = course.prerequisites
+    .map((id) => courseCatalog.value.find((item) => item.id === id)?.course_name)
+    .filter((item): item is string => Boolean(item))
+  return names.length ? names.join('、') : '无先修要求'
+}
+
+function displayOrderConstraints(course: PlanCourseRequirement) {
+  const source = course.orderConstraints.length
+    ? course.orderConstraints
+    : (course.orderRule ?? '').split(/[；;]/u)
+  const constraints = source
+    .map((item) => item.trim().replace(/[。；;]+$/u, ''))
+    .filter(Boolean)
+  if (constraints.length) return `${constraints.join('；')}。`
+  return '尚未设置项目顺序要求'
+}
+
+function addPrerequisite(course: PlanCourseRequirement) {
+  course.prerequisites.push('')
+}
+
+function removePrerequisite(course: PlanCourseRequirement, index: number) {
+  course.prerequisites.splice(index, 1)
+}
+
+function prerequisiteOptions(course: PlanCourseRequirement, index: number) {
+  return courseCatalog.value
+    .filter((item) =>
+      item.id !== course.courseId &&
+      (!course.prerequisites.includes(item.id) || course.prerequisites[index] === item.id),
+    )
+    .sort((left, right) => {
+      if (left.course_type !== right.course_type) return left.course_type === 'THEORY' ? -1 : 1
+      return left.course_name.localeCompare(right.course_name, 'zh-CN')
+    })
+}
+
+async function savePlanDraft() {
   if (!planMajor.value || !planYear.value || planCourses.value.some((course) => !course.name || !course.studyYear || !course.semester)) {
     showToast('请完整填写专业、培养年份及每门课程的修读学年和学期')
     return
   }
-  planEditorOpen.value = false
-  showToast('培养方案已保存为前端演示草稿，未写入真实系统')
+  const major = majors.value.find((item) => item.name === planMajor.value)
+  if (!major) return showToast('请选择有效专业')
+  try {
+    savingPlan.value = true
+    const payload = {
+      major_id: major.id,
+      enrollment_year: Number(planYear.value),
+      effective_from: null,
+      courses: planCourses.value.map((course) => {
+        const catalog = projectCatalog.value[course.courseId] ?? []
+        const prerequisiteIds = course.prerequisites.filter(Boolean)
+        return {
+          course_id: course.courseId,
+          course_nature: 'REQUIRED',
+          study_year: Number(course.studyYear.match(/\d+/)?.[0] ?? 1),
+          semester_no: course.semester === '第一学期' ? 1 : course.semester === '第二学期' ? 2 : 3,
+          prerequisite_course_ids: prerequisiteIds,
+          required_project_count: course.requiredCount,
+          optional_project_min_count: course.optionalCount,
+          order_rule_text: course.orderRule || null,
+          allow_order_override: course.allowOrderOverride,
+          projects: [
+            ...course.requiredProjects.map((name, index) => ({ project_id: catalog.find((item) => item.project_name === name)?.id, requirement_type: 'REQUIRED', display_order: index + 1 })),
+            ...course.optionalProjects.map((name, index) => ({ project_id: catalog.find((item) => item.project_name === name)?.id, requirement_type: 'OPTIONAL', display_order: course.requiredProjects.length + index + 1 })),
+          ],
+        }
+      }),
+    }
+    if (payload.courses.some((course) => !course.course_id || course.projects.some((item) => !item.project_id) || course.prerequisite_course_ids.some((item) => !item))) {
+      throw new Error('课程、项目或先修课程必须从后台基础资料中选择')
+    }
+    const saved = currentPlanId.value
+      ? await api.put<PlanDetail>(`/training-plans/${currentPlanId.value}`, payload)
+      : await api.post<PlanDetail>('/training-plans', payload)
+    currentPlanId.value = saved.id
+    planEditorOpen.value = false
+    await loadPlans()
+    showToast('培养方案草稿已保存')
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '培养方案保存失败')
+  } finally {
+    savingPlan.value = false
+  }
 }
+
+async function submitNewProject() {
+  const course = activePlanCourse.value
+  if (!course?.courseId) return
+  const item = newProject.value
+  if (!item.project_code || !item.project_name || !item.category || !item.required_slots || !item.default_group_size || item.historical_selection_ratio === '') {
+    showToast('请完整填写实验项目资料')
+    return
+  }
+  try {
+    const created = await api.post<ProjectInfo>(`/admin/courses/${course.courseId}/projects`, {
+      project_code: item.project_code,
+      project_name: item.project_name,
+      category: item.category,
+      required_slots: Number(item.required_slots),
+      default_group_size: Number(item.default_group_size),
+      historical_selection_ratio: Number(item.historical_selection_ratio),
+    })
+    projectCatalog.value[course.courseId] = [...(projectCatalog.value[course.courseId] ?? []), created]
+    toggleListItem(pendingProjectKind.value, created.project_name)
+    customRequiredProject.value = ''
+    customOptionalProject.value = ''
+    projectEditorOpen.value = false
+    showToast('实验项目已创建并加入当前培养方案')
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '实验项目创建失败')
+  }
+}
+
+async function handlePlanStatus(plan: PlanCard) {
+  if (plan.rawStatus === 'ARCHIVED') return showToast('该培养方案已经归档')
+  const action = plan.rawStatus === 'DRAFT' ? '发布' : '归档'
+  if (!window.confirm(`确认${action}“${plan.major} ${plan.year} 级 V${plan.version}”培养方案？`)) return
+  try {
+    await api.post(`/training-plans/${plan.id}/${plan.rawStatus === 'DRAFT' ? 'publish' : 'archive'}`, {})
+    await loadPlans()
+    showToast(`培养方案已${action}`)
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : `培养方案${action}失败`)
+  }
+}
+
+async function deletePlan(plan: PlanCard) {
+  if (!window.confirm(`确认删除“${plan.major} ${plan.year} 级 V${plan.version}”培养方案？删除后将归档保留审计记录，不会物理删除数据。`)) return
+  try {
+    await api.post(`/training-plans/${plan.id}/archive`, {})
+    await loadPlans()
+    showToast('培养方案已删除')
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '培养方案删除失败')
+  }
+}
+
+let filterTimer: number | undefined
+watch([selectedPlan, planYearFilter, planKeyword], () => {
+  window.clearTimeout(filterTimer)
+  filterTimer = window.setTimeout(loadPlans, 250)
+})
+
+onMounted(async () => {
+  try {
+    await loadLookups()
+    selectedPlan.value = '全部专业'
+    await loadPlans()
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '培养方案基础数据加载失败')
+  }
+})
 
 function generateSchedule() {
   if (aiGenerating.value) return
@@ -287,7 +708,7 @@ function generateSchedule() {
       <main class="system-content">
         <div class="system-page-heading">
           <div><h1>{{ viewMeta[activeView].title }}</h1><p>{{ viewMeta[activeView].subtitle }}</p></div>
-          <button v-if="activeView === 'plans'" @click="planEditorOpen = true">＋ 新建培养方案</button>
+          <button v-if="activeView === 'plans'" @click="openNewPlan">＋ 新建培养方案</button>
           <button v-else-if="activeView === 'courses'" @click="showToast('已创建一条空白课程配置草稿（演示）')">＋ 添加实验课程</button>
           <button v-else-if="activeView === 'labs'" @click="showToast('已创建一条空白实验室档案（演示）')">＋ 添加实验室</button>
           <button v-else-if="activeView === 'schedule'" class="ai-generate-button" :disabled="aiGenerating" @click="generateSchedule"><span>✦</span>{{ aiGenerating ? 'AI 正在生成...' : 'AI 一键生成课表' }}</button>
@@ -295,33 +716,34 @@ function generateSchedule() {
 
         <template v-if="activeView === 'plans'">
           <section class="system-summary-grid">
-            <article><span class="cyan">▤</span><div><small>培养方案</small><strong>4 <i>套</i></strong><p>覆盖 4 个专业方向</p></div></article>
-            <article><span class="blue">◫</span><div><small>已发布</small><strong>2 <i>套</i></strong><p>学生选课规则已生效</p></div></article>
-            <article><span class="purple">✦</span><div><small>实验课程</small><strong>3 <i>门</i></strong><p>共关联 16 个实验项目</p></div></article>
-            <article><span class="amber">!</span><div><small>待完善</small><strong>1 <i>套</i></strong><p>缺少项目顺序要求</p></div></article>
+            <article><span class="cyan">▤</span><div><small>培养方案</small><strong>{{ summary.plans }} <i>套</i></strong><p>覆盖 {{ summary.majors }} 个专业方向</p></div></article>
+            <article><span class="blue">◫</span><div><small>已发布</small><strong>{{ summary.published }} <i>套</i></strong><p>学生选课规则已生效</p></div></article>
+            <article><span class="purple">✦</span><div><small>实验课程</small><strong>{{ summary.courses }} <i>门</i></strong><p>共关联 {{ summary.projects }} 个实验项目</p></div></article>
+            <article><span class="amber">!</span><div><small>待完善</small><strong>{{ summary.incomplete }} <i>套</i></strong><p>缺少项目或顺序要求</p></div></article>
           </section>
           <section class="system-panel plan-toolbar">
-            <div class="plan-tabs"><button v-for="major in ['全部专业','物理学（师范）','应用物理学','电子信息科学与技术','材料物理']" :key="major" :class="{ active: selectedPlan === major }" @click="selectedPlan = major">{{ major }}</button></div>
-            <div><label class="system-search">⌕<input placeholder="搜索专业或培养年份" /></label><select><option>全部年份</option><option>2024</option><option>2023</option></select></div>
+            <div class="plan-tabs"><button v-for="major in ['全部专业', ...majors.map(item => item.name)]" :key="major" :class="{ active: selectedPlan === major }" @click="selectedPlan = major">{{ major }}</button></div>
+            <div><label class="system-search">⌕<input v-model="planKeyword" placeholder="搜索专业或培养年份" /></label><select v-model="planYearFilter"><option>全部年份</option><option v-for="year in planYears" :key="year">{{ year }}</option></select></div>
           </section>
           <div class="plan-card-grid">
-            <article v-for="plan in plans.filter(p => selectedPlan === '全部专业' || selectedPlan === p.major)" :key="`${plan.major}-${plan.year}`" class="system-panel plan-card">
-              <div class="plan-card-head"><span>{{ plan.major.slice(0, 1) }}</span><div><h3>{{ plan.major }}</h3><p>{{ plan.year }} 级培养方案 · 最近更新 {{ plan.updated }}</p></div><i :class="plan.status">{{ plan.status }}</i></div>
+            <article v-for="plan in plans" :key="plan.id" class="system-panel plan-card">
+              <div class="plan-card-head"><span>{{ plan.major.slice(0, 1) }}</span><div><h3>{{ plan.major }}</h3><p>{{ plan.year }} 级培养方案 V{{ plan.version }} · 最近更新 {{ plan.updated }}</p></div><i :class="plan.status">{{ plan.status }}</i></div>
               <div v-if="courseDetailsForPlan(plan).length" class="plan-course-detail-grid">
                 <section v-for="(course, index) in courseDetailsForPlan(plan)" :key="course.id" class="plan-course-detail">
                   <header><span>{{ String(index + 1).padStart(2, '0') }}</span><div><small>实验课程</small><h4>{{ course.name || '未命名课程' }}</h4></div></header>
                   <dl>
                     <div><dt>建议修读时间</dt><dd>{{ course.studyYear }} · {{ course.semester }}</dd></div>
-                    <div><dt>先修课程要求</dt><dd>{{ course.prerequisite || '无' }}</dd></div>
+                    <div><dt>先修课程要求</dt><dd>{{ displayPrerequisites(course) }}</dd></div>
                   </dl>
                   <div class="plan-project-group required"><strong>必选项目 <i>要求 {{ course.requiredCount }} 项</i></strong><p><span v-for="item in course.requiredProjects" :key="item">{{ item }}</span><em v-if="!course.requiredProjects.length">尚未配置</em></p></div>
                   <div class="plan-project-group optional"><strong>选做项目 <i>最低 {{ course.optionalCount }} 项</i></strong><p><span v-for="item in course.optionalProjects" :key="item">{{ item }}</span><em v-if="!course.optionalProjects.length">尚未配置</em></p></div>
-                  <div class="plan-order-rule"><small>项目顺序要求</small><p>{{ course.orderRule || '尚未设置项目顺序要求' }}</p></div>
+                  <div class="plan-order-rule"><small>项目顺序要求</small><p>{{ displayOrderConstraints(course) }}</p></div>
                 </section>
               </div>
               <div v-else class="plan-detail-empty"><span>＋</span><div><strong>尚未录入课程明细</strong><p>请进入“编辑要求”，逐门维护修读学期、必选项目、选做项目和顺序要求。</p></div></div>
-              <div class="plan-card-actions"><button @click="planEditorOpen = true">编辑要求</button><button @click="showToast('培养方案详情预览已打开（演示）')">查看详情</button><button>•••</button></div>
+              <div class="plan-card-actions"><button @click="editPlan(plan)">编辑要求</button><button :title="plan.rawStatus === 'DRAFT' ? '发布' : '归档'" @click="handlePlanStatus(plan)">•••</button><button type="button" @click="deletePlan(plan)">删除</button></div>
             </article>
+            <p v-if="!plansLoading && !plans.length">暂无符合条件的培养方案</p>
           </div>
         </template>
 
@@ -393,8 +815,8 @@ function generateSchedule() {
         <section>
           <h3>01　培养方案基础信息</h3>
           <div class="plan-form-grid">
-            <label>专业<select v-model="planMajor"><option>物理学（师范）</option><option>应用物理学</option><option>电子信息科学与技术</option><option>材料物理</option></select></label>
-            <label>培养年份<select v-model="planYear"><option>2024</option><option>2023</option><option>2022</option></select></label>
+            <label>专业<select v-model="planMajor" :disabled="!!currentPlanId"><option v-for="major in majors" :key="major.id">{{ major.name }}</option></select></label>
+            <label>培养年份<select v-model="planYear" :disabled="!!currentPlanId"><option v-for="year in enrollmentYearOptions" :key="year">{{ year }}</option></select></label>
           </div>
         </section>
         <section>
@@ -402,29 +824,55 @@ function generateSchedule() {
           <div class="plan-course-list">
             <article v-for="(course, index) in planCourses" :key="course.id" :class="{ active: activePlanCourseId === course.id }" @click="activePlanCourseId = course.id">
               <span>{{ String(index + 1).padStart(2, '0') }}</span>
-              <div><label>实验课程名称<input v-model="course.name" list="plan-course-options" placeholder="输入或选择课程名称" /></label><small class="course-requirement-summary">必选 {{ course.requiredProjects.length }} 项 · 选做 {{ course.optionalProjects.length }} 项</small></div>
+              <div><label>实验课程名称<select v-model="course.courseId" @change="syncCourseSelection(course)"><option value="" disabled>请选择实验课程</option><option v-for="item in experimentCourseOptions(course)" :key="item.id" :value="item.id">{{ item.course_name }}</option></select></label><small class="course-requirement-summary">必选 {{ course.requiredProjects.length }} 项 · 选做 {{ course.optionalProjects.length }} 项</small></div>
               <label>建议修读学年<select v-model="course.studyYear"><option>第 1 学年</option><option>第 2 学年</option><option>第 3 学年</option><option>第 4 学年</option></select></label>
               <label>建议修读学期<select v-model="course.semester"><option>第一学期</option><option>第二学期</option><option>小学期</option></select></label>
-              <label>先修课程要求<input v-model="course.prerequisite" list="prerequisite-options" placeholder="输入或选择先修课程" /></label>
+              <label>先修课程要求
+                <span class="prerequisite-inputs">
+                  <span v-for="(_, prerequisiteIndex) in course.prerequisites" :key="`${course.id}-${prerequisiteIndex}`">
+                    <select v-model="course.prerequisites[prerequisiteIndex]">
+                      <option value="" disabled>请选择先修课程</option>
+                      <option v-for="item in prerequisiteOptions(course, prerequisiteIndex)" :key="item.id" :value="item.id">{{ item.course_name }}</option>
+                    </select>
+                    <button type="button" @click.stop="removePrerequisite(course, prerequisiteIndex)">×</button>
+                  </span>
+                  <button type="button" @click.stop="addPrerequisite(course)">＋ 添加先修</button>
+                </span>
+              </label>
               <button type="button" aria-label="删除课程要求" @click.stop="removePlanCourse(course.id)">×</button>
             </article>
-            <datalist id="plan-course-options"><option>大学物理实验（上）</option><option>大学物理实验（下）</option><option>近代物理实验</option><option>专业物理实验</option></datalist>
-            <datalist id="prerequisite-options"><option>大学物理 A（上）</option><option>大学物理实验（上）</option><option>普通物理学（上）</option><option>无先修要求</option></datalist>
           </div>
         </section>
         <section v-if="activePlanCourse">
           <div class="plan-section-heading"><div><h3>03　实验项目要求</h3><p>当前配置：{{ activePlanCourse.name || '未命名课程' }} · {{ activePlanCourse.studyYear }} {{ activePlanCourse.semester }}</p></div><select v-model="activePlanCourseId"><option v-for="course in planCourses" :key="course.id" :value="course.id">{{ course.name || '未命名课程' }} · {{ course.studyYear }} {{ course.semester }}</option></select></div>
           <div class="requirement-columns">
-            <div><label>本课程必选项目数量<input v-model.number="activePlanCourse.requiredCount" type="number" min="0" /></label><p>选择“{{ activePlanCourse.name || '当前课程' }}”的必选项目</p><button v-for="item in activeProjectCatalog" :key="item" type="button" :class="{ selected: activePlanCourse.requiredProjects.includes(item) }" @click="toggleListItem('required',item)"><i>{{ activePlanCourse.requiredProjects.includes(item) ? '✓' : '＋' }}</i>{{ item }}</button><div class="custom-project-row"><input v-model="customRequiredProject" type="text" placeholder="手动输入本课程必选项目" @keyup.enter.prevent="addCustomProject('required')" /><button type="button" @click="addCustomProject('required')">添加</button></div></div>
-            <div><label>本课程选做项目最低数量<input v-model.number="activePlanCourse.optionalCount" type="number" min="0" /></label><p>选择“{{ activePlanCourse.name || '当前课程' }}”的选做项目</p><button v-for="item in activeProjectCatalog" :key="item" type="button" :class="{ selected: activePlanCourse.optionalProjects.includes(item) }" @click="toggleListItem('optional',item)"><i>{{ activePlanCourse.optionalProjects.includes(item) ? '✓' : '＋' }}</i>{{ item }}</button><div class="custom-project-row"><input v-model="customOptionalProject" type="text" placeholder="手动输入本课程选做项目" @keyup.enter.prevent="addCustomProject('optional')" /><button type="button" @click="addCustomProject('optional')">添加</button></div></div>
+            <div><label>本课程必选项目数量<input v-model.number="activePlanCourse.requiredCount" type="number" min="0" /></label><p>从“{{ activePlanCourse.name || '当前课程' }}”项目库选择必选项目</p><div class="project-select-row"><select v-model="selectedRequiredProject" :disabled="!activePlanCourse.courseId"><option value="">请选择本课程项目</option><option v-for="item in availableProjectOptions('required')" :key="item" :value="item">{{ item }}</option></select><button type="button" :disabled="!selectedRequiredProject" @click="addSelectedProject('required')">加入必选</button></div><div class="selected-project-list"><button v-for="item in activePlanCourse.requiredProjects" :key="item" type="button" class="selected" @click="toggleListItem('required',item)"><i>✓</i>{{ item }}<b>×</b></button></div><div class="custom-project-row"><input v-model="customRequiredProject" type="text" placeholder="项目库中没有？输入名称补充资料" @keyup.enter.prevent="addCustomProject('required')" /><button type="button" @click="addCustomProject('required')">新增项目</button></div></div>
+            <div><label>本课程选做项目最低数量<input v-model.number="activePlanCourse.optionalCount" type="number" min="0" /></label><p>从“{{ activePlanCourse.name || '当前课程' }}”项目库选择选做项目</p><div class="project-select-row"><select v-model="selectedOptionalProject" :disabled="!activePlanCourse.courseId"><option value="">请选择本课程项目</option><option v-for="item in availableProjectOptions('optional')" :key="item" :value="item">{{ item }}</option></select><button type="button" :disabled="!selectedOptionalProject" @click="addSelectedProject('optional')">加入选做</button></div><div class="selected-project-list"><button v-for="item in activePlanCourse.optionalProjects" :key="item" type="button" class="selected" @click="toggleListItem('optional',item)"><i>✓</i>{{ item }}<b>×</b></button></div><div class="custom-project-row"><input v-model="customOptionalProject" type="text" placeholder="项目库中没有？输入名称补充资料" @keyup.enter.prevent="addCustomProject('optional')" /><button type="button" @click="addCustomProject('optional')">新增项目</button></div></div>
           </div>
         </section>
         <section v-if="activePlanCourse">
           <h3>04　当前课程的顺序与约束</h3>
           <label class="full-field">实验项目顺序要求<textarea v-model="activePlanCourse.orderRule" rows="3" placeholder="例如：必须先完成基础测量项目，再选择近代物理项目"></textarea></label>
-          <div class="rule-options"><label><input type="checkbox" checked />未完成先修课程时禁止选课</label><label><input type="checkbox" checked />必做项目优先于选做项目</label><label><input type="checkbox" />允许特殊情况跳过项目顺序</label></div>
+          <div class="rule-options"><label><input type="checkbox" checked disabled />未完成先修课程时禁止选课</label><label><input type="checkbox" checked disabled />必做项目优先于选做项目</label><label><input v-model="activePlanCourse.allowOrderOverride" type="checkbox" />允许特殊情况跳过项目顺序</label></div>
         </section>
-        <footer><p>当前为演示表单，保存不会修改真实培养方案。</p><button type="button" @click="planEditorOpen = false">取消</button><button type="submit">保存为演示草稿</button></footer>
+        <footer><p>保存后写入培养方案草稿，发布前仍可继续修改。</p><button type="button" @click="planEditorOpen = false">取消</button><button type="submit" :disabled="savingPlan">{{ savingPlan ? '保存中...' : '保存草稿' }}</button></footer>
+      </form>
+    </div>
+
+    <div v-if="projectEditorOpen" class="system-dialog-backdrop" @click.self="projectEditorOpen = false">
+      <form class="plan-editor" @submit.prevent="submitNewProject">
+        <header><div><span>✦</span><div><h2>补充实验项目资料</h2><p>项目创建后将加入当前课程项目库</p></div></div><button type="button" @click="projectEditorOpen = false">×</button></header>
+        <section>
+          <div class="plan-form-grid">
+            <label>项目编码<input v-model.trim="newProject.project_code" maxlength="32" required placeholder="例如 PHYS-EXP-001" /></label>
+            <label>项目名称<input v-model.trim="newProject.project_name" maxlength="150" required /></label>
+            <label>项目分类<select v-model="newProject.category" required><option disabled value="">请选择</option><option value="BASIC">基础</option><option value="MECHANICS">力学</option><option value="ELECTRICITY">电学</option><option value="OPTICS">光学</option><option value="MODERN">近代物理</option><option value="OTHER">其他</option></select></label>
+            <label>所需节次<input v-model="newProject.required_slots" type="number" min="1" max="24" required /></label>
+            <label>默认分组人数<input v-model="newProject.default_group_size" type="number" min="1" max="100" required /></label>
+            <label>历史选中比例<input v-model="newProject.historical_selection_ratio" type="number" min="0" max="1" step="0.0001" required placeholder="0 至 1" /></label>
+          </div>
+        </section>
+        <footer><p>请确认资料准确，系统不会自动填充业务参数。</p><button type="button" @click="projectEditorOpen = false">取消</button><button type="submit">创建并加入</button></footer>
       </form>
     </div>
 
