@@ -16,7 +16,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import AuditMixin, BaseModel
 
@@ -55,6 +55,16 @@ class TeachingTask(AuditMixin, BaseModel):
         String(20), nullable=False, default="DRAFT"
     )
 
+    # relationships
+    course: Mapped["ExperimentCourse"] = relationship("ExperimentCourse", viewonly=True)
+    term: Mapped["AcademicTerm"] = relationship("AcademicTerm", viewonly=True)
+    cohorts: Mapped[list["TeachingTaskCohort"]] = relationship(
+        "TeachingTaskCohort", back_populates="task", viewonly=True,
+    )
+    demands: Mapped[list["ProjectDemand"]] = relationship(
+        "ProjectDemand", back_populates="task", viewonly=True,
+    )
+
 
 class TeachingTaskCohort(BaseModel):
     __tablename__ = "teaching_task_cohort"
@@ -80,6 +90,12 @@ class TeachingTaskCohort(BaseModel):
         ForeignKey("student_class.id", ondelete="RESTRICT")
     )
     student_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # relationships
+    task: Mapped["TeachingTask"] = relationship(
+        "TeachingTask", back_populates="cohorts", viewonly=True,
+    )
+    major: Mapped["Major"] = relationship("Major", viewonly=True)
 
 
 class ProjectDemand(BaseModel):
@@ -124,6 +140,14 @@ class ProjectDemand(BaseModel):
     required_session_count: Mapped[int] = mapped_column(Integer, nullable=False)
     calculation_snapshot: Mapped[dict] = mapped_column(
         nullable=False, default=dict
+    )
+
+    # relationships
+    task: Mapped["TeachingTask"] = relationship(
+        "TeachingTask", back_populates="demands", viewonly=True,
+    )
+    project: Mapped["ExperimentProject"] = relationship(
+        "ExperimentProject", viewonly=True,
     )
 
 

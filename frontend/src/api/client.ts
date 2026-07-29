@@ -43,6 +43,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     throw new Error(errorData?.detail || `请求失败 (${response.status})`)
   }
 
+  if (response.status === 204) return undefined as unknown as T
   return response.json()
 }
 

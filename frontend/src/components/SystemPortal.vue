@@ -124,30 +124,172 @@ const viewMeta: Record<SystemView, { title: string; subtitle: string }> = {
   approvals: { title: '申请审批管理', subtitle: '统一处理学生与教师申请，查看审批方案和驳回理由' },
 }
 
-const semesterCourses = [
-  {
-    name: '大学物理实验（上）',
-    code: 'PHYS-LAB-101',
-    target: '2024 级物理学、电子信息类',
-    weeks: '第 2–10 周',
-    projects: [
-      { name: '用单摆测量重力加速度', expected: 120, teachers: ['李老师', '陈老师'], equipment: ['单摆实验仪', '光电计时器', '游标卡尺'] },
-      { name: '示波器的原理与使用', expected: 108, teachers: ['王老师', '李老师'], equipment: ['数字示波器', '信号发生器', '万用表'] },
-      { name: '霍尔效应及磁场测量', expected: 72, teachers: ['陈老师'], equipment: ['霍尔效应实验仪', '数字毫特计', '稳压电源'] },
-    ],
-  },
-  {
-    name: '近代物理实验',
-    code: 'PHYS-LAB-203',
-    target: '2023 级物理学、应用物理学',
-    weeks: '第 5–16 周',
-    projects: [
-      { name: '光电效应与普朗克常量测定', expected: 64, teachers: ['周老师', '孙老师'], equipment: ['光电效应实验箱', '汞灯电源', '数字电流表'] },
-      { name: '弗兰克—赫兹实验', expected: 48, teachers: ['孙老师'], equipment: ['弗兰克—赫兹实验仪', '示波器'] },
-      { name: '密立根油滴实验', expected: 56, teachers: ['周老师'], equipment: ['密立根油滴仪', '显微测量系统'] },
-    ],
-  },
-]
+const semesterCourses = ref<Array<{
+  name: string; code: string; target: string; weeks: string;
+  projects: Array<{ name: string; expected: number; teachers: string[]; equipment: string[] }>
+}>>([])
+
+const termInfo = ref<{ academic_year: string; semester_no: number; total_weeks: number } | null>(null)
+const totalStudents = ref(0)
+
+async function fetchSemesterCourses(syncAll = false) {
+  try {
+    if (syncAll) await api.post('/admin/teaching-tasks/sync-all', {})
+    const [term, tasksRes, stuRes] = await Promise.all([
+      api.get<{ academic_year: string; semester_no: number; total_weeks: number }>('/admin/active-term'),
+      api.get<{ items: Array<{
+        id: string; task_code: string
+        course: { course_code: string; course_name: string }
+        planned_student_count: number
+        week_start: number; week_end: number
+        cohorts: Array<{ major: { name: string }; enrollment_year: number; student_count: number }>
+        demands: Array<{ id: string; project: { project_name: string }; requirement_type: string; required_capacity: number; teachers: string[]; equipment: string[] }>
+      }>; total: number }>('/admin/teaching-tasks'),
+      api.get<{ total: number }>('/admin/students/total'),
+    ])
+    termInfo.value = term
+    totalStudents.value = stuRes.total
+    semesterCourses.value = tasksRes.items.map(t => {
+      const targetSet = [...new Set(t.cohorts.map(c => `${c.enrollment_year} 级${c.major.name}`))]
+      return {
+        _taskId: t.id,
+        _totalStudents: t.planned_student_count,
+        name: t.course.course_name,
+        code: t.course.course_code,
+        target: targetSet.join('、') || '未配置',
+        weeks: `第 ${t.week_start}–${t.week_end} 周`,
+        projects: t.demands.map(d => ({
+          _demandId: d.id,
+          name: d.project.project_name,
+          expected: d.required_capacity,
+          teachers: d.teachers || [],
+          equipment: d.equipment || [],
+        })),
+      }
+    })
+  } catch { /* silently fail, keep empty state */ }
+}
+
+// ── 添加/编辑教学任务 ──
+const addCourseDialogOpen = ref(false)
+const selectedCourseId = ref('')
+const newWeekStart = ref(2)
+const newWeekEnd = ref(16)
+const editTaskDialog = ref<{ id: string; code: string; name: string; weekStart: number; weekEnd: number } | null>(null)
+
+const availableCourses = computed(() => {
+  if (!courseCatalog.value.length || !semesterCourses.value.length) return courseCatalog.value
+  const used = new Set(semesterCourses.value.map(c => c.code))
+  return courseCatalog.value.filter(c => !used.has(c.course_code) && c.course_type === 'EXPERIMENT')
+})
+
+function openAddCourseDialog() {
+  selectedCourseId.value = ''
+  newWeekStart.value = 2
+  newWeekEnd.value = 16
+  addCourseDialogOpen.value = true
+}
+
+async function addTeachingTask() {
+  if (!selectedCourseId.value) { showToast('请选择实验课程'); return }
+  try {
+    await api.post('/admin/teaching-tasks', { course_id: selectedCourseId.value, week_start: newWeekStart.value, week_end: newWeekEnd.value })
+    addCourseDialogOpen.value = false
+    showToast('教学任务已创建')
+    await fetchSemesterCourses()
+  } catch (err) { showToast(err instanceof Error ? err.message : '创建失败') }
+}
+
+function openEditTaskDialog(course: any) {
+  const w = (course.weeks || '').match(/(\d+).*?(\d+)/)
+  editTaskDialog.value = { id: course._taskId || '', code: course.code, name: course.name, weekStart: w ? +w[1] : 2, weekEnd: w ? +w[2] : 16 }
+}
+
+async function saveEditTask() {
+  if (!editTaskDialog.value) return
+  try {
+    await api.put(`/admin/teaching-tasks/${editTaskDialog.value.id}`, { week_start: editTaskDialog.value.weekStart, week_end: editTaskDialog.value.weekEnd })
+    editTaskDialog.value = null
+    showToast('已更新')
+    await fetchSemesterCourses()
+  } catch (err) { showToast(err instanceof Error ? err.message : '更新失败') }
+}
+
+async function deleteTeachingTask(course: any) {
+  if (!course._taskId) return
+  if (!confirm(`确定删除"${course.name}"的教学任务吗？`)) return
+  try {
+    await api.delete(`/admin/teaching-tasks/${course._taskId}`)
+    showToast('已删除')
+    await fetchSemesterCourses()
+  } catch (err) { showToast(err instanceof Error ? err.message : '删除失败') }
+}
+
+// ── 编辑项目需求 ──
+const editProjectDialog = ref<{ demandId: string; name: string; capacity: number; taskId: string } | null>(null)
+
+function openEditProjectDialog(project: any, course: any) {
+  editProjectDialog.value = { demandId: project._demandId, name: project.name, capacity: project.expected, taskId: course._taskId }
+}
+
+async function saveProjectDemand() {
+  if (!editProjectDialog.value) return
+  try {
+    await api.put(`/admin/teaching-tasks/${editProjectDialog.value.taskId}/demands/${editProjectDialog.value.demandId}`, { required_capacity: editProjectDialog.value.capacity })
+    editProjectDialog.value = null
+    showToast('项目需求已更新')
+    await fetchSemesterCourses()
+  } catch (err) { showToast(err instanceof Error ? err.message : '更新失败') }
+}
+
+async function deleteProjectDemand(project: any, course: any) {
+  if (!confirm(`确定删除项目"${project.name}"吗？`)) return
+  try {
+    await api.delete(`/admin/teaching-tasks/${course._taskId}/demands/${project._demandId}`)
+    showToast('项目已删除')
+    await fetchSemesterCourses()
+  } catch (err) { showToast(err instanceof Error ? err.message : '删除失败') }
+}
+
+const addProjectDialog = ref<{
+  course: any
+  // new project fields
+  project_code: string; project_name: string; category: string
+  required_slots: number; default_group_size: number; historical_selection_ratio: number
+  reqType: string
+} | null>(null)
+
+function openAddProjectDialog(course: any) {
+  addProjectDialog.value = {
+    course, reqType: 'REQUIRED',
+    project_code: '', project_name: '', category: 'BASIC',
+    required_slots: 4, default_group_size: 2, historical_selection_ratio: 0.5,
+  }
+}
+
+async function saveAddProject() {
+  const d = addProjectDialog.value
+  if (!d || !d.project_code || !d.project_name) { showToast('请填写项目编号和名称'); return }
+  try {
+    // 1. 找课程 ID
+    const courseOpt = courseCatalog.value.find(c => c.course_code === d.course.code)
+    if (!courseOpt) { showToast('未找到课程信息'); return }
+    // 2. 创建项目
+    const project = await api.post<{ id: string }>(`/admin/courses/${courseOpt.id}/projects`, {
+      project_code: d.project_code,
+      project_name: d.project_name,
+      category: d.category,
+      required_slots: d.required_slots,
+      default_group_size: d.default_group_size,
+      historical_selection_ratio: d.historical_selection_ratio,
+    })
+    // 3. 加入教学任务
+    await api.post(`/admin/teaching-tasks/${d.course._taskId}/demands`, { project_id: project.id, requirement_type: d.reqType })
+    addProjectDialog.value = null
+    showToast('项目已创建并添加')
+    await fetchSemesterCourses()
+  } catch (err) { showToast(err instanceof Error ? err.message : '添加失败') }
+}
 
 const labs = [
   { name: '实验楼 A203', type: '基础力学实验室', capacity: 24, manager: '赵老师', availability: '可排课', equipment: [
@@ -626,7 +768,7 @@ async function submitNewProject() {
 async function handlePlanStatus(plan: PlanCard) {
   if (plan.rawStatus === 'ARCHIVED') return showToast('该培养方案已经归档')
   const action = plan.rawStatus === 'DRAFT' ? '发布' : '归档'
-  if (!window.confirm(`确认${action}“${plan.major} ${plan.year} 级 V${plan.version}”培养方案？`)) return
+  if (!window.confirm(`确认${action}"${plan.major} ${plan.year} 级 V${plan.version}"培养方案？`)) return
   try {
     await api.post(`/training-plans/${plan.id}/${plan.rawStatus === 'DRAFT' ? 'publish' : 'archive'}`, {})
     await loadPlans()
@@ -637,7 +779,7 @@ async function handlePlanStatus(plan: PlanCard) {
 }
 
 async function deletePlan(plan: PlanCard) {
-  if (!window.confirm(`确认删除“${plan.major} ${plan.year} 级 V${plan.version}”培养方案？删除后将归档保留审计记录，不会物理删除数据。`)) return
+  if (!window.confirm(`确认删除"${plan.major} ${plan.year} 级 V${plan.version}"培养方案？删除后将归档保留审计记录，不会物理删除数据。`)) return
   try {
     await api.post(`/training-plans/${plan.id}/archive`, {})
     await loadPlans()
@@ -658,6 +800,7 @@ onMounted(async () => {
     await loadLookups()
     selectedPlan.value = '全部专业'
     await loadPlans()
+    await fetchSemesterCourses(true)
   } catch (error) {
     showToast(error instanceof Error ? error.message : '培养方案基础数据加载失败')
   }
@@ -709,7 +852,7 @@ function generateSchedule() {
         <div class="system-page-heading">
           <div><h1>{{ viewMeta[activeView].title }}</h1><p>{{ viewMeta[activeView].subtitle }}</p></div>
           <button v-if="activeView === 'plans'" @click="openNewPlan">＋ 新建培养方案</button>
-          <button v-else-if="activeView === 'courses'" @click="showToast('已创建一条空白课程配置草稿（演示）')">＋ 添加实验课程</button>
+          <button v-else-if="activeView === 'courses'" @click="openAddCourseDialog">＋ 添加实验课程</button>
           <button v-else-if="activeView === 'labs'" @click="showToast('已创建一条空白实验室档案（演示）')">＋ 添加实验室</button>
           <button v-else-if="activeView === 'schedule'" class="ai-generate-button" :disabled="aiGenerating" @click="generateSchedule"><span>✦</span>{{ aiGenerating ? 'AI 正在生成...' : 'AI 一键生成课表' }}</button>
         </div>
@@ -740,7 +883,7 @@ function generateSchedule() {
                   <div class="plan-order-rule"><small>项目顺序要求</small><p>{{ displayOrderConstraints(course) }}</p></div>
                 </section>
               </div>
-              <div v-else class="plan-detail-empty"><span>＋</span><div><strong>尚未录入课程明细</strong><p>请进入“编辑要求”，逐门维护修读学期、必选项目、选做项目和顺序要求。</p></div></div>
+              <div v-else class="plan-detail-empty"><span>＋</span><div><strong>尚未录入课程明细</strong><p>请进入"编辑要求"，逐门维护修读学期、必选项目、选做项目和顺序要求。</p></div></div>
               <div class="plan-card-actions"><button @click="editPlan(plan)">编辑要求</button><button :title="plan.rawStatus === 'DRAFT' ? '发布' : '归档'" @click="handlePlanStatus(plan)">•••</button><button type="button" @click="deletePlan(plan)">删除</button></div>
             </article>
             <p v-if="!plansLoading && !plans.length">暂无符合条件的培养方案</p>
@@ -749,14 +892,14 @@ function generateSchedule() {
 
         <template v-else-if="activeView === 'courses'">
           <section class="semester-banner">
-            <div><span>当前开课学期</span><strong>2025–2026 学年 第二学期</strong><p>选课开放时间：演示日期 · 当前课程配置仅为前端示例</p></div>
-            <div><span>已设置课程</span><strong>2 <i>门</i></strong></div><div><span>实验项目</span><strong>6 <i>项</i></strong></div><div><span>预计选课</span><strong>568 <i>人次</i></strong></div>
+            <div><span>当前开课学期</span><strong>{{ termInfo ? `${termInfo.academic_year} 学年 第${termInfo.semester_no === 1 ? '一' : termInfo.semester_no === 2 ? '二' : '三'}学期` : '加载中...' }}</strong><p>总教学周数：{{ termInfo?.total_weeks ?? '—' }} 周 · 教学任务配置</p></div>
+            <div><span>已设置课程</span><strong>{{ semesterCourses.length }} <i>门</i></strong></div><div><span>实验项目</span><strong>{{ semesterCourses.reduce((s, c) => s + c.projects.length, 0) }} <i>项</i></strong></div><div><span>在籍学生总人数</span><strong>{{ totalStudents }} <i>人</i></strong></div>
           </section>
           <section v-for="course in semesterCourses" :key="course.code" class="system-panel course-config-card">
-            <header><span class="course-config-icon">{{ course.name.slice(0, 1) }}</span><div><small>{{ course.code }}</small><h3>{{ course.name }}</h3><p>面向：{{ course.target }}　·　开设周次：{{ course.weeks }}</p></div><i>本学期开设</i><button @click="showToast('课程基础信息已进入编辑状态（演示）')">编辑课程</button></header>
+            <header><span class="course-config-icon">{{ course.name.slice(0, 1) }}</span><div><small>{{ course.code }}</small><h3>{{ course.name }}</h3><p>面向：{{ course.target }}　·　开设周次：{{ course.weeks }}</p></div><i>本学期开设</i><button @click="openEditTaskDialog(course)">编辑课程</button><button @click="deleteTeachingTask(course)" style="color:red;margin-left:.25rem">删除</button><button @click="openAddProjectDialog(course)" style="margin-left:.25rem">＋ 添加项目</button></header>
             <div class="course-project-table">
               <div class="course-project-row course-project-head"><span>实验项目</span><span>预计人数</span><span>负责教师</span><span>所需实验器材</span><span>配置状态</span><span>操作</span></div>
-              <div v-for="project in course.projects" :key="project.name" class="course-project-row"><span><b>{{ project.name }}</b><small>四节连堂 · 单次完成</small></span><span><strong>{{ project.expected }}</strong> 人次</span><span class="tag-cell"><i v-for="teacher in project.teachers" :key="teacher">{{ teacher }}</i></span><span class="tag-cell"><i v-for="item in project.equipment" :key="item">{{ item }}</i></span><span><em>已配置</em></span><span><button @click="showToast(`正在编辑“${project.name}”（演示）`)">编辑</button></span></div>
+              <div v-for="project in course.projects" :key="project.name" class="course-project-row"><span><b>{{ project.name }}</b><small>四节连堂 · 单次完成</small></span><span><strong>{{ project.expected }}</strong> 人次</span><span class="tag-cell"><i v-for="teacher in project.teachers" :key="teacher">{{ teacher }}</i></span><span class="tag-cell"><i v-for="item in project.equipment" :key="item">{{ item }}</i></span><span><em>已配置</em></span><span><button @click="openEditProjectDialog(project, course)">编辑</button><button @click="deleteProjectDemand(project, course)" style="color:red;margin-left:.25rem">删除</button></span></div>
             </div>
           </section>
         </template>
@@ -769,7 +912,7 @@ function generateSchedule() {
             <div class="system-panel-title"><div><h3>{{ currentLab.name }} · 设备台账</h3><p>实验室单次最多容纳 {{ currentLab.capacity }} 人开展实验</p></div><div><label class="system-search">⌕<input placeholder="搜索器材名称或型号" /></label><button @click="showToast('已创建一条空白设备记录（演示）')">＋ 添加器材</button></div></div>
             <div class="equipment-table">
               <div class="equipment-row equipment-head"><span>器材名称</span><span>型号 / 规格</span><span>账面数量</span><span>可用数量</span><span>使用状态</span><span>操作</span></div>
-              <div v-for="item in currentLab.equipment" :key="item.name" class="equipment-row"><span><i>◇</i><b>{{ item.name }}</b></span><span>{{ item.model }}</span><span>{{ item.quantity }} 台 / 套</span><span><strong>{{ item.usable }}</strong> 台 / 套</span><span><em :class="{ warning: item.status !== '正常' }">{{ item.status }}</em></span><span><button @click="showToast(`已打开“${item.name}”设备档案（演示）`)">管理</button></span></div>
+              <div v-for="item in currentLab.equipment" :key="item.name" class="equipment-row"><span><i>◇</i><b>{{ item.name }}</b></span><span>{{ item.model }}</span><span>{{ item.quantity }} 台 / 套</span><span><strong>{{ item.usable }}</strong> 台 / 套</span><span><em :class="{ warning: item.status !== '正常' }">{{ item.status }}</em></span><span><button @click="showToast('已打开档案（演示）')">管理</button></span></div>
             </div>
           </section>
           <section class="lab-capacity-note"><span>i</span><p>实验室容量应取场地安全容量、实验台位数及关键器材可用套数中的最小值。当前数据均为演示配置。</p></section>
@@ -846,8 +989,8 @@ function generateSchedule() {
         <section v-if="activePlanCourse">
           <div class="plan-section-heading"><div><h3>03　实验项目要求</h3><p>当前配置：{{ activePlanCourse.name || '未命名课程' }} · {{ activePlanCourse.studyYear }} {{ activePlanCourse.semester }}</p></div><select v-model="activePlanCourseId"><option v-for="course in planCourses" :key="course.id" :value="course.id">{{ course.name || '未命名课程' }} · {{ course.studyYear }} {{ course.semester }}</option></select></div>
           <div class="requirement-columns">
-            <div><label>本课程必选项目数量<input v-model.number="activePlanCourse.requiredCount" type="number" min="0" /></label><p>从“{{ activePlanCourse.name || '当前课程' }}”项目库选择必选项目</p><div class="project-select-row"><select v-model="selectedRequiredProject" :disabled="!activePlanCourse.courseId"><option value="">请选择本课程项目</option><option v-for="item in availableProjectOptions('required')" :key="item" :value="item">{{ item }}</option></select><button type="button" :disabled="!selectedRequiredProject" @click="addSelectedProject('required')">加入必选</button></div><div class="selected-project-list"><button v-for="item in activePlanCourse.requiredProjects" :key="item" type="button" class="selected" @click="toggleListItem('required',item)"><i>✓</i>{{ item }}<b>×</b></button></div><div class="custom-project-row"><input v-model="customRequiredProject" type="text" placeholder="项目库中没有？输入名称补充资料" @keyup.enter.prevent="addCustomProject('required')" /><button type="button" @click="addCustomProject('required')">新增项目</button></div></div>
-            <div><label>本课程选做项目最低数量<input v-model.number="activePlanCourse.optionalCount" type="number" min="0" /></label><p>从“{{ activePlanCourse.name || '当前课程' }}”项目库选择选做项目</p><div class="project-select-row"><select v-model="selectedOptionalProject" :disabled="!activePlanCourse.courseId"><option value="">请选择本课程项目</option><option v-for="item in availableProjectOptions('optional')" :key="item" :value="item">{{ item }}</option></select><button type="button" :disabled="!selectedOptionalProject" @click="addSelectedProject('optional')">加入选做</button></div><div class="selected-project-list"><button v-for="item in activePlanCourse.optionalProjects" :key="item" type="button" class="selected" @click="toggleListItem('optional',item)"><i>✓</i>{{ item }}<b>×</b></button></div><div class="custom-project-row"><input v-model="customOptionalProject" type="text" placeholder="项目库中没有？输入名称补充资料" @keyup.enter.prevent="addCustomProject('optional')" /><button type="button" @click="addCustomProject('optional')">新增项目</button></div></div>
+            <div><label>本课程必选项目数量<input v-model.number="activePlanCourse.requiredCount" type="number" min="0" /></label><p>从"{{ activePlanCourse.name || '当前课程' }}"项目库选择必选项目</p><div class="project-select-row"><select v-model="selectedRequiredProject" :disabled="!activePlanCourse.courseId"><option value="">请选择本课程项目</option><option v-for="item in availableProjectOptions('required')" :key="item" :value="item">{{ item }}</option></select><button type="button" :disabled="!selectedRequiredProject" @click="addSelectedProject('required')">加入必选</button></div><div class="selected-project-list"><button v-for="item in activePlanCourse.requiredProjects" :key="item" type="button" class="selected" @click="toggleListItem('required',item)"><i>✓</i>{{ item }}<b>×</b></button></div><div class="custom-project-row"><input v-model="customRequiredProject" type="text" placeholder="项目库中没有？输入名称补充资料" @keyup.enter.prevent="addCustomProject('required')" /><button type="button" @click="addCustomProject('required')">新增项目</button></div></div>
+            <div><label>本课程选做项目最低数量<input v-model.number="activePlanCourse.optionalCount" type="number" min="0" /></label><p>从"{{ activePlanCourse.name || '当前课程' }}"项目库选择选做项目</p><div class="project-select-row"><select v-model="selectedOptionalProject" :disabled="!activePlanCourse.courseId"><option value="">请选择本课程项目</option><option v-for="item in availableProjectOptions('optional')" :key="item" :value="item">{{ item }}</option></select><button type="button" :disabled="!selectedOptionalProject" @click="addSelectedProject('optional')">加入选做</button></div><div class="selected-project-list"><button v-for="item in activePlanCourse.optionalProjects" :key="item" type="button" class="selected" @click="toggleListItem('optional',item)"><i>✓</i>{{ item }}<b>×</b></button></div><div class="custom-project-row"><input v-model="customOptionalProject" type="text" placeholder="项目库中没有？输入名称补充资料" @keyup.enter.prevent="addCustomProject('optional')" /><button type="button" @click="addCustomProject('optional')">新增项目</button></div></div>
           </div>
         </section>
         <section v-if="activePlanCourse">
@@ -886,5 +1029,65 @@ function generateSchedule() {
     </div>
 
     <Transition name="toast"><div v-if="toast" class="system-toast"><span>✓</span>{{ toast }}</div></Transition>
+
+    <!-- 添加实验课程弹窗 -->
+    <Teleport to="body">
+      <div v-if="addCourseDialogOpen" class="system-dialog-backdrop" @click.self="addCourseDialogOpen = false">
+        <form class="approval-detail" style="width:440px" @submit.prevent="addTeachingTask">
+          <header><div><span>＋</span><div><h2>添加实验课程</h2><p>从课程库中选择并创建教学任务</p></div></div><button type="button" @click="addCourseDialogOpen = false">×</button></header>
+          <label style="display:block;margin-bottom:1rem">实验课程<select v-model="selectedCourseId" style="width:100%"><option value="" disabled>请选择课程</option><option v-for="c in availableCourses" :key="c.id" :value="c.id">{{ c.course_code }} {{ c.course_name }}</option></select></label>
+          <div style="display:flex;gap:1rem;margin-bottom:1rem">
+            <label style="flex:1">起始周<input v-model.number="newWeekStart" type="number" min="1" max="20" style="width:100%" /></label>
+            <label style="flex:1">结束周<input v-model.number="newWeekEnd" type="number" min="1" max="20" style="width:100%" /></label>
+          </div>
+          <p v-if="!availableCourses.length" style="color:#888">所有实验课程已创建教学任务。</p>
+          <footer><button type="button" @click="addCourseDialogOpen = false">取消</button><button type="submit" :disabled="!selectedCourseId">创建</button></footer>
+        </form>
+      </div>
+    </Teleport>
+
+    <!-- 编辑课程弹窗 -->
+    <Teleport to="body">
+      <div v-if="editTaskDialog" class="system-dialog-backdrop" @click.self="editTaskDialog = null">
+        <form class="approval-detail" style="width:400px" @submit.prevent="saveEditTask">
+          <header><div><span>✎</span><div><h2>编辑教学任务</h2><p>{{ editTaskDialog.code }} {{ editTaskDialog.name }}</p></div></div><button type="button" @click="editTaskDialog = null">×</button></header>
+          <div style="display:flex;gap:1rem;margin-bottom:1rem">
+            <label style="flex:1">起始周<input v-model.number="editTaskDialog.weekStart" type="number" min="1" max="20" style="width:100%" /></label>
+            <label style="flex:1">结束周<input v-model.number="editTaskDialog.weekEnd" type="number" min="1" max="20" style="width:100%" /></label>
+          </div>
+          <footer><button type="button" @click="editTaskDialog = null">取消</button><button type="submit">保存</button></footer>
+        </form>
+      </div>
+    </Teleport>
+
+    <!-- 添加项目弹窗 -->
+    <Teleport to="body">
+      <div v-if="addProjectDialog" class="system-dialog-backdrop" @click.self="addProjectDialog = null">
+        <form class="approval-detail" style="width:500px;max-height:85vh;overflow-y:auto" @submit.prevent="saveAddProject">
+          <header><div><span>＋</span><div><h2>创建实验项目</h2><p>课程：{{ addProjectDialog.course.code }}</p></div></div><button type="button" @click="addProjectDialog = null">×</button></header>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+            <label>项目编号 *<input v-model="addProjectDialog.project_code" placeholder="例：PROJ-001" style="width:100%" /></label>
+            <label>项目名称 *<input v-model="addProjectDialog.project_name" placeholder="例：用单摆测量重力加速度" style="width:100%" /></label>
+            <label>类别<select v-model="addProjectDialog.category" style="width:100%"><option>BASIC</option><option>MECHANICS</option><option>ELECTRICITY</option><option>OPTICS</option><option>MODERN</option><option>OTHER</option></select></label>
+            <label>所需学时<input v-model.number="addProjectDialog.required_slots" type="number" min="1" max="24" style="width:100%" /></label>
+            <label>每组人数<input v-model.number="addProjectDialog.default_group_size" type="number" min="1" max="100" style="width:100%" /></label>
+            <label>往届选择比<input v-model.number="addProjectDialog.historical_selection_ratio" type="number" min="0" max="1" step="0.01" style="width:100%" /></label>
+          </div>
+          <div style="margin:.75rem 0"><label><input v-model="addProjectDialog.reqType" value="REQUIRED" type="radio" /> 必做</label><label style="margin-left:1rem"><input v-model="addProjectDialog.reqType" value="OPTIONAL" type="radio" /> 选做</label></div>
+          <footer><button type="button" @click="addProjectDialog = null">取消</button><button type="submit">创建并添加</button></footer>
+        </form>
+      </div>
+    </Teleport>
+
+    <!-- 编辑项目需求弹窗 -->
+    <Teleport to="body">
+      <div v-if="editProjectDialog" class="system-dialog-backdrop" @click.self="editProjectDialog = null">
+        <form class="approval-detail" style="width:400px" @submit.prevent="saveProjectDemand">
+          <header><div><span>✎</span><div><h2>编辑项目需求</h2><p>{{ editProjectDialog.name }}</p></div></div><button type="button" @click="editProjectDialog = null">×</button></header>
+          <label style="display:block;margin-bottom:1rem">预计容量（人次）<input v-model.number="editProjectDialog.capacity" type="number" min="1" style="width:100%" /></label>
+          <footer><button type="button" @click="editProjectDialog = null">取消</button><button type="submit">保存</button></footer>
+        </form>
+      </div>
+    </Teleport>
   </div>
 </template>
