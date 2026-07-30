@@ -27,7 +27,17 @@ type PlanCourseRequirement = {
 }
 type MajorInfo = { id: string; code: string; name: string }
 type CourseInfo = { id: string; course_code: string; course_name: string; course_type: 'EXPERIMENT' | 'THEORY' }
-type ProjectInfo = { id: string; project_code: string; project_name: string; category: string | null }
+type ProjectGroupMode = 'INDIVIDUAL' | 'GROUP'
+type ProjectInfo = {
+  id: string
+  project_code: string
+  project_name: string
+  category: string | null
+  required_slots: number
+  group_mode: ProjectGroupMode
+  default_group_size: number
+  historical_selection_ratio: number
+}
 type PlanStatus = 'DRAFT' | 'PUBLISHED' | 'ARCHIVED'
 type PlanCard = {
   id: string
@@ -98,10 +108,13 @@ const newProject = ref({
   project_name: '',
   category: '',
   required_slots: '',
+  group_mode: 'INDIVIDUAL' as ProjectGroupMode,
   default_group_size: '',
   historical_selection_ratio: '',
 })
 const activeLab = ref('实验楼 A203')
+const selectedLabIds = ref<Set<string>>(new Set())
+const equipKeyword = ref('')
 const scheduleLab = ref('实验楼 A203')
 const aiGenerating = ref(false)
 const aiGenerated = ref(false)
@@ -125,8 +138,20 @@ const viewMeta: Record<SystemView, { title: string; subtitle: string }> = {
 }
 
 const semesterCourses = ref<Array<{
+  _taskId: string
+  _courseId: string
+  _totalStudents: number
   name: string; code: string; target: string; weeks: string;
-  projects: Array<{ name: string; expected: number; teachers: string[]; equipment: string[] }>
+  projects: Array<{
+    _demandId: string
+    _projectId: string
+    name: string
+    groupMode: ProjectGroupMode
+    groupSize: number
+    expected: number
+    teachers: string[]
+    equipment: string[]
+  }>
 }>>([])
 
 const termInfo = ref<{ academic_year: string; semester_no: number; total_weeks: number } | null>(null)
@@ -139,11 +164,18 @@ async function fetchSemesterCourses(syncAll = false) {
       api.get<{ academic_year: string; semester_no: number; total_weeks: number }>('/admin/active-term'),
       api.get<{ items: Array<{
         id: string; task_code: string
-        course: { course_code: string; course_name: string }
+        course: { id: string; course_code: string; course_name: string }
         planned_student_count: number
         week_start: number; week_end: number
         cohorts: Array<{ major: { name: string }; enrollment_year: number; student_count: number }>
-        demands: Array<{ id: string; project: { project_name: string }; requirement_type: string; required_capacity: number; teachers: string[]; equipment: string[] }>
+        demands: Array<{
+          id: string
+          project: ProjectInfo
+          requirement_type: string
+          required_capacity: number
+          teachers: string[]
+          equipment: string[]
+        }>
       }>; total: number }>('/admin/teaching-tasks'),
       api.get<{ total: number }>('/admin/students/total'),
     ])
@@ -153,6 +185,7 @@ async function fetchSemesterCourses(syncAll = false) {
       const targetSet = [...new Set(t.cohorts.map(c => `${c.enrollment_year} 级${c.major.name}`))]
       return {
         _taskId: t.id,
+        _courseId: t.course.id,
         _totalStudents: t.planned_student_count,
         name: t.course.course_name,
         code: t.course.course_code,
@@ -160,7 +193,10 @@ async function fetchSemesterCourses(syncAll = false) {
         weeks: `第 ${t.week_start}–${t.week_end} 周`,
         projects: t.demands.map(d => ({
           _demandId: d.id,
+          _projectId: d.project.id,
           name: d.project.project_name,
+          groupMode: d.project.group_mode || 'INDIVIDUAL',
+          groupSize: d.project.default_group_size || 1,
           expected: d.required_capacity,
           teachers: d.teachers || [],
           equipment: d.equipment || [],
@@ -226,18 +262,49 @@ async function deleteTeachingTask(course: any) {
 }
 
 // ── 编辑项目需求 ──
-const editProjectDialog = ref<{ demandId: string; name: string; capacity: number; taskId: string } | null>(null)
+const editProjectDialog = ref<{
+  demandId: string
+  projectId: string
+  courseId: string
+  name: string
+  capacity: number
+  taskId: string
+  groupMode: ProjectGroupMode
+  groupSize: number
+} | null>(null)
 
 function openEditProjectDialog(project: any, course: any) {
-  editProjectDialog.value = { demandId: project._demandId, name: project.name, capacity: project.expected, taskId: course._taskId }
+  editProjectDialog.value = {
+    demandId: project._demandId,
+    projectId: project._projectId,
+    courseId: course._courseId,
+    name: project.name,
+    capacity: project.expected,
+    taskId: course._taskId,
+    groupMode: project.groupMode || 'INDIVIDUAL',
+    groupSize: project.groupMode === 'GROUP' ? project.groupSize : 1,
+  }
 }
 
 async function saveProjectDemand() {
   if (!editProjectDialog.value) return
+  const dialog = editProjectDialog.value
+  if (dialog.groupMode === 'GROUP' && dialog.groupSize < 2) {
+    showToast('多人分组实验的每组人数至少为 2')
+    return
+  }
   try {
-    await api.put(`/admin/teaching-tasks/${editProjectDialog.value.taskId}/demands/${editProjectDialog.value.demandId}`, { required_capacity: editProjectDialog.value.capacity })
+    const groupSize = dialog.groupMode === 'INDIVIDUAL' ? 1 : dialog.groupSize
+    await api.put(
+      `/admin/courses/${dialog.courseId}/projects/${dialog.projectId}/grouping`,
+      { group_mode: dialog.groupMode, default_group_size: groupSize },
+    )
+    await api.put(
+      `/admin/teaching-tasks/${dialog.taskId}/demands/${dialog.demandId}`,
+      { required_capacity: dialog.capacity },
+    )
     editProjectDialog.value = null
-    showToast('项目需求已更新')
+    showToast('项目实验形式和需求已更新')
     await fetchSemesterCourses()
   } catch (err) { showToast(err instanceof Error ? err.message : '更新失败') }
 }
@@ -255,7 +322,8 @@ const addProjectDialog = ref<{
   course: any
   // new project fields
   project_code: string; project_name: string; category: string
-  required_slots: number; default_group_size: number; historical_selection_ratio: number
+  required_slots: number; group_mode: ProjectGroupMode
+  default_group_size: number; historical_selection_ratio: number
   reqType: string
 } | null>(null)
 
@@ -263,7 +331,8 @@ function openAddProjectDialog(course: any) {
   addProjectDialog.value = {
     course, reqType: 'REQUIRED',
     project_code: '', project_name: '', category: 'BASIC',
-    required_slots: 4, default_group_size: 2, historical_selection_ratio: 0.5,
+    required_slots: 4, group_mode: 'INDIVIDUAL',
+    default_group_size: 1, historical_selection_ratio: 0.5,
   }
 }
 
@@ -280,7 +349,8 @@ async function saveAddProject() {
       project_name: d.project_name,
       category: d.category,
       required_slots: d.required_slots,
-      default_group_size: d.default_group_size,
+      group_mode: d.group_mode,
+      default_group_size: d.group_mode === 'INDIVIDUAL' ? 1 : d.default_group_size,
       historical_selection_ratio: d.historical_selection_ratio,
     })
     // 3. 加入教学任务
@@ -291,24 +361,115 @@ async function saveAddProject() {
   } catch (err) { showToast(err instanceof Error ? err.message : '添加失败') }
 }
 
-const labs = [
-  { name: '实验楼 A203', type: '基础力学实验室', capacity: 24, manager: '赵老师', availability: '可排课', equipment: [
-    { name: '单摆实验仪', model: 'DP-2024', quantity: 12, usable: 12, status: '正常' },
-    { name: '光电计时器', model: 'GD-8A', quantity: 12, usable: 11, status: '部分检修' },
-    { name: '游标卡尺', model: '0–150 mm', quantity: 30, usable: 30, status: '正常' },
-    { name: '电子天平', model: 'FA2004', quantity: 6, usable: 6, status: '正常' },
-  ] },
-  { name: '实验楼 B105', type: '电学综合实验室', capacity: 20, manager: '钱老师', availability: '可排课', equipment: [
-    { name: '数字示波器', model: 'TBS1102C', quantity: 10, usable: 9, status: '部分检修' },
-    { name: '信号发生器', model: 'DG1022Z', quantity: 10, usable: 10, status: '正常' },
-    { name: '数字万用表', model: 'UT61E+', quantity: 20, usable: 20, status: '正常' },
-  ] },
-  { name: '近代物理实验室 2', type: '近代物理实验室', capacity: 16, manager: '吴老师', availability: '限制排课', equipment: [
-    { name: '光电效应实验箱', model: 'ZKY-GD-4', quantity: 8, usable: 7, status: '部分检修' },
-    { name: '汞灯电源', model: 'GY-6', quantity: 8, usable: 8, status: '正常' },
-    { name: '微电流测量仪', model: 'EM-5', quantity: 8, usable: 8, status: '正常' },
-  ] },
-]
+const labs = ref<Array<{
+  id: string; name: string; room_type: string; safety_capacity: number; status: string
+  equipment: Array<{ id: string; equipment_name: string; model: string; total_quantity: number; usable_quantity: number }>
+}>>([])
+
+async function fetchLabs() {
+  try {
+    labs.value = await api.get('/admin/labs')
+  } catch { /* keep empty */ }
+}
+
+// ── 添加实验室 ──
+const addLabDialogOpen = ref(false)
+const newLab = ref({ name: '', safety_capacity: 24 })
+const newLabEquip = ref<Array<{ name: string; model: string; total: number; usable: number; note: string }>>([])
+
+function openAddLabDialog() {
+  newLab.value = { name: '', safety_capacity: 24 }
+  newLabEquip.value = []
+  addLabDialogOpen.value = true
+}
+
+function addEquipRow() {
+  newLabEquip.value.push({ name: '', model: '', total: 1, usable: 1, note: '' })
+}
+
+function removeEquipRow(idx: number) {
+  newLabEquip.value.splice(idx, 1)
+}
+
+function toggleLabSelect(labId: string) {
+  const s = selectedLabIds.value
+  if (s.has(labId)) { s.delete(labId) } else { s.add(labId) }
+  selectedLabIds.value = new Set(s)
+}
+function toggleAllLabs() {
+  if (selectedLabIds.value.size === labs.value.length) {
+    selectedLabIds.value = new Set()
+  } else {
+    selectedLabIds.value = new Set(labs.value.map(l => l.id))
+  }
+}
+async function batchDeleteLabs() {
+  if (selectedLabIds.value.size === 0) { showToast('请先选择实验室'); return }
+  if (!confirm(`确定删除 ${selectedLabIds.value.size} 间实验室吗？`)) return
+  try {
+    for (const id of selectedLabIds.value) {
+      await api.delete(`/admin/labs/${id}`)
+    }
+    selectedLabIds.value = new Set()
+    showToast('已删除')
+    await fetchLabs()
+  } catch (err) { showToast(err instanceof Error ? err.message : '删除失败') }
+}
+
+async function scrapEquip(lab: any, equip: any) {
+  const n = prompt(`报废数量（当前可用 ${equip.usable_quantity} 台）：`, '1')
+  if (!n || isNaN(+n) || +n <= 0) return
+  const qty = Math.min(+n, equip.usable_quantity)
+  if (!confirm(`确认报废 ${qty} 台"${equip.equipment_name}"？`)) return
+  try {
+    await api.put(`/admin/labs/${lab.id}/equipment/${equip.id}`, {
+      usable_quantity: equip.usable_quantity - qty,
+      total_quantity: equip.total_quantity - qty,
+    })
+    showToast(`已报废 ${qty} 台`)
+    await fetchLabs()
+  } catch (err) { showToast(err instanceof Error ? err.message : '操作失败') }
+}
+
+async function addEquip(lab: any, equip: any) {
+  const n = prompt(`新增数量（当前账面 ${equip.total_quantity} 台）：`, '1')
+  if (!n || isNaN(+n) || +n <= 0) return
+  const qty = +n
+  try {
+    await api.put(`/admin/labs/${lab.id}/equipment/${equip.id}`, {
+      usable_quantity: equip.usable_quantity + qty,
+      total_quantity: equip.total_quantity + qty,
+    })
+    showToast(`已新增 ${qty} 台`)
+    await fetchLabs()
+  } catch (err) { showToast(err instanceof Error ? err.message : '操作失败') }
+}
+
+async function deleteEquipment(lab: any, equip: any) {
+  if (!confirm(`确定删除"${equip.equipment_name}"吗？`)) return
+  try {
+    await api.delete(`/admin/labs/${lab.id}/equipment/${equip.id}`)
+    showToast('设备已删除')
+    await fetchLabs()
+  } catch (err) { showToast(err instanceof Error ? err.message : '删除失败') }
+}
+
+async function saveNewLab() {
+  if (!newLab.value.name) { showToast('请填写实验室名称'); return }
+  try {
+    await api.post('/admin/labs/batch-create', {
+      name: newLab.value.name,
+      safety_capacity: newLab.value.safety_capacity,
+      equipment: newLabEquip.value.map(e => ({
+        name: e.name, model: e.model,
+        total_quantity: e.total, usable_quantity: e.usable,
+      })),
+    })
+    addLabDialogOpen.value = false
+    showToast('实验室已创建')
+    await fetchLabs()
+  } catch (err) { showToast(err instanceof Error ? err.message : '创建失败') }
+}
 
 const scheduleEvents = ref([
   { lab: '实验楼 A203', day: 3, start: 5, name: '用单摆测量重力加速度', teacher: '李老师', selected: 24, tone: 'teal' },
@@ -324,7 +485,15 @@ const approvals = ref([
   { id: 'SP20260315002', source: '学生申请', applicant: '周同学 · 2024****08', type: '换组申请', subject: '霍尔效应及磁场测量 → 密立根油滴实验', submitted: '2026-03-15 14:26', status: '已驳回' as ApprovalStatus, result: '驳回理由：目标项目已达到实验室安全容量上限，暂无可用名额。' },
 ])
 
-const currentLab = computed(() => labs.find((lab) => lab.name === activeLab.value) ?? labs[0])
+const currentLab = computed(() => labs.value.find((lab) => lab.name === activeLab.value) ?? labs.value[0])
+const filteredEquipment = computed(() => {
+  if (!currentLab.value) return []
+  const kw = equipKeyword.value.trim().toLowerCase()
+  if (!kw) return currentLab.value.equipment
+  return currentLab.value.equipment.filter(e =>
+    e.equipment_name.toLowerCase().includes(kw) || e.model.toLowerCase().includes(kw)
+  )
+})
 const activePlanCourse = computed(() => planCourses.value.find((course) => course.id === activePlanCourseId.value) ?? planCourses.value[0])
 const activeProjectCatalog = computed(() => {
   const course = activePlanCourse.value
@@ -583,6 +752,7 @@ function addCustomProject(which: 'required' | 'optional') {
     project_name: name,
     category: '',
     required_slots: '',
+    group_mode: 'INDIVIDUAL' as ProjectGroupMode,
     default_group_size: '',
     historical_selection_ratio: '',
   }
@@ -741,7 +911,7 @@ async function submitNewProject() {
   const course = activePlanCourse.value
   if (!course?.courseId) return
   const item = newProject.value
-  if (!item.project_code || !item.project_name || !item.category || !item.required_slots || !item.default_group_size || item.historical_selection_ratio === '') {
+  if (!item.project_code || !item.project_name || !item.category || !item.required_slots || (item.group_mode === 'GROUP' && !item.default_group_size) || item.historical_selection_ratio === '') {
     showToast('请完整填写实验项目资料')
     return
   }
@@ -751,7 +921,8 @@ async function submitNewProject() {
       project_name: item.project_name,
       category: item.category,
       required_slots: Number(item.required_slots),
-      default_group_size: Number(item.default_group_size),
+      group_mode: item.group_mode,
+      default_group_size: item.group_mode === 'INDIVIDUAL' ? 1 : Number(item.default_group_size),
       historical_selection_ratio: Number(item.historical_selection_ratio),
     })
     projectCatalog.value[course.courseId] = [...(projectCatalog.value[course.courseId] ?? []), created]
@@ -801,6 +972,7 @@ onMounted(async () => {
     selectedPlan.value = '全部专业'
     await loadPlans()
     await fetchSemesterCourses(true)
+    await fetchLabs()
   } catch (error) {
     showToast(error instanceof Error ? error.message : '培养方案基础数据加载失败')
   }
@@ -853,7 +1025,7 @@ function generateSchedule() {
           <div><h1>{{ viewMeta[activeView].title }}</h1><p>{{ viewMeta[activeView].subtitle }}</p></div>
           <button v-if="activeView === 'plans'" @click="openNewPlan">＋ 新建培养方案</button>
           <button v-else-if="activeView === 'courses'" @click="openAddCourseDialog">＋ 添加实验课程</button>
-          <button v-else-if="activeView === 'labs'" @click="showToast('已创建一条空白实验室档案（演示）')">＋ 添加实验室</button>
+          <button v-else-if="activeView === 'labs'" @click="openAddLabDialog">＋ 添加实验室</button>
           <button v-else-if="activeView === 'schedule'" class="ai-generate-button" :disabled="aiGenerating" @click="generateSchedule"><span>✦</span>{{ aiGenerating ? 'AI 正在生成...' : 'AI 一键生成课表' }}</button>
         </div>
 
@@ -899,20 +1071,24 @@ function generateSchedule() {
             <header><span class="course-config-icon">{{ course.name.slice(0, 1) }}</span><div><small>{{ course.code }}</small><h3>{{ course.name }}</h3><p>面向：{{ course.target }}　·　开设周次：{{ course.weeks }}</p></div><i>本学期开设</i><button @click="openEditTaskDialog(course)">编辑课程</button><button @click="deleteTeachingTask(course)" style="color:red;margin-left:.25rem">删除</button><button @click="openAddProjectDialog(course)" style="margin-left:.25rem">＋ 添加项目</button></header>
             <div class="course-project-table">
               <div class="course-project-row course-project-head"><span>实验项目</span><span>预计人数</span><span>负责教师</span><span>所需实验器材</span><span>配置状态</span><span>操作</span></div>
-              <div v-for="project in course.projects" :key="project.name" class="course-project-row"><span><b>{{ project.name }}</b><small>四节连堂 · 单次完成</small></span><span><strong>{{ project.expected }}</strong> 人次</span><span class="tag-cell"><i v-for="teacher in project.teachers" :key="teacher">{{ teacher }}</i></span><span class="tag-cell"><i v-for="item in project.equipment" :key="item">{{ item }}</i></span><span><em>已配置</em></span><span><button @click="openEditProjectDialog(project, course)">编辑</button><button @click="deleteProjectDemand(project, course)" style="color:red;margin-left:.25rem">删除</button></span></div>
+              <div v-for="project in course.projects" :key="project.name" class="course-project-row"><span><b>{{ project.name }}</b><small>四节连堂 · {{ project.groupMode === 'INDIVIDUAL' ? '单人实验' : `${project.groupSize} 人/组` }}</small></span><span><strong>{{ project.expected }}</strong> 人次</span><span class="tag-cell"><i v-for="teacher in project.teachers" :key="teacher">{{ teacher }}</i></span><span class="tag-cell"><i v-for="item in project.equipment" :key="item">{{ item }}</i></span><span><em>已配置</em></span><span><button @click="openEditProjectDialog(project, course)">编辑</button><button @click="deleteProjectDemand(project, course)" style="color:red;margin-left:.25rem">删除</button></span></div>
             </div>
           </section>
         </template>
 
         <template v-else-if="activeView === 'labs'">
+          <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.75rem">
+            <label style="font-size:.85rem;cursor:pointer"><input type="checkbox" @change="toggleAllLabs" :checked="selectedLabIds.size === labs.length && labs.length > 0" /> 全选</label>
+            <button v-if="selectedLabIds.size > 0" @click="batchDeleteLabs" style="background:#c0392b;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:.85rem">删除选中 ({{ selectedLabIds.size }})</button>
+          </div>
           <section class="lab-card-grid">
-            <button v-for="lab in labs" :key="lab.name" :class="{ active: activeLab === lab.name }" @click="activeLab = lab.name"><span class="lab-card-icon">⌂</span><div><small>{{ lab.type }}</small><strong>{{ lab.name }}</strong><p>负责人：{{ lab.manager }}</p></div><i :class="{ limited: lab.availability !== '可排课' }">{{ lab.availability }}</i><em><b>{{ lab.capacity }}</b> 人 / 次</em></button>
+            <button v-for="lab in labs" :key="lab.name" :class="{ active: activeLab === lab.name }" @click="activeLab = lab.name"><span class="lab-card-icon">⌂</span><div><small>{{ lab.room_type || '实验室' }}</small><strong>{{ lab.name }}</strong></div><i>{{ lab.status }}</i><em><b>{{ lab.safety_capacity }}</b> 人 / 次</em><input type="checkbox" :checked="selectedLabIds.has(lab.id)" @click.stop="toggleLabSelect(lab.id)" style="position:absolute;bottom:8px;right:8px" /></button>
           </section>
-          <section class="system-panel equipment-panel">
-            <div class="system-panel-title"><div><h3>{{ currentLab.name }} · 设备台账</h3><p>实验室单次最多容纳 {{ currentLab.capacity }} 人开展实验</p></div><div><label class="system-search">⌕<input placeholder="搜索器材名称或型号" /></label><button @click="showToast('已创建一条空白设备记录（演示）')">＋ 添加器材</button></div></div>
+          <section v-if="currentLab" class="system-panel equipment-panel">
+            <div class="system-panel-title"><div><h3>{{ currentLab.name }} · 设备台账</h3><p>实验室单次最多容纳 {{ currentLab.safety_capacity }} 人开展实验</p></div><div><label class="system-search">⌕<input v-model="equipKeyword" placeholder="搜索器材名称或型号" /></label></div></div>
             <div class="equipment-table">
-              <div class="equipment-row equipment-head"><span>器材名称</span><span>型号 / 规格</span><span>账面数量</span><span>可用数量</span><span>使用状态</span><span>操作</span></div>
-              <div v-for="item in currentLab.equipment" :key="item.name" class="equipment-row"><span><i>◇</i><b>{{ item.name }}</b></span><span>{{ item.model }}</span><span>{{ item.quantity }} 台 / 套</span><span><strong>{{ item.usable }}</strong> 台 / 套</span><span><em :class="{ warning: item.status !== '正常' }">{{ item.status }}</em></span><span><button @click="showToast('已打开档案（演示）')">管理</button></span></div>
+              <div class="equipment-row equipment-head"><span>器材名称</span><span>型号 / 规格</span><span>账面数量</span><span>可用数量</span><span>备注</span><span>操作</span></div>
+              <div v-for="item in filteredEquipment" :key="item.id" class="equipment-row"><span><i>◇</i><b>{{ item.equipment_name }}</b></span><span>{{ item.model }}</span><span>{{ item.total_quantity }} 台 / 套</span><span><strong>{{ item.usable_quantity }}</strong> 台 / 套</span><span>{{ item.note }}</span><span style="white-space:nowrap"><button @click="scrapEquip(currentLab, item)" style="color:#e67e22">报废</button><button @click="addEquip(currentLab, item)" style="color:#27ae60;margin:0 2px">新增</button><button @click="deleteEquipment(currentLab, item)" style="color:red">删除</button></span></div>
             </div>
           </section>
           <section class="lab-capacity-note"><span>i</span><p>实验室容量应取场地安全容量、实验台位数及关键器材可用套数中的最小值。当前数据均为演示配置。</p></section>
@@ -1011,7 +1187,8 @@ function generateSchedule() {
             <label>项目名称<input v-model.trim="newProject.project_name" maxlength="150" required /></label>
             <label>项目分类<select v-model="newProject.category" required><option disabled value="">请选择</option><option value="BASIC">基础</option><option value="MECHANICS">力学</option><option value="ELECTRICITY">电学</option><option value="OPTICS">光学</option><option value="MODERN">近代物理</option><option value="OTHER">其他</option></select></label>
             <label>所需节次<input v-model="newProject.required_slots" type="number" min="1" max="24" required /></label>
-            <label>默认分组人数<input v-model="newProject.default_group_size" type="number" min="1" max="100" required /></label>
+            <label>实验形式<select v-model="newProject.group_mode" @change="newProject.group_mode === 'GROUP' && Number(newProject.default_group_size) < 2 ? newProject.default_group_size = '2' : null"><option value="INDIVIDUAL">单人实验</option><option value="GROUP">多人分组实验</option></select></label>
+            <label v-if="newProject.group_mode === 'GROUP'">每组人数<input v-model="newProject.default_group_size" type="number" min="2" max="100" required /></label>
             <label>历史选中比例<input v-model="newProject.historical_selection_ratio" type="number" min="0" max="1" step="0.0001" required placeholder="0 至 1" /></label>
           </div>
         </section>
@@ -1027,6 +1204,39 @@ function generateSchedule() {
         <footer v-if="selectedApproval.status === '待审批'"><button @click="showToast('已生成驳回意见草稿，未提交'); selectedApprovalId = null">驳回（演示）</button><button @click="showToast('已生成审批通过方案，未提交'); selectedApprovalId = null">通过（演示）</button></footer><footer v-else><button @click="selectedApprovalId = null">关闭</button></footer>
       </aside>
     </div>
+
+    <!-- 添加实验室弹窗 -->
+    <Teleport to="body">
+      <div v-if="addLabDialogOpen" class="system-dialog-backdrop" @click.self="addLabDialogOpen = false">
+        <form class="approval-detail" style="width:660px;max-height:85vh;overflow-y:auto" @submit.prevent="saveNewLab">
+          <header><div><span>⌂</span><div><h2>新建实验室</h2><p>填写实验室基本信息和设备台账</p></div></div><button type="button" @click="addLabDialogOpen = false">×</button></header>
+          <div style="display:flex;gap:1rem;margin-bottom:1rem">
+            <label style="flex:2">实验室名称<input v-model="newLab.name" placeholder="例：基础力学实验室 A204" style="width:100%" /></label>
+            <label style="flex:1">容纳人数<input v-model.number="newLab.safety_capacity" type="number" min="1" max="100" style="width:100%" /></label>
+          </div>
+          <section style="background:#f7f8fa;border-radius:8px;padding:1rem">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
+              <strong>设备台账</strong><button type="button" @click="addEquipRow" style="background:#4769a8;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:.85rem">＋ 添加器材</button>
+            </div>
+            <div v-if="newLabEquip.length" style="max-height:280px;overflow-y:auto">
+              <div class="equipment-row equipment-head" style="display:flex;gap:6px;padding:6px 8px;font-weight:600;font-size:.85rem;border-bottom:2px solid #ddd">
+                <span style="flex:2">器材名称</span><span style="flex:1.5">型号/规格</span><span style="flex:0.8">账面数</span><span style="flex:0.8">可用数</span><span style="flex:1.5">备注</span><span style="width:28px"></span>
+              </div>
+              <div v-for="(eq, i) in newLabEquip" :key="i" style="display:flex;gap:6px;padding:6px 8px;align-items:center;border-bottom:1px solid #eee">
+                <span style="flex:2"><input v-model="eq.name" placeholder="器材名" style="width:100%" /></span>
+                <span style="flex:1.5"><input v-model="eq.model" placeholder="型号" style="width:100%" /></span>
+                <span style="flex:0.8"><input v-model.number="eq.total" type="number" min="1" style="width:100%" /></span>
+                <span style="flex:0.8"><input v-model.number="eq.usable" type="number" min="0" :max="eq.total" style="width:100%" /></span>
+                <span style="flex:1.5"><input v-model="eq.note" placeholder="如2人一台" style="width:100%" /></span>
+                <span style="width:28px"><button type="button" @click="removeEquipRow(i)" style="color:red;background:none;border:none;cursor:pointer;font-size:1.2rem">×</button></span>
+              </div>
+            </div>
+            <p v-else style="color:#888;font-size:.9rem">暂无设备，可点击上方按钮添加</p>
+          </section>
+          <footer><button type="button" @click="addLabDialogOpen = false">取消</button><button type="submit">创建实验室</button></footer>
+        </form>
+      </div>
+    </Teleport>
 
     <Transition name="toast"><div v-if="toast" class="system-toast"><span>✓</span>{{ toast }}</div></Transition>
 
@@ -1070,7 +1280,8 @@ function generateSchedule() {
             <label>项目名称 *<input v-model="addProjectDialog.project_name" placeholder="例：用单摆测量重力加速度" style="width:100%" /></label>
             <label>类别<select v-model="addProjectDialog.category" style="width:100%"><option>BASIC</option><option>MECHANICS</option><option>ELECTRICITY</option><option>OPTICS</option><option>MODERN</option><option>OTHER</option></select></label>
             <label>所需学时<input v-model.number="addProjectDialog.required_slots" type="number" min="1" max="24" style="width:100%" /></label>
-            <label>每组人数<input v-model.number="addProjectDialog.default_group_size" type="number" min="1" max="100" style="width:100%" /></label>
+            <label>实验形式<select v-model="addProjectDialog.group_mode" @change="addProjectDialog.group_mode === 'GROUP' && Number(addProjectDialog.default_group_size) < 2 ? addProjectDialog.default_group_size = 2 : null" style="width:100%"><option value="INDIVIDUAL">单人实验</option><option value="GROUP">多人分组实验</option></select></label>
+            <label v-if="addProjectDialog.group_mode === 'GROUP'">每组人数<input v-model.number="addProjectDialog.default_group_size" type="number" min="2" max="100" style="width:100%" /></label>
             <label>往届选择比<input v-model.number="addProjectDialog.historical_selection_ratio" type="number" min="0" max="1" step="0.01" style="width:100%" /></label>
           </div>
           <div style="margin:.75rem 0"><label><input v-model="addProjectDialog.reqType" value="REQUIRED" type="radio" /> 必做</label><label style="margin-left:1rem"><input v-model="addProjectDialog.reqType" value="OPTIONAL" type="radio" /> 选做</label></div>
@@ -1083,8 +1294,10 @@ function generateSchedule() {
     <Teleport to="body">
       <div v-if="editProjectDialog" class="system-dialog-backdrop" @click.self="editProjectDialog = null">
         <form class="approval-detail" style="width:400px" @submit.prevent="saveProjectDemand">
-          <header><div><span>✎</span><div><h2>编辑项目需求</h2><p>{{ editProjectDialog.name }}</p></div></div><button type="button" @click="editProjectDialog = null">×</button></header>
+          <header><div><span>✎</span><div><h2>编辑实验项目</h2><p>{{ editProjectDialog.name }}</p></div></div><button type="button" @click="editProjectDialog = null">×</button></header>
           <label style="display:block;margin-bottom:1rem">预计容量（人次）<input v-model.number="editProjectDialog.capacity" type="number" min="1" style="width:100%" /></label>
+          <label style="display:block;margin-bottom:1rem">实验形式<select v-model="editProjectDialog.groupMode" @change="editProjectDialog.groupMode === 'GROUP' && editProjectDialog.groupSize < 2 ? editProjectDialog.groupSize = 2 : null" style="width:100%"><option value="INDIVIDUAL">单人实验</option><option value="GROUP">多人分组实验</option></select></label>
+          <label v-if="editProjectDialog.groupMode === 'GROUP'" style="display:block;margin-bottom:1rem">每组人数<input v-model.number="editProjectDialog.groupSize" type="number" min="2" max="100" style="width:100%" /></label>
           <footer><button type="button" @click="editProjectDialog = null">取消</button><button type="submit">保存</button></footer>
         </form>
       </div>

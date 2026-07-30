@@ -16,6 +16,7 @@ from app.schemas.training_plan import (
     TrainingPlanListOut,
     TrainingPlanListResponse,
     TrainingPlanProjectOut,
+    UpdateProjectGroupingRequest,
     UpdateTrainingPlanRequest,
 )
 
@@ -46,6 +47,10 @@ def _to_project_info(project) -> ProjectInfo:
         project_code=project.project_code,
         project_name=project.project_name,
         category=project.category,
+        required_slots=project.required_slots,
+        group_mode=project.group_mode,
+        default_group_size=project.default_group_size,
+        historical_selection_ratio=project.historical_selection_ratio,
     )
 
 
@@ -552,3 +557,35 @@ async def create_course_project(
     except IntegrityError as exc:
         await session.rollback()
         raise TrainingPlanError("项目编码已存在，或该课程已有同名项目") from exc
+
+
+async def update_course_project_grouping(
+    session: AsyncSession,
+    course_id: UUID,
+    project_id: UUID,
+    data: UpdateProjectGroupingRequest,
+    actor_id: UUID,
+) -> ProjectInfo:
+    project = await tp_crud.update_course_project_grouping(
+        session,
+        course_id=course_id,
+        project_id=project_id,
+        actor_id=actor_id,
+        **data.model_dump(),
+    )
+    if project is None:
+        raise TrainingPlanError("实验项目不存在或不属于该课程", 404)
+    await tp_crud.add_operation_log(
+        session,
+        actor_id=actor_id,
+        operation_type="EXPERIMENT_PROJECT_GROUPING_UPDATED",
+        object_type="EXPERIMENT_PROJECT",
+        object_id=project.id,
+        before_snapshot={},
+        after_snapshot={
+            "group_mode": project.group_mode,
+            "default_group_size": project.default_group_size,
+        },
+    )
+    await session.commit()
+    return _to_project_info(project)

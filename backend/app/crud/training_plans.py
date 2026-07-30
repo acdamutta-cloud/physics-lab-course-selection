@@ -399,6 +399,7 @@ async def create_course_project(
     project_name: str,
     category: str,
     required_slots: int,
+    group_mode: str,
     default_group_size: int,
     historical_selection_ratio: Decimal,
     actor_id: UUID,
@@ -409,6 +410,7 @@ async def create_course_project(
         project_name=project_name.strip(),
         category=category,
         required_slots=required_slots,
+        group_mode=group_mode,
         default_group_size=default_group_size,
         historical_selection_ratio=historical_selection_ratio,
         status="ACTIVE",
@@ -416,5 +418,31 @@ async def create_course_project(
         updated_by=actor_id,
     )
     session.add(project)
+    await session.flush()
+    return project
+
+
+async def update_course_project_grouping(
+    session: AsyncSession,
+    *,
+    course_id: UUID,
+    project_id: UUID,
+    group_mode: str,
+    default_group_size: int,
+    actor_id: UUID,
+) -> ExperimentProject | None:
+    result = await session.execute(
+        select(ExperimentProject).where(
+            ExperimentProject.id == project_id,
+            ExperimentProject.course_id == course_id,
+            ExperimentProject.status == "ACTIVE",
+        )
+    )
+    project = result.scalar_one_or_none()
+    if project is None:
+        return None
+    project.group_mode = group_mode
+    project.default_group_size = default_group_size
+    project.updated_by = actor_id
     await session.flush()
     return project

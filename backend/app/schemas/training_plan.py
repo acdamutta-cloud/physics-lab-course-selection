@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 PlanStatus = Literal["DRAFT", "PUBLISHED", "ARCHIVED"]
 CourseNature = Literal["REQUIRED", "ELECTIVE"]
 ProjectRequirement = Literal["REQUIRED", "OPTIONAL"]
+ProjectGroupMode = Literal["INDIVIDUAL", "GROUP"]
 ProjectCategory = Literal[
     "BASIC", "MECHANICS", "ELECTRICITY", "OPTICS", "MODERN", "OTHER"
 ]
@@ -31,6 +32,10 @@ class ProjectInfo(BaseModel):
     project_code: str
     project_name: str
     category: str | None = None
+    required_slots: int
+    group_mode: ProjectGroupMode
+    default_group_size: int
+    historical_selection_ratio: Decimal
 
 
 class CreateProjectRequest(BaseModel):
@@ -38,8 +43,34 @@ class CreateProjectRequest(BaseModel):
     project_name: str = Field(min_length=1, max_length=150)
     category: ProjectCategory
     required_slots: int = Field(ge=1, le=24)
+    group_mode: ProjectGroupMode | None = None
     default_group_size: int = Field(ge=1, le=100)
     historical_selection_ratio: Decimal = Field(ge=0, le=1, max_digits=6, decimal_places=4)
+
+    @model_validator(mode="after")
+    def validate_grouping(self) -> "CreateProjectRequest":
+        if self.group_mode is None:
+            self.group_mode = (
+                "INDIVIDUAL" if self.default_group_size == 1 else "GROUP"
+            )
+        if self.group_mode == "INDIVIDUAL":
+            self.default_group_size = 1
+        elif self.default_group_size < 2:
+            raise ValueError("多人分组实验的每组人数必须至少为 2")
+        return self
+
+
+class UpdateProjectGroupingRequest(BaseModel):
+    group_mode: ProjectGroupMode
+    default_group_size: int = Field(ge=1, le=100)
+
+    @model_validator(mode="after")
+    def validate_grouping(self) -> "UpdateProjectGroupingRequest":
+        if self.group_mode == "INDIVIDUAL":
+            self.default_group_size = 1
+        elif self.default_group_size < 2:
+            raise ValueError("多人分组实验的每组人数必须至少为 2")
+        return self
 
 
 class TrainingPlanProjectIn(BaseModel):

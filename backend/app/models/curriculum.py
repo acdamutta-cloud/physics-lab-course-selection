@@ -105,6 +105,15 @@ class ExperimentProject(AuditMixin, BaseModel):
         CheckConstraint("required_slots >= 1", name="slots_positive"),
         CheckConstraint("default_group_size >= 1", name="group_size_positive"),
         CheckConstraint(
+            "group_mode IN ('INDIVIDUAL', 'GROUP')",
+            name="group_mode_allowed",
+        ),
+        CheckConstraint(
+            "(group_mode = 'INDIVIDUAL' AND default_group_size = 1) OR "
+            "(group_mode = 'GROUP' AND default_group_size >= 2)",
+            name="group_mode_size_consistent",
+        ),
+        CheckConstraint(
             "historical_selection_ratio BETWEEN 0 AND 1",
             name="selection_ratio_valid",
         ),
@@ -130,7 +139,10 @@ class ExperimentProject(AuditMixin, BaseModel):
         SmallInteger, nullable=False, default=4
     )
     default_group_size: Mapped[int] = mapped_column(
-        SmallInteger, nullable=False, default=2
+        SmallInteger, nullable=False, default=1
+    )
+    group_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="INDIVIDUAL"
     )
     material_note: Mapped[str | None] = mapped_column(Text)
     historical_selection_ratio: Mapped[Decimal] = mapped_column(

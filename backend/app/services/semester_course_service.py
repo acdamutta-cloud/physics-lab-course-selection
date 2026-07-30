@@ -54,6 +54,10 @@ def _to_project_info(project) -> ProjectInfo:
         project_code=project.project_code,
         project_name=project.project_name,
         category=project.category,
+        required_slots=project.required_slots,
+        group_mode=project.group_mode,
+        default_group_size=project.default_group_size,
+        historical_selection_ratio=project.historical_selection_ratio,
     )
 
 

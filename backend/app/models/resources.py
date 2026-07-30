@@ -14,7 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import AuditMixin, BaseModel
 
@@ -108,6 +108,10 @@ class Laboratory(AuditMixin, BaseModel):
     )
     description: Mapped[str | None] = mapped_column(Text)
 
+    equipment_inventory: Mapped[list["LabEquipmentInventory"]] = relationship(
+        "LabEquipmentInventory", viewonly=True,
+    )
+
 
 class LabProjectCapability(BaseModel):
     __tablename__ = "lab_project_capability"
@@ -190,6 +194,8 @@ class LabEquipmentInventory(AuditMixin, BaseModel):
     checked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+
+    equipment_type: Mapped["EquipmentType"] = relationship("EquipmentType", viewonly=True)
 
 
 class ProjectEquipmentRequirement(BaseModel):
