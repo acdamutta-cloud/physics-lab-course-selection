@@ -93,6 +93,7 @@ def test_custom_project_requires_confirmed_business_fields() -> None:
         historical_selection_ratio=Decimal("0.5000"),
     )
     assert request.historical_selection_ratio == Decimal("0.5000")
+    assert request.group_mode == "GROUP"
 
     with pytest.raises(ValidationError):
         CreateProjectRequest(
@@ -102,4 +103,28 @@ def test_custom_project_requires_confirmed_business_fields() -> None:
             required_slots=4,
             default_group_size=2,
             historical_selection_ratio=Decimal("1.1000"),
+        )
+
+
+def test_project_group_mode_controls_group_size() -> None:
+    individual = CreateProjectRequest(
+        project_code="PHYS-INDIVIDUAL",
+        project_name="单人实验",
+        category="OTHER",
+        required_slots=4,
+        group_mode="INDIVIDUAL",
+        default_group_size=8,
+        historical_selection_ratio=Decimal("0.5000"),
+    )
+    assert individual.default_group_size == 1
+
+    with pytest.raises(ValidationError):
+        CreateProjectRequest(
+            project_code="PHYS-GROUP",
+            project_name="多人实验",
+            category="OTHER",
+            required_slots=4,
+            group_mode="GROUP",
+            default_group_size=1,
+            historical_selection_ratio=Decimal("0.5000"),
         )

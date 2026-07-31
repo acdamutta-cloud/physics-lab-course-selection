@@ -25,13 +25,14 @@ from app.models.identity import (
     StudentBusyBitmap,
     StudentClass,
     Teacher,
+    TeacherBusyBitmap,
     UserAccount,
 )
 from app.models.notification import Notification
 from app.models.resources import (
     EquipmentType,
-    Laboratory,
     LabEquipmentInventory,
+    Laboratory,
     LabProjectCapability,
     ProjectEquipmentRequirement,
     ResourceIssueReport,
@@ -40,10 +41,12 @@ from app.models.resources import (
 )
 from app.models.rules import RuleConfig, RuleSet
 from app.models.scheduling import (
+    CourseTimeAvailability,
     ExperimentSession,
     ProjectDemand,
     ScheduleJob,
     ScheduleVersion,
+    TeacherTimetableEntry,
     TeachingTask,
     TeachingTaskCohort,
 )
@@ -58,6 +61,7 @@ __all__ = [
     "Base",
     "Campus",
     "CoursePrerequisite",
+    "CourseTimeAvailability",
     "EquipmentType",
     "ExperimentCourse",
     "ExperimentProject",
@@ -84,7 +88,9 @@ __all__ = [
     "StudentProjectRecord",
     "Teacher",
     "TeacherAvailability",
+    "TeacherBusyBitmap",
     "TeacherProjectQualification",
+    "TeacherTimetableEntry",
     "TeachingTask",
     "TeachingTaskCohort",
     "TrainingPlan",

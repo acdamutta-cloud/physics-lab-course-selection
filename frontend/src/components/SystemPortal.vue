@@ -75,6 +75,48 @@ type PlanDetail = {
     order_constraints: Array<{ before_project: ProjectInfo; after_project: ProjectInfo; description: string | null; allow_override: boolean }>
   }>
 }
+type ScheduleSession = {
+  id: string
+  project_name: string
+  week_no: number
+  day_of_week: number
+  start_slot: number
+  end_slot: number
+  teacher_name: string
+  laboratory_name: string
+  capacity: number
+  selected_count: number
+}
+type ScheduleCandidate = {
+  id: string
+  version_no: number
+  status: string
+  profile_code: string
+  hard_constraint_passed: boolean
+  soft_score: number
+  session_count: number
+  runtime_weights: Record<string, number>
+  score_details: {
+    validation?: {
+      soft_constraint_review?: {
+        advantages: Array<{ rule_code: string; text: string; penalty: number }>
+        tradeoffs: Array<{ rule_code: string; text: string; penalty: number }>
+      }
+    }
+  }
+  sessions: ScheduleSession[]
+}
+type ScheduleJob = {
+  id: string
+  status: string
+  progress: number
+  preference_text: string
+  parsed_preferences: Array<{ rule_code: string; preference_level: string }>
+  comparison_weights: Record<string, number>
+  warnings: string[]
+  selected_candidate_version_id: string | null
+  candidates: ScheduleCandidate[]
+}
 
 const emit = defineEmits<{ logout: [] }>()
 const activeView = ref<SystemView>('plans')
@@ -112,12 +154,48 @@ const newProject = ref({
   default_group_size: '',
   historical_selection_ratio: '',
 })
+const scheduleWeek = ref(1)
+
+// 根据学期开学日期和选中周号计算具体日期范围
+const weekDates = computed(() => {
+  if (!termInfo.value || !termInfo.value.start_date) return ''
+  const start = new Date(termInfo.value.start_date + 'T00:00:00')
+  const dayOfWeek = start.getDay() // 0=Sunday
+  // 找到第一个周日
+  const sundayOffset = dayOfWeek === 0 ? 0 : (7 - dayOfWeek)
+  const weekStart = new Date(start)
+  weekStart.setDate(start.getDate() + sundayOffset + (scheduleWeek.value - 1) * 7)
+  const weekEnd = new Date(weekStart)
+  weekEnd.setDate(weekStart.getDate() + 6) // 周六
+  const fmt = (d: Date) => `${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')}`
+  return `${fmt(weekStart)} — ${fmt(weekEnd)}`
+})
+
+const weekDayHeaders = computed(() => {
+  if (!termInfo.value || !termInfo.value.start_date) return ['周日','周一','周二','周三','周四','周五','周六']
+  const start = new Date(termInfo.value.start_date + 'T00:00:00')
+  const dayOfWeek = start.getDay()
+  const sundayOffset = dayOfWeek === 0 ? 0 : (7 - dayOfWeek)
+  const sunday = new Date(start)
+  sunday.setDate(start.getDate() + sundayOffset + (scheduleWeek.value - 1) * 7)
+  const days = ['日','一','二','三','四','五','六']
+  return Array.from({length: 7}, (_, i) => {
+    const d = new Date(sunday); d.setDate(sunday.getDate() + i)
+    return `周${days[i]} ${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`
+  })
+})
+
 const activeLab = ref('实验楼 A203')
 const selectedLabIds = ref<Set<string>>(new Set())
 const equipKeyword = ref('')
 const scheduleLab = ref('实验楼 A203')
 const aiGenerating = ref(false)
 const aiGenerated = ref(false)
+const aiPreference = ref('')
+const aiJob = ref<ScheduleJob | null>(null)
+const previewCandidateId = ref('')
+const selectingCandidate = ref(false)
+const publishingSchedule = ref(false)
 const approvalFilter = ref('全部状态')
 const selectedApprovalId = ref<string | null>(null)
 
@@ -154,14 +232,38 @@ const semesterCourses = ref<Array<{
   }>
 }>>([])
 
-const termInfo = ref<{ academic_year: string; semester_no: number; total_weeks: number } | null>(null)
+const termInfo = ref<{ id: string; academic_year: string; semester_no: number; start_date: string; end_date: string; total_weeks: number; current_week: number } | null>(null)
+
+// ── 学期设置 ──
+const termEditorOpen = ref(false)
+const termEdit = ref({ start_date: '', end_date: '', total_weeks: 18 })
+
+function openTermEditor() {
+  if (termInfo.value) {
+    termEdit.value = {
+      start_date: termInfo.value.start_date,
+      end_date: termInfo.value.end_date,
+      total_weeks: termInfo.value.total_weeks,
+    }
+  }
+  termEditorOpen.value = true
+}
+
+async function saveTermSettings() {
+  try {
+    await api.put('/admin/active-term', termEdit.value)
+    termEditorOpen.value = false
+    showToast('学期设置已保存')
+    await fetchSemesterCourses(true)
+  } catch (err) { showToast(err instanceof Error ? err.message : '保存失败') }
+}
 const totalStudents = ref(0)
 
 async function fetchSemesterCourses(syncAll = false) {
   try {
     if (syncAll) await api.post('/admin/teaching-tasks/sync-all', {})
     const [term, tasksRes, stuRes] = await Promise.all([
-      api.get<{ academic_year: string; semester_no: number; total_weeks: number }>('/admin/active-term'),
+      api.get<{ id: string; academic_year: string; semester_no: number; start_date: string; end_date: string; total_weeks: number; current_week: number }>('/admin/active-term'),
       api.get<{ items: Array<{
         id: string; task_code: string
         course: { id: string; course_code: string; course_name: string }
@@ -363,12 +465,16 @@ async function saveAddProject() {
 
 const labs = ref<Array<{
   id: string; name: string; room_type: string; safety_capacity: number; status: string
-  equipment: Array<{ id: string; equipment_name: string; model: string; total_quantity: number; usable_quantity: number }>
+  equipment: Array<{ id: string; equipment_name: string; model: string; total_quantity: number; usable_quantity: number; note?: string }>
 }>>([])
 
 async function fetchLabs() {
   try {
     labs.value = await api.get('/admin/labs')
+    if (labs.value.length && !labs.value.some(lab => lab.name === scheduleLab.value)) {
+      scheduleLab.value = labs.value[0].name
+      activeLab.value = labs.value[0].name
+    }
   } catch { /* keep empty */ }
 }
 
@@ -471,13 +577,6 @@ async function saveNewLab() {
   } catch (err) { showToast(err instanceof Error ? err.message : '创建失败') }
 }
 
-const scheduleEvents = ref([
-  { lab: '实验楼 A203', day: 3, start: 5, name: '用单摆测量重力加速度', teacher: '李老师', selected: 24, tone: 'teal' },
-  { lab: '实验楼 A203', day: 5, start: 5, name: '用单摆测量重力加速度', teacher: '陈老师', selected: 22, tone: 'blue' },
-  { lab: '实验楼 B105', day: 4, start: 5, name: '示波器的原理与使用', teacher: '王老师', selected: 20, tone: 'purple' },
-  { lab: '近代物理实验室 2', day: 4, start: 5, name: '光电效应与普朗克常量测定', teacher: '周老师', selected: 16, tone: 'blue' },
-])
-
 const approvals = ref([
   { id: 'SP20260321008', source: '学生申请', applicant: '张同学 · 2024****18', type: '调课申请', subject: '用单摆测量重力加速度', submitted: '2026-03-21 09:32', status: '待审批' as ApprovalStatus, result: '等待实验中心审核，可用场次已完成冲突检查。' },
   { id: 'SP20260320006', source: '教师申请', applicant: '李老师 · T****026', type: '场地调整', subject: '示波器的原理与使用', submitted: '2026-03-20 16:18', status: 'AI 自动审批' as ApprovalStatus, result: '调整至第 7 周周四第 5–8 节，实验楼 A205；设备与容量满足要求，无时间冲突。' },
@@ -517,7 +616,24 @@ const enrollmentYearOptions = computed(() => Array.from(
   { length: new Date().getFullYear() - 1998 },
   (_, index) => new Date().getFullYear() + 1 - index,
 ))
-const visibleScheduleEvents = computed(() => scheduleEvents.value.filter((event) => event.lab === scheduleLab.value))
+const activeCandidate = computed(() =>
+  aiJob.value?.candidates.find(candidate => candidate.id === previewCandidateId.value) ?? null,
+)
+const visibleScheduleEvents = computed(() =>
+  (activeCandidate.value?.sessions ?? [])
+    .filter(session => session.laboratory_name === scheduleLab.value && session.week_no === scheduleWeek.value)
+    .map((session, index) => ({
+      id: session.id,
+      day: session.day_of_week,
+      start: session.start_slot,
+      span: session.end_slot - session.start_slot + 1,
+      name: session.project_name,
+      teacher: session.teacher_name,
+      selected: session.selected_count,
+      capacity: session.capacity,
+      tone: ['teal', 'blue', 'purple', 'ai'][index % 4],
+    })),
+)
 const visibleApprovals = computed(() => approvals.value.filter((item) => approvalFilter.value === '全部状态' || item.status === approvalFilter.value))
 const selectedApproval = computed(() => approvals.value.find((item) => item.id === selectedApprovalId.value) ?? null)
 
@@ -966,6 +1082,24 @@ watch([selectedPlan, planYearFilter, planKeyword], () => {
   filterTimer = window.setTimeout(loadPlans, 250)
 })
 
+async function loadPublishedSchedule() {
+  if (!termInfo.value?.id) return
+  try {
+    const result = await api.get<ScheduleJob>(
+      `/schedule-jobs/published?term_id=${termInfo.value.id}`,
+    )
+    const published = result.candidates.find(
+      candidate => candidate.status === 'PUBLISHED',
+    )
+    if (!published) return
+    aiJob.value = result
+    previewCandidateId.value = published.id
+    aiGenerated.value = false
+  } catch {
+    // 当前学期没有正式课表时保持空白视图。
+  }
+}
+
 onMounted(async () => {
   try {
     await loadLookups()
@@ -973,31 +1107,78 @@ onMounted(async () => {
     await loadPlans()
     await fetchSemesterCourses(true)
     await fetchLabs()
+    await loadPublishedSchedule()
   } catch (error) {
     showToast(error instanceof Error ? error.message : '培养方案基础数据加载失败')
   }
 })
 
-function generateSchedule() {
+async function generateSchedule() {
   if (aiGenerating.value) return
   aiGenerating.value = true
-  window.setTimeout(() => {
-    if (!aiGenerated.value) {
-      scheduleEvents.value.push({
-        lab: scheduleLab.value,
-        day: 6,
-        start: 9,
-        name: scheduleLab.value === '实验楼 A203' ? '霍尔效应及磁场测量' : '实验项目候选场次',
-        teacher: '陈老师',
-        selected: 18,
-        tone: 'ai',
-      })
-    }
+  try {
+    const result = await api.post<ScheduleJob>('/schedule-jobs/generate', {
+      term_id: termInfo.value?.id || null,
+      preference_text: aiPreference.value.trim(),
+    })
+    aiJob.value = result
+    previewCandidateId.value = result.candidates[0]?.id || ''
     aiGenerated.value = true
+    showToast(`AI 已生成 ${result.candidates.length} 版候选课表，尚未发布`)
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : 'AI 排课生成失败')
+  } finally {
     aiGenerating.value = false
-    showToast('AI 已生成一版无冲突课表（仅演示，尚未发布）')
-  }, 900)
+  }
 }
+
+async function chooseCandidate(candidate: ScheduleCandidate) {
+  if (!aiJob.value || selectingCandidate.value) return
+  selectingCandidate.value = true
+  previewCandidateId.value = candidate.id
+  try {
+    aiJob.value = await api.post<ScheduleJob>(`/schedule-jobs/${aiJob.value.id}/select`, {
+      schedule_version_id: candidate.id,
+    })
+    showToast('已选择候选方案，确认后可发布')
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '候选方案选择失败')
+  } finally {
+    selectingCandidate.value = false
+  }
+}
+
+function applyPreferenceExample(example: string) {
+  const current = aiPreference.value.trim()
+  aiPreference.value = current ? `${current}，${example}` : example
+}
+
+async function publishSelectedSchedule() {
+  if (!aiJob.value?.selected_candidate_version_id || publishingSchedule.value) return
+  const confirmed = window.confirm('确认发布当前选择的课表？同学期原正式课表将被归档，并同步更新教师课表。')
+  if (!confirmed) return
+  publishingSchedule.value = true
+  try {
+    aiJob.value = await api.post<ScheduleJob>(`/schedule-jobs/${aiJob.value.id}/publish`, {
+      schedule_version_id: aiJob.value.selected_candidate_version_id,
+    })
+    const published = aiJob.value.candidates.find(
+      candidate => candidate.status === 'PUBLISHED',
+    )
+    if (published) previewCandidateId.value = published.id
+    aiGenerated.value = false
+    showToast('课表已发布，并已同步教师课表')
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '课表发布失败')
+  } finally {
+    publishingSchedule.value = false
+  }
+}
+
+const selectedCandidate = computed(() => {
+  const selectedId = aiJob.value?.selected_candidate_version_id
+  return aiJob.value?.candidates.find(candidate => candidate.id === selectedId) ?? null
+})
 </script>
 
 <template>
@@ -1026,7 +1207,7 @@ function generateSchedule() {
           <button v-if="activeView === 'plans'" @click="openNewPlan">＋ 新建培养方案</button>
           <button v-else-if="activeView === 'courses'" @click="openAddCourseDialog">＋ 添加实验课程</button>
           <button v-else-if="activeView === 'labs'" @click="openAddLabDialog">＋ 添加实验室</button>
-          <button v-else-if="activeView === 'schedule'" class="ai-generate-button" :disabled="aiGenerating" @click="generateSchedule"><span>✦</span>{{ aiGenerating ? 'AI 正在生成...' : 'AI 一键生成课表' }}</button>
+          <button v-if="activeView === 'schedule'" @click="openTermEditor" style="padding:8px 14px;border:1px solid #dce4e8;border-radius:6px;color:#607480;background:#fff;font-size:9px;margin-left:8px">⚙ 学期设置</button>
         </div>
 
         <template v-if="activeView === 'plans'">
@@ -1097,20 +1278,85 @@ function generateSchedule() {
         <template v-else-if="activeView === 'schedule'">
           <section class="schedule-control-bar system-panel">
             <label>实验室<select v-model="scheduleLab"><option v-for="lab in labs" :key="lab.name">{{ lab.name }}</option></select></label>
-            <label>教学周<select><option>第 6 教学周</option><option>第 7 教学周</option></select></label>
-            <div class="schedule-week-range"><button>‹</button><strong>2026.03.22 — 03.28</strong><button>›</button></div>
-            <span v-if="aiGenerated" class="ai-plan-tag">✦ AI 方案 · 未发布</span>
+            <label>教学周<select v-model="scheduleWeek"><option v-for="w in (termInfo?.total_weeks || 18)" :key="w" :value="w">第 {{ w }} 教学周</option></select></label>
+            <div class="schedule-week-range" style="display:flex;align-items:center;gap:.5rem"><button @click="scheduleWeek = Math.max(1, scheduleWeek - 1)">‹</button><strong style="white-space:nowrap">{{ weekDates }}</strong><button @click="scheduleWeek = Math.min(termInfo?.total_weeks || 18, scheduleWeek + 1)">›</button></div>
+            <div v-if="aiGenerated" class="schedule-publish-actions">
+              <span class="ai-plan-tag">{{ selectedCandidate?.status === 'PUBLISHED' ? '课表已发布' : '候选课表' }}</span>
+              <button
+                class="schedule-publish-button"
+                :disabled="!aiJob?.selected_candidate_version_id || publishingSchedule || selectedCandidate?.status === 'PUBLISHED'"
+                @click="publishSelectedSchedule"
+              >
+                {{ selectedCandidate?.status === 'PUBLISHED' ? '已发布' : !aiJob?.selected_candidate_version_id ? '请先选择方案' : publishingSchedule ? '发布中…' : '发布课表' }}
+              </button>
+            </div>
+          </section>
+          <section v-if="aiGenerated && aiJob?.candidates.length" class="ai-candidate-grid">
+            <article
+              v-for="(candidate, index) in aiJob.candidates"
+              :key="candidate.id"
+              :class="{ active: previewCandidateId === candidate.id, selected: aiJob.selected_candidate_version_id === candidate.id }"
+              @click="previewCandidateId = candidate.id"
+            >
+              <header><strong>方案 {{ index + 1 }}</strong><span v-if="aiJob.selected_candidate_version_id === candidate.id">已选择</span></header>
+              <p><b>{{ candidate.soft_score.toFixed(2) }}</b> 综合分 · {{ candidate.session_count }} 个场次</p>
+              <div class="ai-candidate-review">
+                <section class="advantage">
+                  <strong>优点</strong>
+                  <ul>
+                    <li v-for="item in candidate.score_details?.validation?.soft_constraint_review?.advantages || []" :key="item.rule_code">{{ item.text }}</li>
+                    <li v-if="!candidate.score_details?.validation?.soft_constraint_review?.advantages?.length">暂无明显优势</li>
+                  </ul>
+                </section>
+                <section class="tradeoff">
+                  <strong>可改进</strong>
+                  <ul>
+                    <li v-for="item in candidate.score_details?.validation?.soft_constraint_review?.tradeoffs || []" :key="item.rule_code">{{ item.text }}</li>
+                    <li v-if="!candidate.score_details?.validation?.soft_constraint_review?.tradeoffs?.length">暂无明显短板</li>
+                  </ul>
+                </section>
+              </div>
+              <button :disabled="selectingCandidate" @click.stop="chooseCandidate(candidate)">{{ aiJob.selected_candidate_version_id === candidate.id ? '已选择' : '选择此方案' }}</button>
+            </article>
           </section>
           <section class="system-panel system-schedule-wrap">
             <div class="system-schedule">
               <div class="system-time-corner">节次</div>
-              <div v-for="(day,index) in ['周日 03/22','周一 03/23','周二 03/24','周三 03/25','周四 03/26','周五 03/27','周六 03/28']" :key="day" class="system-day-head" :style="{ gridColumn: index + 2 }"><strong>{{ day.split(' ')[0] }}</strong><span>{{ day.split(' ')[1] }}</span></div>
+              <div v-for="(day,index) in weekDayHeaders" :key="day" class="system-day-head" :style="{ gridColumn: index + 2 }"><strong>{{ day.split(' ')[0] }}</strong><span>{{ day.split(' ')[1] }}</span></div>
               <div v-for="period in 12" :key="period" class="system-period" :class="{ boundary: period === 4 || period === 8 }" :style="{ gridRow: period + 1 }">第 {{ period }} 节</div>
               <div v-for="day in 7" :key="day" class="system-day-column" :style="{ gridColumn: day + 1, gridRow: '2 / 14' }"></div>
-              <article v-for="event in visibleScheduleEvents" :key="`${event.name}-${event.day}-${event.start}`" class="system-schedule-event" :class="event.tone" :style="{ gridColumn: event.day + 1, gridRow: `${event.start + 1} / span 4` }"><span>{{ event.start === 1 ? '第 1–4 节' : event.start === 5 ? '第 5–8 节' : '第 9–12 节' }}</span><strong>{{ event.name }}</strong><small>{{ event.teacher }} · 已选 {{ event.selected }} 人</small></article>
+              <article v-for="event in visibleScheduleEvents" :key="event.id" class="system-schedule-event" :class="event.tone" :style="{ gridColumn: event.day + 1, gridRow: `${event.start + 1} / span ${event.span}` }"><span>第 {{ event.start }}–{{ event.start + event.span - 1 }} 节</span><strong>{{ event.name }}</strong><small>{{ event.teacher }} · 容量 {{ event.capacity }} 人</small></article>
             </div>
           </section>
-          <section class="ai-schedule-note"><span>✦</span><div><strong>AI 排课依据</strong><p>综合实验室容量、器材数量、教师可用时间、项目顺序、学生需求与时间冲突生成。当前为前端演示，生成结果不会自动发布。</p></div><button v-if="aiGenerated" @click="showToast('AI 方案已保存为演示草稿，尚未发布')">保存为草稿</button></section>
+          <section class="ai-schedule-note ai-preference-panel">
+            <span>✦</span>
+            <div>
+              <strong>告诉 AI 你更关注什么（可选）</strong>
+              <p>可以直接输入，也可以选择示例：</p>
+              <div class="ai-preference-examples">
+                <button type="button" @click="applyPreferenceExample('尽量减少周末实验')">减少周末实验</button>
+                <button type="button" @click="applyPreferenceExample('教师课时尽量紧凑')">教师课时更紧凑</button>
+                <button type="button" @click="applyPreferenceExample('优先安排学生空闲人数多的时段')">优先学生空闲时段</button>
+                <button
+                  v-if="semesterCourses[0]"
+                  type="button"
+                  @click="applyPreferenceExample(`${semesterCourses[0].name}尽量排在前6周`)"
+                >
+                  课程尽量安排在前几周
+                </button>
+                <button
+                  v-if="semesterCourses[0]?.projects[0]"
+                  type="button"
+                  @click="applyPreferenceExample(`${semesterCourses[0].projects[0].name}尽量排在前4周`)"
+                >
+                  项目尽量安排在前几周
+                </button>
+              </div>
+              <textarea v-model="aiPreference" maxlength="1000" placeholder="例如：尽量减少周末实验，教师课时更紧凑"></textarea>
+              <details v-if="aiJob?.warnings.length"><summary>{{ aiJob.warnings.length }} 条数据提示</summary><p v-for="warning in aiJob.warnings" :key="warning">{{ warning }}</p></details>
+            </div>
+            <button class="ai-submit-button" :disabled="aiGenerating" @click="generateSchedule">{{ aiGenerating ? '生成中…' : 'AI 生成候选课表' }}</button>
+          </section>
         </template>
 
         <template v-else>
@@ -1234,6 +1480,22 @@ function generateSchedule() {
             <p v-else style="color:#888;font-size:.9rem">暂无设备，可点击上方按钮添加</p>
           </section>
           <footer><button type="button" @click="addLabDialogOpen = false">取消</button><button type="submit">创建实验室</button></footer>
+        </form>
+      </div>
+    </Teleport>
+
+    <!-- 学期设置弹窗 -->
+    <Teleport to="body">
+      <div v-if="termEditorOpen" class="system-dialog-backdrop" @click.self="termEditorOpen = false">
+        <form class="approval-detail" style="width:440px" @submit.prevent="saveTermSettings">
+          <header><div><span>⚙</span><div><h2>学期设置</h2><p v-if="termInfo">{{ termInfo.academic_year }} 学年 第{{ termInfo.semester_no === 1 ? '一' : termInfo.semester_no === 2 ? '二' : '三' }}学期</p></div></div><button type="button" @click="termEditorOpen = false">×</button></header>
+          <div v-if="termInfo" style="display:flex;gap:8px;margin-bottom:1rem;padding:10px 14px;border-radius:8px;background:#e8f4f3;color:#287d82;font-size:.9rem">
+            <strong>当前第 {{ termInfo.current_week }} 周</strong>
+          </div>
+          <label style="display:block;margin-bottom:.75rem">开学日期<input v-model="termEdit.start_date" type="date" style="width:100%" /></label>
+          <label style="display:block;margin-bottom:.75rem">结束日期<input v-model="termEdit.end_date" type="date" style="width:100%" /></label>
+          <label style="display:block;margin-bottom:.75rem">总教学周数<input v-model.number="termEdit.total_weeks" type="number" min="1" max="30" style="width:100%" /></label>
+          <footer><button type="button" @click="termEditorOpen = false">取消</button><button type="submit">保存</button></footer>
         </form>
       </div>
     </Teleport>

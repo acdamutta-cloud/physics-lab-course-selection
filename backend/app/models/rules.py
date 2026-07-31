@@ -23,19 +23,31 @@ from app.models.base import AuditMixin, BaseModel
 class RuleSet(AuditMixin, BaseModel):
     __tablename__ = "rule_set"
     __table_args__ = (
-        UniqueConstraint("rule_set_code", "version_no", name="code_version"),
+        UniqueConstraint(
+            "rule_domain",
+            "rule_set_code",
+            "version_no",
+            name="domain_code_version",
+        ),
+        CheckConstraint(
+            "rule_domain IN "
+            "('SCHEDULING', 'SELECTION', 'ADJUSTMENT', 'APPROVAL')",
+            name="domain_allowed",
+        ),
         CheckConstraint(
             "status IN ('DRAFT', 'PUBLISHED', 'ARCHIVED')",
             name="status_allowed",
         ),
         Index(
             "uq_rule_set_published",
+            "rule_domain",
             "rule_set_code",
             unique=True,
             postgresql_where=text("status = 'PUBLISHED'"),
         ),
     )
 
+    rule_domain: Mapped[str] = mapped_column(String(20), nullable=False)
     rule_set_code: Mapped[str] = mapped_column(String(64), nullable=False)
     version_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
@@ -55,12 +67,20 @@ class RuleConfig(AuditMixin, BaseModel):
     __table_args__ = (
         UniqueConstraint("rule_set_id", "rule_code", name="rule_set_code"),
         CheckConstraint(
-            "rule_type IN ('HARD', 'SOFT', 'RUNTIME', 'APPROVAL')",
-            name="rule_type_allowed",
+            "enforcement_type IN ('BLOCK', 'SCORE', 'WARN', 'ROUTE')",
+            name="enforcement_type_allowed",
         ),
         CheckConstraint("priority >= 0", name="priority_nonnegative"),
         CheckConstraint("weight >= 0", name="weight_nonnegative"),
-        Index("ix_rule_config_type_enabled", "rule_type", "enabled"),
+        CheckConstraint(
+            "enforcement_type = 'SCORE' OR weight = 0",
+            name="non_score_weight_zero",
+        ),
+        Index(
+            "ix_rule_config_enforcement_enabled",
+            "enforcement_type",
+            "enabled",
+        ),
     )
 
     rule_set_id: Mapped[UUID] = mapped_column(
@@ -68,12 +88,14 @@ class RuleConfig(AuditMixin, BaseModel):
     )
     rule_code: Mapped[str] = mapped_column(String(64), nullable=False)
     rule_name: Mapped[str] = mapped_column(String(150), nullable=False)
-    rule_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    enforcement_type: Mapped[str] = mapped_column(
+        String(20), nullable=False
+    )
     scope_config: Mapped[dict] = mapped_column(nullable=False, default=dict)
     condition_config: Mapped[dict] = mapped_column(nullable=False, default=dict)
     action_config: Mapped[dict] = mapped_column(nullable=False, default=dict)
     weight: Mapped[Decimal] = mapped_column(
-        Numeric(8, 4), nullable=False, default=Decimal("0")
+        Numeric(8, 4), nullable=False, default=Decimal(0)
     )
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     description: Mapped[str] = mapped_column(Text, nullable=False)

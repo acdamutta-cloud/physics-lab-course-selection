@@ -217,3 +217,41 @@ class StudentBusyBitmap(BaseModel):
         Integer, nullable=False, default=1
     )
     source_version: Mapped[str | None] = mapped_column(String(64))
+
+
+class TeacherBusyBitmap(BaseModel):
+    """教师忙闲位图。与 StudentBusyBitmap 结构对称，初始全空。
+    实验场次为 4 节连排，排入后批量更新位图。"""
+    __tablename__ = "teacher_busy_bitmap"
+    __table_args__ = (
+        UniqueConstraint(
+            "teacher_id",
+            "term_id",
+            "mapping_version",
+            name="teacher_term_mapping",
+        ),
+        CheckConstraint("start_week >= 1", name="tb_start_week_positive"),
+        CheckConstraint("end_week >= start_week", name="tb_week_range_valid"),
+        CheckConstraint("days_per_week BETWEEN 1 AND 7", name="tb_days_valid"),
+        CheckConstraint("slots_per_day >= 1", name="tb_slots_positive"),
+    )
+
+    teacher_id: Mapped[UUID] = mapped_column(
+        ForeignKey("teacher.id", ondelete="CASCADE"), nullable=False
+    )
+    term_id: Mapped[UUID] = mapped_column(
+        ForeignKey("academic_term.id", ondelete="CASCADE"), nullable=False
+    )
+    start_week: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    end_week: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    days_per_week: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=7
+    )
+    slots_per_day: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=12
+    )
+    bitmap: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    mapping_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1
+    )
+    source_version: Mapped[str | None] = mapped_column(String(64))

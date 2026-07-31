@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import type { UserProfile } from '../api/auth'
+import { api } from '../api/client'
 
 type View = 'home' | 'schedule' | 'selection' | 'applications' | 'ai'
 type ApplicationType = '调课申请' | '换组申请' | '补做申请'
@@ -115,6 +116,26 @@ const selectedOptionalProjects = computed(() => selectedProjects.value.filter((p
 const requiredSelectionTarget = computed(() => totalRequiredProjects.value + totalOptionalRequired.value)
 const satisfiedSelectionCount = computed(() => courseSelectionDetails.value.reduce((total, course) => total + course.satisfiedSelectionCount, 0))
 const completionRate = computed(() => Math.round((satisfiedSelectionCount.value / requiredSelectionTarget.value) * 100))
+// ── 课表位图 ──
+const bitmapData = ref<{ weeks: number; days: number; slots: number; data: string | null } | null>(null)
+const bitmapWeek = ref(1)
+
+function isSlotBusy(day: number, slot: number): boolean {
+  if (!bitmapData.value?.data) return false
+  const bytes = Uint8Array.from(atob(bitmapData.value.data), c => c.charCodeAt(0))
+  const idx = (bitmapWeek.value - 1) * bitmapData.value.days * bitmapData.value.slots + day * bitmapData.value.slots + slot
+  return !!(bytes[idx >> 3] & (1 << (7 - (idx & 7))))
+}
+
+async function fetchBitmap() {
+  try {
+    bitmapData.value = await api.get('/students/me/busy-bitmap')
+    if (bitmapData.value?.weeks) bitmapWeek.value = Math.min(bitmapWeek.value, bitmapData.value.weeks)
+  } catch { /* ignore */ }
+}
+
+onMounted(() => { fetchBitmap() })
+
 const swapTargetProjects = computed(() => projects.filter((project) =>
   project.name !== applicationSourceProject.value
   && !selectedProjectIds.value.includes(project.id)
@@ -343,6 +364,21 @@ async function askAi(preset?: string) {
         </template>
 
         <template v-else-if="activeView === 'selection'">
+          <!-- 个人课表概览 -->
+          <section class="panel-card" style="margin-bottom:16px;padding:16px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+              <div><h3 style="margin:0 0 4px">我的课表</h3><p style="margin:0;color:#919da7;font-size:8px">红色块表示已有安排的时间段</p></div>
+              <label style="font-size:9px">第 <select v-model="bitmapWeek" style="margin:0 4px"><option v-for="w in (bitmapData?.weeks || 18)" :key="w" :value="w">{{ w }}</option></select> 周</label>
+            </div>
+            <div style="display:grid;grid-template-columns:50px repeat(7,1fr);grid-template-rows:28px repeat(12,18px);border:1px solid #e4eaed;border-radius:6px;overflow:hidden;font-size:8px;min-width:600px">
+              <div style="grid-row:1;display:flex;align-items:center;justify-content:center;color:#8997a1;border-bottom:1px solid #e4eaed;border-right:1px solid #e4eaed">节次</div>
+              <div v-for="(d,i) in ['周日','周一','周二','周三','周四','周五','周六']" :key="d" :style="{gridColumn:i+2,gridRow:1}" style="display:flex;align-items:center;justify-content:center;font-weight:600;color:#405562;background:#f8fafb;border-bottom:1px solid #e4eaed;border-right:1px solid #e4eaed">{{ d }}</div>
+              <template v-for="slot in 12" :key="slot">
+                <div :style="{gridRow:slot+1, borderBottom: slot===4||slot===8 ? '2px solid #c8d4da' : '1px solid #e4eaed'}" style="display:flex;align-items:center;justify-content:center;color:#8997a1;font-size:7px;border-right:1px solid #e4eaed">第{{ slot }}节</div>
+                <div v-for="day in 7" :key="day" :style="{gridColumn:day+1,gridRow:slot+1, background: isSlotBusy(day-1,slot-1) ? '#f28b82' : '', border: isSlotBusy(day-1,slot-1) ? '1px solid #e57373' : '1px solid #f0f3f5'}"></div>
+              </template>
+            </div>
+          </section>
           <section class="selection-summary">
             <div><span>本学期选课要求完成度（已满足 / 应选）</span><strong>{{ satisfiedSelectionCount }} / {{ requiredSelectionTarget }}</strong><div class="progress-track"><i :style="{ width: `${completionRate}%` }"></i></div></div>
             <p><i>!</i> 必做项目还需选择 3 项，建议优先完成必做项目安排。</p>

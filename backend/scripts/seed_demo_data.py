@@ -9,6 +9,15 @@ from uuid import UUID, uuid5
 from pwdlib import PasswordHash
 from sqlalchemy import func, select
 
+from app.data.physics_resources import (
+    EQUIPMENT_SPECS as PHYSICS_EQUIPMENT_SPECS,
+)
+from app.data.physics_resources import (
+    LABORATORY_SPECS,
+    PROJECT_LAB_CAPACITIES,
+    PROJECT_RESOURCE_SPECS,
+    build_reserved_inventory_specs,
+)
 from app.db.session import AsyncSessionFactory, dispose_database_engine
 from app.models import (
     AcademicTerm,
@@ -18,8 +27,8 @@ from app.models import (
     ExperimentProject,
     ExperimentSession,
     LabEquipmentInventory,
-    LabProjectCapability,
     Laboratory,
+    LabProjectCapability,
     Major,
     OperationLog,
     ProjectDemand,
@@ -42,8 +51,8 @@ from app.models import (
     UserAccount,
 )
 
-
 DEMO_NAMESPACE = UUID("a869341b-7477-4d3a-81b9-57e212579ec9")
+SOFT_RULE_NAMESPACE = UUID("72bb4302-7d4a-49b9-b3c6-969fe2846cb2")
 DEMO_ENROLLMENT_YEAR = 2024
 STUDENTS_PER_MAJOR = 80
 CLASSES_PER_MAJOR = 2
@@ -103,14 +112,261 @@ PROJECT_SPECS = [
     for index, (name, category) in enumerate(items, start=1)
 ]
 
-EQUIPMENT_SPECS = [
-    ("DEMO-EQ-BASIC", "基础测量组合仪", "PHY-BASIC"),
-    ("DEMO-EQ-MECH", "力学综合实验仪", "PHY-MECH"),
-    ("DEMO-EQ-ELEC", "电学综合实验箱", "PHY-ELEC"),
-    ("DEMO-EQ-OSC", "数字示波器", "DSO-1000"),
-    ("DEMO-EQ-OPT", "光学综合实验平台", "PHY-OPT"),
-    ("DEMO-EQ-MODERN", "近代物理综合实验仪", "PHY-MODERN"),
+RULE_SET_SPECS = {
+    "SCHEDULING": {
+        "code": "DEMO-PHYSICS-LAB-SCHEDULING",
+        "name": "物理实验模拟排课规则集 V1",
+        "status": "PUBLISHED",
+    },
+    "SELECTION": {
+        "code": "DEMO-PHYSICS-LAB-SELECTION",
+        "name": "物理实验模拟选课规则集 V1",
+        "status": "PUBLISHED",
+    },
+    "ADJUSTMENT": {
+        "code": "DEMO-PHYSICS-LAB-ADJUSTMENT",
+        "name": "物理实验模拟调整规则集 V1",
+        "status": "DRAFT",
+    },
+    "APPROVAL": {
+        "code": "DEMO-PHYSICS-LAB-APPROVAL",
+        "name": "物理实验模拟审批规则集 V1",
+        "status": "DRAFT",
+    },
+}
+
+RULE_SPECS = {
+    "SCHEDULING": [
+        ("TEACHER_TIME_CONFLICT", "教师时间不得冲突", "BLOCK", 100, {}),
+        ("LAB_TIME_CONFLICT", "实验室时间不得冲突", "BLOCK", 100, {}),
+        ("SESSION_CAPACITY", "场次不得超过容量", "BLOCK", 100, {}),
+        ("TEACHER_QUALIFICATION", "教师须具备项目资格", "BLOCK", 100, {}),
+        ("LAB_CAPABILITY", "实验室须支持对应项目", "BLOCK", 100, {}),
+        ("EQUIPMENT_AVAILABLE", "设备数量须满足要求", "BLOCK", 100, {}),
+        ("TEACHER_BALANCE", "教师工作量尽量均衡", "SCORE", 50, {}),
+        ("EVENING_PENALTY", "尽量减少晚间场次", "SCORE", 40, {}),
+    ],
+    "SELECTION": [
+        ("STUDENT_TIME_CONFLICT", "学生时间不得冲突", "BLOCK", 100, {}),
+        ("PROJECT_DUPLICATE", "项目不得重复修读", "BLOCK", 100, {}),
+    ],
+    "ADJUSTMENT": [
+        ("RESCHEDULE_SAME_PROJECT", "调课须保持实验项目不变", "BLOCK", 100, {}),
+        ("RESCHEDULE_TARGET_CAPACITY", "调课目标场次须有余量", "BLOCK", 100, {}),
+        ("RESCHEDULE_STUDENT_TIME", "调课不得与学生课表冲突", "BLOCK", 100, {}),
+        ("GROUP_CHANGE_CAPACITY", "换组目标组须有容量", "BLOCK", 100, {}),
+        (
+            "GROUP_CHANGE_FEATURE_ENABLED",
+            "未启用场次内分组时不得换组",
+            "BLOCK",
+            100,
+            {},
+        ),
+        ("MAKEUP_ABSENCE_REQUIRED", "补做须存在缺做记录", "BLOCK", 100, {}),
+        ("MAKEUP_WITHIN_DEADLINE", "补做须在规定期限内申请", "BLOCK", 100, {}),
+        (
+            "REPLACEMENT_TEACHER_QUALIFIED",
+            "替换教师须具备项目资格",
+            "BLOCK",
+            100,
+            {},
+        ),
+        ("RESOURCE_ISSUE_SUSPEND", "资源异常须暂停受影响安排", "WARN", 100, {}),
+        ("LAB_UNAVAILABLE_BLOCK", "停用实验室不得继续使用", "BLOCK", 100, {}),
+        (
+            "MINIMIZE_PUBLISHED_SCHEDULE_CHANGE",
+            "调整应尽量减少对已发布课表的影响",
+            "SCORE",
+            50,
+            {},
+        ),
+    ],
+    "APPROVAL": [
+        (
+            "SINGLE_STUDENT_NO_SESSION_CHANGE_AUTO_APPROVE",
+            "单人且不改变正式场次时自动批准",
+            "ROUTE",
+            100,
+            {"route": "AUTO_APPROVE"},
+        ),
+        (
+            "HARD_CONFLICT_AUTO_REJECT",
+            "存在阻断级硬冲突时自动驳回",
+            "ROUTE",
+            100,
+            {"route": "AUTO_REJECT"},
+        ),
+        (
+            "OFFICIAL_SESSION_CHANGE_MANUAL_REVIEW",
+            "改变正式场次时转管理员审批",
+            "ROUTE",
+            100,
+            {"route": "MANUAL_REVIEW"},
+        ),
+        (
+            "MULTI_STUDENT_IMPACT_MANUAL_REVIEW",
+            "影响多名学生时转管理员审批",
+            "ROUTE",
+            100,
+            {"route": "MANUAL_REVIEW"},
+        ),
+        (
+            "INITIAL_SCHEDULE_PUBLISH_ADMIN_CONFIRM",
+            "初始课表发布须管理员确认",
+            "ROUTE",
+            100,
+            {"route": "ADMIN_CONFIRM"},
+        ),
+        (
+            "RULE_SET_PUBLISH_ADMIN_CONFIRM",
+            "规则启用须管理员确认",
+            "ROUTE",
+            100,
+            {"route": "ADMIN_CONFIRM"},
+        ),
+        (
+            "SCHEDULE_ROLLBACK_ADMIN_CONFIRM",
+            "课表回滚须管理员确认",
+            "ROUTE",
+            100,
+            {"route": "ADMIN_CONFIRM"},
+        ),
+    ],
+}
+
+NEW_SCHEDULING_SOFT_RULES = [
+    (
+        "TEACHER_COMPACTNESS",
+        "减少教师课时过于分散",
+        "SCORE",
+        0,
+        {"metric": "teacher_schedule_compactness"},
+    ),
+    (
+        "TEACHER_CONSECUTIVE_LOAD",
+        "避免教师连续承担过多实验",
+        "SCORE",
+        0,
+        {"metric": "teacher_consecutive_load"},
+    ),
+    (
+        "LAB_UTILIZATION_BALANCE",
+        "平衡实验室利用率",
+        "SCORE",
+        0,
+        {"metric": "laboratory_utilization_balance"},
+    ),
+    (
+        "STUDENT_AVAILABILITY_COVERAGE",
+        "提高学生可选时间覆盖率",
+        "SCORE",
+        0,
+        {"metric": "student_availability_coverage"},
+    ),
+    (
+        "WEEKEND_PENALTY",
+        "尽量减少周末实验",
+        "SCORE",
+        0,
+        {"metric": "weekend_session_count"},
+    ),
+    (
+        "TEACHER_PREFERRED_TIME",
+        "尽量满足教师偏好时间",
+        "SCORE",
+        0,
+        {"metric": "teacher_preferred_time_match"},
+    ),
+    (
+        "TEACHER_TARGET_LOAD_SCORE",
+        "指定教师课时负荷评分",
+        "SCORE",
+        0,
+        {"metric": "target_teacher_assigned_session_count"},
+    ),
+    (
+        "COURSE_EARLY_WEEK_PREFERENCE",
+        "指定课程前置周安排评分",
+        "SCORE",
+        0,
+        {"metric": "target_course_late_session_ratio"},
+    ),
+    (
+        "PROJECT_EARLY_WEEK_PREFERENCE",
+        "指定项目前置周安排评分",
+        "SCORE",
+        0,
+        {"metric": "target_project_late_session_ratio"},
+    ),
 ]
+
+NEW_SCHEDULING_SOFT_CONDITIONS = {
+    "WEEKEND_PENALTY": {"weekend_days": [1, 7]},
+    "TEACHER_PREFERRED_TIME": {
+        "availability_type": "PREFERRED",
+    },
+    "TEACHER_TARGET_LOAD_SCORE": {
+        "configuration_status": "RUNTIME",
+        "target_source": "SCHEDULE_JOB_INPUT",
+    },
+    "COURSE_EARLY_WEEK_PREFERENCE": {
+        "configuration_status": "RUNTIME",
+        "target_source": "SCHEDULE_JOB_INPUT",
+        "parameter": "preferred_end_week",
+    },
+    "PROJECT_EARLY_WEEK_PREFERENCE": {
+        "configuration_status": "RUNTIME",
+        "target_source": "SCHEDULE_JOB_INPUT",
+        "parameter": "preferred_end_week",
+    },
+}
+
+SCHEDULING_SOFT_RULE_INITIALS = {
+    "STUDENT_AVAILABILITY_COVERAGE": {
+        "weight": Decimal(25),
+        "priority": 90,
+    },
+    "TEACHER_BALANCE": {
+        "weight": Decimal(15),
+        "priority": 80,
+    },
+    "EVENING_PENALTY": {
+        "weight": Decimal(12),
+        "priority": 70,
+    },
+    "WEEKEND_PENALTY": {
+        "weight": Decimal(10),
+        "priority": 70,
+    },
+    "TEACHER_COMPACTNESS": {
+        "weight": Decimal(10),
+        "priority": 60,
+    },
+    "TEACHER_CONSECUTIVE_LOAD": {
+        "weight": Decimal(10),
+        "priority": 60,
+    },
+    "TEACHER_PREFERRED_TIME": {
+        "weight": Decimal(10),
+        "priority": 60,
+    },
+    "LAB_UTILIZATION_BALANCE": {
+        "weight": Decimal(8),
+        "priority": 50,
+    },
+    "TEACHER_TARGET_LOAD_SCORE": {
+        "weight": Decimal(0),
+        "priority": 40,
+    },
+    "COURSE_EARLY_WEEK_PREFERENCE": {
+        "weight": Decimal(0),
+        "priority": 40,
+    },
+    "PROJECT_EARLY_WEEK_PREFERENCE": {
+        "weight": Decimal(0),
+        "priority": 40,
+    },
+}
 
 SURNAMES = "张王李赵陈刘杨黄周吴徐孙胡朱高林何郭马罗梁宋郑谢韩唐冯于董萧程曹袁邓许傅沈曾彭吕苏卢蒋蔡贾丁魏薛叶阎余潘杜戴夏钟汪田任姜范方石姚谭廖邹熊金陆郝孔白崔康毛邱秦江史顾侯邵孟龙万段雷钱汤尹黎易常武乔贺赖龚文"
 GIVEN_NAMES = ["小明","小红","子涵","雨桐","浩然","欣怡","宇轩","思琪","嘉豪","梦瑶","梓涵","俊杰","诗涵","晨曦","文博","佳宁","明轩","若彤","天宇","雅婷"]
@@ -127,8 +383,8 @@ def build_busy_bitmap(student_index: int) -> bytes:
     bitmap = bytearray(math.ceil(weeks * days_per_week * slots_per_day / 8))
 
     weekly_blocks = [
-        (1 + student_index % 5, 1, 4),
-        (3 + student_index % 3, 5, 8),
+        (2 + student_index % 5, 1, 4),
+        (4 + student_index % 3, 5, 8),
     ]
     for week_no in range(1, weeks + 1):
         for day_of_week, start_slot, end_slot in weekly_blocks:
@@ -380,7 +636,8 @@ async def seed_demo_data() -> None:
                 project_name=f"{project_name}（模拟）",
                 category=category,
                 required_slots=4,
-                default_group_size=2,
+                group_mode="INDIVIDUAL",
+                default_group_size=1,
                 historical_selection_ratio=Decimal(historical_ratio),
                 status="ACTIVE",
             )
@@ -460,49 +717,39 @@ async def seed_demo_data() -> None:
 
         laboratories = [
             Laboratory(
-                id=demo_id("lab", "A203"),
-                lab_code="DEMO-A203",
-                name="模拟基础力学实验室",
-                campus_id=main_campus.id,
-                room_type="基础力学",
-                safety_capacity=24,
-                manager_teacher_id=teachers[0].id,
+                id=demo_id("lab", spec.code),
+                lab_code=spec.code,
+                name=spec.name,
+                campus_id=(
+                    east_campus.id
+                    if spec.code.startswith("C")
+                    else main_campus.id
+                ),
+                room_type=spec.room_type,
+                safety_capacity=spec.safety_capacity,
+                manager_teacher_id=teachers[index % len(teachers)].id,
                 status="ACTIVE",
-            ),
-            Laboratory(
-                id=demo_id("lab", "B105"),
-                lab_code="DEMO-B105",
-                name="模拟电学综合实验室",
-                campus_id=main_campus.id,
-                room_type="电学综合",
-                safety_capacity=20,
-                manager_teacher_id=teachers[1].id,
-                status="ACTIVE",
-            ),
-            Laboratory(
-                id=demo_id("lab", "M201"),
-                lab_code="DEMO-M201",
-                name="模拟近代物理实验室",
-                campus_id=east_campus.id,
-                room_type="近代物理",
-                safety_capacity=16,
-                manager_teacher_id=teachers[2].id,
-                status="ACTIVE",
-            ),
+                description="通用高校物理实验演示配置",
+            )
+            for index, spec in enumerate(LABORATORY_SPECS)
         ]
+        laboratory_by_code = {
+            laboratory.lab_code: laboratory
+            for laboratory in laboratories
+        }
         session.add_all(laboratories)
         await session.flush()
 
         equipment_types = [
             EquipmentType(
-                id=demo_id("equipment", code),
-                equipment_code=code,
-                name=f"{name}（模拟）",
-                model=model,
-                unit="台",
+                id=demo_id("equipment", spec.code),
+                equipment_code=spec.code,
+                name=spec.name,
+                model=spec.model,
+                unit=spec.unit,
                 status="ACTIVE",
             )
-            for code, name, model in EQUIPMENT_SPECS
+            for spec in PHYSICS_EQUIPMENT_SPECS
         ]
         equipment_by_code = {
             equipment.equipment_code: equipment
@@ -515,64 +762,61 @@ async def seed_demo_data() -> None:
         inventories: list[LabEquipmentInventory] = []
         equipment_requirements: list[ProjectEquipmentRequirement] = []
 
-        category_lab = {
-            "BASIC": laboratories[0],
-            "MECHANICS": laboratories[0],
-            "ELECTRICITY": laboratories[1],
-            "OPTICS": laboratories[2],
-            "MODERN": laboratories[2],
-        }
-        category_equipment = {
-            "BASIC": ["DEMO-EQ-BASIC"],
-            "MECHANICS": ["DEMO-EQ-MECH"],
-            "ELECTRICITY": ["DEMO-EQ-ELEC", "DEMO-EQ-OSC"],
-            "OPTICS": ["DEMO-EQ-OPT"],
-            "MODERN": ["DEMO-EQ-MODERN", "DEMO-EQ-OSC"],
-        }
         project_lab_map = {
-            project.project_code: category_lab[project.category]
+            project.project_code: laboratory_by_code[
+                PROJECT_RESOURCE_SPECS[
+                    project.project_code
+                ].lab_codes[0]
+            ]
             for project in projects
         }
-        project_equipment_map = {
-            project.project_code: category_equipment[project.category]
-            for project in projects
-        }
+        project_capacity_map: dict[str, int] = {}
 
-        for project_code, laboratory in project_lab_map.items():
+        reserved_inventory_specs = build_reserved_inventory_specs()
+        for project_code, resource_spec in PROJECT_RESOURCE_SPECS.items():
             project = project_by_code[project_code]
-            lab_capabilities.append(
-                LabProjectCapability(
-                    id=demo_id("lab_capability", project_code),
-                    laboratory_id=laboratory.id,
-                    project_id=project.id,
-                    effective_capacity=laboratory.safety_capacity,
-                    status="ACTIVE",
-                    note="模拟能力配置",
+            project.material_note = resource_spec.material_note
+            for lab_code in resource_spec.lab_codes:
+                laboratory = laboratory_by_code[lab_code]
+                effective_capacity = PROJECT_LAB_CAPACITIES[
+                    project_code
+                ][lab_code]
+                if lab_code == resource_spec.lab_codes[0]:
+                    project_capacity_map[project_code] = effective_capacity
+                lab_capabilities.append(
+                    LabProjectCapability(
+                        id=demo_id(
+                            "lab_capability",
+                            f"{project_code}:{lab_code}",
+                        ),
+                        laboratory_id=laboratory.id,
+                        project_id=project.id,
+                        effective_capacity=effective_capacity,
+                        status="ACTIVE",
+                        note=resource_spec.capability_note,
+                    )
                 )
-            )
-            for equipment_code in project_equipment_map[project_code]:
+            for item in resource_spec.requirements:
                 equipment_requirements.append(
                     ProjectEquipmentRequirement(
                         id=demo_id(
                             "project_equipment",
-                            f"{project_code}:{equipment_code}",
+                            f"{project_code}:{item.equipment_code}",
                         ),
                         project_id=project.id,
-                        equipment_type_id=equipment_by_code[equipment_code].id,
-                        units_per_group=1,
-                        required=True,
+                        equipment_type_id=equipment_by_code[
+                            item.equipment_code
+                        ].id,
+                        units_per_group=item.units_per_group,
+                        required=item.required,
                     )
                 )
 
-        inventory_pairs: set[tuple[UUID, UUID]] = set()
-        for project_code, laboratory in project_lab_map.items():
-            for equipment_code in project_equipment_map[project_code]:
+        for lab_code, inventory_spec in reserved_inventory_specs.items():
+            laboratory = laboratory_by_code[lab_code]
+            for equipment_code, quantities in inventory_spec.items():
+                total, usable = quantities
                 equipment = equipment_by_code[equipment_code]
-                pair = (laboratory.id, equipment.id)
-                if pair in inventory_pairs:
-                    continue
-                inventory_pairs.add(pair)
-                total = max(8, laboratory.safety_capacity // 2)
                 inventories.append(
                     LabEquipmentInventory(
                         id=demo_id(
@@ -582,8 +826,8 @@ async def seed_demo_data() -> None:
                         laboratory_id=laboratory.id,
                         equipment_type_id=equipment.id,
                         total_quantity=total,
-                        usable_quantity=total,
-                        disabled_quantity=0,
+                        usable_quantity=usable,
+                        disabled_quantity=total - usable,
                         checked_at=now,
                     )
                 )
@@ -613,7 +857,7 @@ async def seed_demo_data() -> None:
                         status="ACTIVE",
                     )
                 )
-            for day_of_week in range(1, 6):
+            for day_of_week in range(2, 7):
                 availabilities.append(
                     TeacherAvailability(
                         id=demo_id(
@@ -634,65 +878,151 @@ async def seed_demo_data() -> None:
         session.add_all(qualifications + availabilities)
         await session.flush()
 
-        rule_set = RuleSet(
-            id=demo_id("rule_set", "DEMO-V1"),
-            rule_set_code="DEMO-PHYSICS-LAB",
-            version_no=1,
-            name="物理实验模拟规则集 V1",
-            status="PUBLISHED",
-            published_at=now,
-            published_by=admin_account.id,
-        )
-        session.add(rule_set)
+        rule_sets = {
+            domain: RuleSet(
+                id=demo_id("rule_set", f"{domain}-V1"),
+                rule_domain=domain,
+                rule_set_code=spec["code"],
+                version_no=1,
+                name=spec["name"],
+                status=spec["status"],
+                published_at=(
+                    now if spec["status"] == "PUBLISHED" else None
+                ),
+                published_by=(
+                    admin_account.id
+                    if spec["status"] == "PUBLISHED"
+                    else None
+                ),
+            )
+            for domain, spec in RULE_SET_SPECS.items()
+        }
+        session.add_all(rule_sets.values())
         await session.flush()
 
-        rule_specs = [
-            (
-                "TEACHER_TIME_CONFLICT",
-                "教师时间不得冲突",
-                "HARD",
-                100,
-            ),
-            (
-                "LAB_TIME_CONFLICT",
-                "实验室时间不得冲突",
-                "HARD",
-                100,
-            ),
-            ("SESSION_CAPACITY", "场次不得超过容量", "HARD", 100),
-            ("TEACHER_QUALIFICATION", "教师须具备项目资格", "HARD", 100),
-            ("LAB_CAPABILITY", "实验室须支持对应项目", "HARD", 100),
-            ("EQUIPMENT_AVAILABLE", "设备数量须满足要求", "HARD", 100),
-            ("STUDENT_TIME_CONFLICT", "学生时间不得冲突", "HARD", 100),
-            ("PROJECT_DUPLICATE", "项目不得重复修读", "HARD", 100),
-            ("TEACHER_BALANCE", "教师工作量尽量均衡", "SOFT", 50),
-            ("EVENING_PENALTY", "尽量减少晚间场次", "SOFT", 40),
-        ]
         session.add_all(
             [
                 RuleConfig(
-                    id=demo_id("rule", rule_code),
-                    rule_set_id=rule_set.id,
+                    id=demo_id("rule", f"{domain}:{rule_code}"),
+                    rule_set_id=rule_sets[domain].id,
                     rule_code=rule_code,
                     rule_name=rule_name,
-                    rule_type=rule_type,
-                    scope_config={"demo": True},
-                    condition_config={"source": "DEMO"},
+                    enforcement_type=enforcement_type,
+                    scope_config={"demo": True, "domain": domain},
+                    condition_config={
+                        "source": "DEMO"
+                        if domain in {"SCHEDULING", "SELECTION"}
+                        else "PRD_V1",
+                        "requires_runtime_context": domain
+                        in {"ADJUSTMENT", "APPROVAL"},
+                    },
                     action_config={
-                        "action": "BLOCK"
-                        if rule_type == "HARD"
-                        else "SCORE"
+                        "action": enforcement_type,
+                        **action_options,
                     },
                     weight=(
-                        Decimal("0")
-                        if rule_type == "HARD"
-                        else Decimal("1")
+                        Decimal(1)
+                        if domain == "SCHEDULING"
+                        and enforcement_type == "SCORE"
+                        else Decimal(0)
                     ),
                     priority=priority,
-                    description=f"{rule_name}（模拟规则）",
+                    description=(
+                        f"{rule_name}（模拟规则）"
+                        if domain in {"SCHEDULING", "SELECTION"}
+                        else f"{rule_name}（PRD 初始草稿）"
+                    ),
                     enabled=True,
                 )
-                for rule_code, rule_name, rule_type, priority in rule_specs
+                for domain, domain_rules in RULE_SPECS.items()
+                for (
+                    rule_code,
+                    rule_name,
+                    enforcement_type,
+                    priority,
+                    action_options,
+                ) in domain_rules
+            ]
+        )
+        await session.flush()
+
+        scheduling_v2_id = uuid5(
+            SOFT_RULE_NAMESPACE,
+            f"{rule_sets['SCHEDULING'].id}:SCHEDULING:V2",
+        )
+        scheduling_v2 = RuleSet(
+            id=scheduling_v2_id,
+            rule_domain="SCHEDULING",
+            rule_set_code=rule_sets["SCHEDULING"].rule_set_code,
+            version_no=2,
+            name="排课规则集 V2（软约束扩展草稿）",
+            status="DRAFT",
+        )
+        session.add(scheduling_v2)
+        await session.flush()
+        new_soft_rule_codes = {
+            item[0] for item in NEW_SCHEDULING_SOFT_RULES
+        }
+        session.add_all(
+            [
+                RuleConfig(
+                    id=uuid5(
+                        SOFT_RULE_NAMESPACE,
+                        f"{scheduling_v2_id}:{rule_code}",
+                    ),
+                    rule_set_id=scheduling_v2_id,
+                    rule_code=rule_code,
+                    rule_name=rule_name,
+                    enforcement_type=enforcement_type,
+                    scope_config={
+                        "demo": True,
+                        "domain": "SCHEDULING",
+                    },
+                    condition_config=(
+                        {
+                            "configuration_status": "PENDING",
+                            **NEW_SCHEDULING_SOFT_CONDITIONS.get(
+                                rule_code, {}
+                            ),
+                        }
+                        if rule_code in new_soft_rule_codes
+                        else {"source": "DEMO"}
+                    ),
+                    action_config={
+                        "action": enforcement_type,
+                        **action_options,
+                    },
+                    weight=(
+                        SCHEDULING_SOFT_RULE_INITIALS[rule_code][
+                            "weight"
+                        ]
+                        if enforcement_type == "SCORE"
+                        else Decimal(0)
+                    ),
+                    priority=(
+                        SCHEDULING_SOFT_RULE_INITIALS[rule_code][
+                            "priority"
+                        ]
+                        if enforcement_type == "SCORE"
+                        else priority
+                    ),
+                    description=(
+                        f"{rule_name}；采用综合均衡初始化，可按管理员偏好调整"
+                        if rule_code in new_soft_rule_codes
+                        else f"{rule_name}（模拟规则）"
+                    ),
+                    enabled=True,
+                )
+                for (
+                    rule_code,
+                    rule_name,
+                    enforcement_type,
+                    priority,
+                    action_options,
+                ) in (
+                    RULE_SPECS["SCHEDULING"]
+                    + NEW_SCHEDULING_SOFT_RULES
+                )
             ]
         )
         await session.flush()
@@ -746,7 +1076,6 @@ async def seed_demo_data() -> None:
                 required_capacity = math.ceil(
                     base_demand * float(prediction_ratio) * 1.2
                 )
-                lab = project_lab_map[project.project_code]
                 demands.append(
                     ProjectDemand(
                         id=demo_id("demand", project.project_code),
@@ -758,7 +1087,8 @@ async def seed_demo_data() -> None:
                         buffer_ratio=Decimal("1.20"),
                         required_capacity=required_capacity,
                         required_session_count=math.ceil(
-                            required_capacity / lab.safety_capacity
+                            required_capacity
+                            / project_capacity_map[project.project_code]
                         ),
                         calculation_snapshot={
                             "demo": True,
@@ -782,7 +1112,7 @@ async def seed_demo_data() -> None:
             hard_constraint_passed=False,
             score_details={"demo": True},
             optimization_params={"demo": True},
-            rule_set_id=rule_set.id,
+            scheduling_rule_set_id=rule_sets["SCHEDULING"].id,
         )
         session.add(schedule_version)
         await session.flush()
@@ -811,7 +1141,7 @@ async def seed_demo_data() -> None:
                             (session_index - 1) % len(qualified_teachers)
                         ].id,
                         laboratory_id=laboratory.id,
-                        capacity=laboratory.safety_capacity,
+                        capacity=project_capacity_map[project.project_code],
                         selected_count=0,
                         status="DRAFT",
                         locked=False,
@@ -824,6 +1154,7 @@ async def seed_demo_data() -> None:
             SelectionWindow(
                 id=demo_id("selection_window", "DEMO-2026"),
                 term_id=term.id,
+                selection_rule_set_id=rule_sets["SELECTION"].id,
                 start_at=datetime(2026, 2, 25, 0, 0, tzinfo=UTC),
                 end_at=datetime(2026, 3, 8, 23, 59, tzinfo=UTC),
                 withdraw_end_at=datetime(2026, 3, 15, 23, 59, tzinfo=UTC),
@@ -846,7 +1177,7 @@ async def seed_demo_data() -> None:
                     "students_per_major": STUDENTS_PER_MAJOR,
                     "students": len(students),
                 },
-                rule_set_id=rule_set.id,
+                rule_set_id=rule_sets["SCHEDULING"].id,
                 result="SUCCEEDED",
             )
         )

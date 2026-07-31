@@ -24,6 +24,14 @@ BUFFER_RATIO = Decimal("1.20")
 
 
 def _to_term_info(term) -> TermInfo:
+    from datetime import date as dt_date
+    today = dt_date.today()
+    if today < term.start_date:
+        cw = 0
+    elif today > term.end_date:
+        cw = term.total_weeks
+    else:
+        cw = min((today - term.start_date).days // 7 + 1, term.total_weeks)
     return TermInfo(
         id=term.id,
         code=term.code,
@@ -33,6 +41,7 @@ def _to_term_info(term) -> TermInfo:
         end_date=term.end_date,
         total_weeks=term.total_weeks,
         status=term.status,
+        current_week=max(0, cw),
     )
 
 
@@ -140,6 +149,19 @@ def _to_task_out(task) -> TeachingTaskOut:
 
 async def get_active_term(session: AsyncSession) -> TermInfo:
     term = await tt_crud.get_or_create_active_term(session)
+    return _to_term_info(term)
+
+
+async def update_active_term(session: AsyncSession, data: dict) -> TermInfo:
+    from datetime import date as dt_date
+    term = await tt_crud.get_or_create_active_term(session)
+    if "start_date" in data and data["start_date"]:
+        term.start_date = dt_date.fromisoformat(data["start_date"])
+    if "end_date" in data and data["end_date"]:
+        term.end_date = dt_date.fromisoformat(data["end_date"])
+    if "total_weeks" in data:
+        term.total_weeks = max(1, int(data["total_weeks"]))
+    await session.commit()
     return _to_term_info(term)
 
 

@@ -109,6 +109,16 @@ async def get_active_term(
     return await sc_svc.get_active_term(session)
 
 
+@router.put("/active-term")
+async def update_active_term(
+    body: dict,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    return await sc_svc.update_active_term(session, body)
+
+
 @router.get("/teaching-tasks", response_model=TeachingTaskListResponse)
 async def list_teaching_tasks(
     session: AsyncSession = Depends(get_db_session),
@@ -404,3 +414,27 @@ async def list_equipment_types(
     require_admin(current_user)
     items = await res_crud.get_active_equipment_types(session)
     return [{"id": str(e.id), "name": e.name, "model": e.model or "", "equipment_code": e.equipment_code} for e in items]
+
+
+@router.get("/teachers/{teacher_id}/busy-bitmap")
+async def get_teacher_bitmap(
+    teacher_id: UUID,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    from app.crud.students import get_teacher_bitmap as get_tb
+    from app.crud.teaching_tasks import get_or_create_active_term
+    import base64
+    term = await get_or_create_active_term(session)
+    bm = await get_tb(session, teacher_id, term.id)
+    if bm is None:
+        return {"weeks": 18, "days": 7, "slots": 12, "data": None}
+    return {
+        "weeks": bm.end_week - bm.start_week + 1,
+        "days": bm.days_per_week,
+        "slots": bm.slots_per_day,
+        "data": base64.b64encode(bm.bitmap).decode(),
+        "start_week": bm.start_week,
+        "end_week": bm.end_week,
+    }

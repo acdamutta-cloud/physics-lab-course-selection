@@ -59,7 +59,10 @@ class ApplicationRequest(AuditMixin, BaseModel):
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict] = mapped_column(nullable=False, default=dict)
     validation_result: Mapped[dict] = mapped_column(nullable=False, default=dict)
-    rule_set_id: Mapped[UUID | None] = mapped_column(
+    adjustment_rule_set_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("rule_set.id", ondelete="SET NULL")
+    )
+    approval_rule_set_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("rule_set.id", ondelete="SET NULL")
     )
     status: Mapped[str] = mapped_column(

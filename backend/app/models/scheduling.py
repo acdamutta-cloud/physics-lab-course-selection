@@ -1,5 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import (
@@ -19,6 +20,15 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import AuditMixin, BaseModel
+
+if TYPE_CHECKING:
+    from app.models.curriculum import (
+        AcademicTerm,
+        ExperimentCourse,
+        ExperimentProject,
+    )
+    from app.models.identity import Major, Teacher
+    from app.models.resources import Laboratory
 
 
 class TeachingTask(AuditMixin, BaseModel):
@@ -131,7 +141,7 @@ class ProjectDemand(BaseModel):
     requirement_type: Mapped[str] = mapped_column(String(20), nullable=False)
     base_demand: Mapped[int] = mapped_column(Integer, nullable=False)
     prediction_ratio: Mapped[Decimal] = mapped_column(
-        Numeric(6, 4), nullable=False, default=Decimal("1")
+        Numeric(6, 4), nullable=False, default=Decimal(1)
     )
     buffer_ratio: Mapped[Decimal] = mapped_column(
         Numeric(5, 2), nullable=False, default=Decimal("1.20")
@@ -177,7 +187,7 @@ class ScheduleJob(AuditMixin, BaseModel):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="PENDING"
     )
-    rule_set_id: Mapped[UUID] = mapped_column(
+    scheduling_rule_set_id: Mapped[UUID] = mapped_column(
         ForeignKey("rule_set.id", ondelete="RESTRICT"), nullable=False
     )
     input_snapshot: Mapped[dict] = mapped_column(nullable=False, default=dict)
@@ -229,7 +239,7 @@ class ScheduleVersion(AuditMixin, BaseModel):
     optimization_params: Mapped[dict] = mapped_column(
         nullable=False, default=dict
     )
-    rule_set_id: Mapped[UUID] = mapped_column(
+    scheduling_rule_set_id: Mapped[UUID] = mapped_column(
         ForeignKey("rule_set.id", ondelete="RESTRICT"), nullable=False
     )
     published_by: Mapped[UUID | None] = mapped_column(
@@ -296,9 +306,172 @@ class ExperimentSession(AuditMixin, BaseModel):
     selected_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )
+
+    project: Mapped["ExperimentProject"] = relationship("ExperimentProject", viewonly=True)
+    teacher: Mapped["Teacher"] = relationship("Teacher", viewonly=True)
+    laboratory: Mapped["Laboratory"] = relationship("Laboratory", viewonly=True)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="DRAFT"
     )
     locked: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
+    )
+
+
+class TeacherTimetableEntry(BaseModel):
+    __tablename__ = "teacher_timetable_entry"
+    __table_args__ = (
+        UniqueConstraint(
+            "experiment_session_id",
+            name="timetable_experiment_session",
+        ),
+        UniqueConstraint(
+            "teacher_id",
+            "experiment_session_id",
+            name="teacher_experiment_session",
+        ),
+        Index(
+            "ix_teacher_timetable_entry_teacher_term",
+            "teacher_id",
+            "term_id",
+        ),
+        Index(
+            "ix_teacher_timetable_entry_schedule_version",
+            "schedule_version_id",
+        ),
+    )
+
+    teacher_id: Mapped[UUID] = mapped_column(
+        ForeignKey("teacher.id", ondelete="RESTRICT"), nullable=False
+    )
+    term_id: Mapped[UUID] = mapped_column(
+        ForeignKey("academic_term.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    schedule_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("schedule_version.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    experiment_session_id: Mapped[UUID] = mapped_column(
+        ForeignKey("experiment_session.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+
+class CourseTimeAvailability(BaseModel):
+    __tablename__ = "course_time_availability"
+    __table_args__ = (
+        UniqueConstraint(
+            "course_id",
+            "term_id",
+            "week_no",
+            "day_of_week",
+            "slot_no",
+            name="course_term_time_slot",
+        ),
+        CheckConstraint("week_no >= 1", name="week_positive"),
+        CheckConstraint(
+            "day_of_week BETWEEN 1 AND 7",
+            name="day_valid",
+        ),
+        CheckConstraint("slot_no >= 1", name="slot_positive"),
+        CheckConstraint(
+            "target_student_count >= 0",
+            name="target_count_nonnegative",
+        ),
+        CheckConstraint(
+            "known_student_count >= 0",
+            name="known_count_nonnegative",
+        ),
+        CheckConstraint(
+            "free_student_count >= 0",
+            name="free_count_nonnegative",
+        ),
+        CheckConstraint(
+            "busy_student_count >= 0",
+            name="busy_count_nonnegative",
+        ),
+        CheckConstraint(
+            "unknown_student_count >= 0",
+            name="unknown_count_nonnegative",
+        ),
+        CheckConstraint(
+            "known_student_count = "
+            "free_student_count + busy_student_count",
+            name="known_count_sum",
+        ),
+        CheckConstraint(
+            "target_student_count = "
+            "known_student_count + unknown_student_count",
+            name="target_count_sum",
+        ),
+        CheckConstraint(
+            "free_ratio BETWEEN 0 AND 1",
+            name="free_ratio_valid",
+        ),
+        CheckConstraint(
+            "data_coverage_ratio BETWEEN 0 AND 1",
+            name="coverage_ratio_valid",
+        ),
+        CheckConstraint(
+            "mapping_version >= 1",
+            name="mapping_version_positive",
+        ),
+        CheckConstraint(
+            "calculation_version >= 1",
+            name="calculation_version_positive",
+        ),
+        Index(
+            "ix_course_time_availability_course_time",
+            "course_id",
+            "term_id",
+            "week_no",
+            "day_of_week",
+        ),
+        Index(
+            "ix_course_time_availability_course_free",
+            "course_id",
+            "term_id",
+            text("free_student_count DESC"),
+        ),
+        Index(
+            "ix_course_time_availability_batch",
+            "calculation_batch_id",
+        ),
+    )
+
+    course_id: Mapped[UUID] = mapped_column(
+        ForeignKey("experiment_course.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    term_id: Mapped[UUID] = mapped_column(
+        ForeignKey("academic_term.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    week_no: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    day_of_week: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    slot_no: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    target_student_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    known_student_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    free_student_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    busy_student_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    unknown_student_count: Mapped[int] = mapped_column(
+        Integer, nullable=False
+    )
+    free_ratio: Mapped[Decimal] = mapped_column(
+        Numeric(8, 6), nullable=False
+    )
+    data_coverage_ratio: Mapped[Decimal] = mapped_column(
+        Numeric(8, 6), nullable=False
+    )
+    mapping_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1
+    )
+    calculation_version: Mapped[int] = mapped_column(
+        Integer, nullable=False
+    )
+    calculation_batch_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    calculated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
     )

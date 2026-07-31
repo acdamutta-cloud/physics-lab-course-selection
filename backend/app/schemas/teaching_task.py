@@ -16,6 +16,7 @@ class TermInfo(BaseModel):
     end_date: date
     total_weeks: int
     status: str
+    current_week: int = 1
 
 
 class TeachingTaskCohortOut(BaseModel):
