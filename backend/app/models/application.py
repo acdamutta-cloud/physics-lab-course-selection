@@ -8,6 +8,7 @@ from sqlalchemy import (
     Index,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -29,6 +30,12 @@ class ApplicationRequest(AuditMixin, BaseModel):
         ),
         Index("ix_application_request_applicant_status", "applicant_user_id", "status"),
         Index("ix_application_request_type_status", "request_type", "status"),
+        Index("ix_application_request_target_status", "target_session_id", "status"),
+        UniqueConstraint(
+            "student_id",
+            "idempotency_key",
+            name="application_student_idempotency_key",
+        ),
     )
 
     request_no: Mapped[str] = mapped_column(
@@ -59,6 +66,14 @@ class ApplicationRequest(AuditMixin, BaseModel):
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict] = mapped_column(nullable=False, default=dict)
     validation_result: Mapped[dict] = mapped_column(nullable=False, default=dict)
+    approval_route: Mapped[str | None] = mapped_column(String(20))
+    reservation_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="NONE"
+    )
+    reservation_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(String(64))
     adjustment_rule_set_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("rule_set.id", ondelete="SET NULL")
     )
@@ -74,6 +89,30 @@ class ApplicationRequest(AuditMixin, BaseModel):
     executed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+
+
+class AdjustmentExecutionAudit(BaseModel):
+    __tablename__ = "adjustment_execution_audit"
+    __table_args__ = (
+        UniqueConstraint("application_id", name="adjustment_audit_application"),
+        Index("ix_adjustment_audit_session", "session_id", "executed_at"),
+    )
+
+    application_id: Mapped[UUID] = mapped_column(
+        ForeignKey("application_request.id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[UUID] = mapped_column(
+        ForeignKey("experiment_session.id", ondelete="RESTRICT"), nullable=False
+    )
+    change_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    before_snapshot: Mapped[dict] = mapped_column(nullable=False, default=dict)
+    after_snapshot: Mapped[dict] = mapped_column(nullable=False, default=dict)
+    execution_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    executed_by: Mapped[UUID] = mapped_column(nullable=False)
+    executed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
 class ApprovalRecord(BaseModel):

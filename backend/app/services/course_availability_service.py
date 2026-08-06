@@ -71,7 +71,7 @@ def bitmap_slot_is_busy(
     )
     if index < 0 or index // 8 >= len(bitmap):
         return None
-    return bool(bitmap[index // 8] & (1 << (index % 8)))
+    return bool(bitmap[index // 8] & (1 << (7 - (index % 8))))
 
 
 def _ratio(numerator: int, denominator: int) -> Decimal:

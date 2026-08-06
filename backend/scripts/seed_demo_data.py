@@ -394,7 +394,7 @@ def build_busy_bitmap(student_index: int) -> bytes:
                     + (day_of_week - 1) * slots_per_day
                     + (slot_no - 1)
                 )
-                bitmap[index // 8] |= 1 << (index % 8)
+                bitmap[index // 8] |= 1 << (7 - (index % 8))
     return bytes(bitmap)
 
 
@@ -633,7 +633,7 @@ async def seed_demo_data() -> None:
                 id=demo_id("project", project_code),
                 project_code=project_code,
                 course_id=course_by_code[course_code].id,
-                project_name=f"{project_name}（模拟）",
+                project_name=project_name,
                 category=category,
                 required_slots=4,
                 group_mode="INDIVIDUAL",

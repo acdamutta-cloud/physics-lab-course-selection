@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.routers.admin import router as admin_router
+from app.api.routers.adjustments import router as adjustments_router
 from app.api.routers.auth import router as auth_router
 from app.api.routers.health import router as health_router
 from app.api.routers.schedules import router as schedules_router
@@ -16,3 +17,4 @@ api_v1_router.include_router(admin_router)
 api_v1_router.include_router(students_router)
 api_v1_router.include_router(teachers_router)
 api_v1_router.include_router(training_plans_router)
+api_v1_router.include_router(adjustments_router)

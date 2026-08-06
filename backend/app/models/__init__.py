@@ -4,7 +4,11 @@ from app.models.agent import (
     AgentStepLog,
     PromptTemplate,
 )
-from app.models.application import ApplicationRequest, ApprovalRecord
+from app.models.application import (
+    AdjustmentExecutionAudit,
+    ApplicationRequest,
+    ApprovalRecord,
+)
 from app.models.audit import OperationLog
 from app.models.base import Base
 from app.models.curriculum import (
@@ -17,7 +21,11 @@ from app.models.curriculum import (
     TrainingPlanCourse,
     TrainingPlanProject,
 )
-from app.models.enrollment import SelectionWindow, StudentProjectRecord
+from app.models.enrollment import (
+    SelectionWindow,
+    StudentCourseCompletion,
+    StudentProjectRecord,
+)
 from app.models.identity import (
     Campus,
     Major,
@@ -57,6 +65,7 @@ __all__ = [
     "AgentRun",
     "AgentStepLog",
     "ApplicationRequest",
+    "AdjustmentExecutionAudit",
     "ApprovalRecord",
     "Base",
     "Campus",

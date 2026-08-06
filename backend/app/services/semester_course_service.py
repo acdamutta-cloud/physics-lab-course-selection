@@ -155,6 +155,10 @@ async def get_active_term(session: AsyncSession) -> TermInfo:
 async def update_active_term(session: AsyncSession, data: dict) -> TermInfo:
     from datetime import date as dt_date
     term = await tt_crud.get_or_create_active_term(session)
+    if "academic_year" in data and data["academic_year"]:
+        term.academic_year = data["academic_year"]
+    if "semester_no" in data:
+        term.semester_no = int(data["semester_no"])
     if "start_date" in data and data["start_date"]:
         term.start_date = dt_date.fromisoformat(data["start_date"])
     if "end_date" in data and data["end_date"]:

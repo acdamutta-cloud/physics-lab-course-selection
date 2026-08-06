@@ -10,7 +10,7 @@ from app.services.course_availability_service import (
 
 
 def test_bitmap_slot_is_busy_uses_student_bitmap_mapping() -> None:
-    bitmap = bytes([0b00000100])
+    bitmap = bytes([0b00100000])
 
     assert (
         bitmap_slot_is_busy(

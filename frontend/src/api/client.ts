@@ -7,6 +7,15 @@ interface RequestOptions {
   skipAuth?: boolean
 }
 
+export interface StreamEvent {
+  event: string
+  data: Record<string, any>
+}
+
+export interface StreamHandlers {
+  onEvent: (event: StreamEvent) => void | Promise<void>
+}
+
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, headers = {}, skipAuth = false } = options
 
@@ -40,7 +49,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
         if (retry.ok) return retry.json()
       }
     }
-    throw new Error(errorData?.detail || `请求失败 (${response.status})`)
+    throw new Error(parseErrorDetail(errorData, response.status))
   }
 
   if (response.status === 204) return undefined as unknown as T
@@ -66,9 +75,79 @@ async function attemptRefresh(): Promise<boolean> {
   }
 }
 
+function parseErrorDetail(errorData: any, status: number): string {
+  const detail = errorData?.detail
+  if (typeof detail === 'string') return detail
+  if (detail && typeof detail.message === 'string') return detail.message
+  return `请求失败 (${status})`
+}
+
+async function openStream(
+  path: string,
+  body: unknown,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const token = localStorage.getItem('access_token')
+  return fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+async function streamPost(
+  path: string,
+  body: unknown,
+  handlers: StreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  let response = await openStream(path, body, signal)
+  if (response.status === 401 && await attemptRefresh()) {
+    response = await openStream(path, body, signal)
+  }
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => null)
+    throw new Error(parseErrorDetail(errorData, response.status))
+  }
+  if (!response.body) throw new Error('浏览器未提供流式响应能力')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  const dispatchBlock = async (block: string) => {
+    let event = 'message'
+    const dataLines: string[] = []
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+    }
+    if (!dataLines.length) return
+    const raw = dataLines.join('\n')
+    const data = JSON.parse(raw)
+    await handlers.onEvent({ event, data })
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+    const blocks = buffer.split(/\r?\n\r?\n/)
+    buffer = blocks.pop() || ''
+    for (const block of blocks) await dispatchBlock(block)
+    if (done) break
+  }
+  if (buffer.trim()) await dispatchBlock(buffer)
+}
+
 export const api = {
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, body: unknown) => request<T>(path, { method: 'POST', body }),
   put: <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
+  streamPost,
 }

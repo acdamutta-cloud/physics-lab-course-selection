@@ -9,7 +9,7 @@ const props = defineProps<{ user: UserProfile | null }>()
 const adminName = computed(() => props.user?.name || '系统管理员')
 const adminLoginId = computed(() => props.user?.login_name || 'ADMIN-001')
 const adminInitial = computed(() => adminName.value.slice(0, 1))
-type ApprovalStatus = '待审批' | '已审批' | 'AI 自动审批' | '已驳回'
+type ApprovalStatus = '待审批' | '已通过' | '已驳回' | '已取消'
 type PlanCourseRequirement = {
   id: number
   courseId: string
@@ -122,6 +122,9 @@ const emit = defineEmits<{ logout: [] }>()
 const activeView = ref<SystemView>('plans')
 const sidebarOpen = ref(false)
 const toast = ref('')
+const selectedCampus = ref(localStorage.getItem('system_campus') || '主校区')
+const campusOptions = ['主校区', '东校区']
+watch(selectedCampus, (v) => localStorage.setItem('system_campus', v))
 const planEditorOpen = ref(false)
 const selectedPlan = ref('物理学（师范）')
 const planMajor = ref('物理学（师范）')
@@ -236,11 +239,13 @@ const termInfo = ref<{ id: string; academic_year: string; semester_no: number; s
 
 // ── 学期设置 ──
 const termEditorOpen = ref(false)
-const termEdit = ref({ start_date: '', end_date: '', total_weeks: 18 })
+const termEdit = ref({ academic_year: '', semester_no: 1, start_date: '', end_date: '', total_weeks: 18 })
 
 function openTermEditor() {
   if (termInfo.value) {
     termEdit.value = {
+      academic_year: termInfo.value.academic_year,
+      semester_no: termInfo.value.semester_no,
       start_date: termInfo.value.start_date,
       end_date: termInfo.value.end_date,
       total_weeks: termInfo.value.total_weeks,
@@ -577,12 +582,80 @@ async function saveNewLab() {
   } catch (err) { showToast(err instanceof Error ? err.message : '创建失败') }
 }
 
-const approvals = ref([
-  { id: 'SP20260321008', source: '学生申请', applicant: '张同学 · 2024****18', type: '调课申请', subject: '用单摆测量重力加速度', submitted: '2026-03-21 09:32', status: '待审批' as ApprovalStatus, result: '等待实验中心审核，可用场次已完成冲突检查。' },
-  { id: 'SP20260320006', source: '教师申请', applicant: '李老师 · T****026', type: '场地调整', subject: '示波器的原理与使用', submitted: '2026-03-20 16:18', status: 'AI 自动审批' as ApprovalStatus, result: '调整至第 7 周周四第 5–8 节，实验楼 A205；设备与容量满足要求，无时间冲突。' },
-  { id: 'SP20260318004', source: '学生申请', applicant: '林同学 · 2024****05', type: '补做申请', subject: '光电效应与普朗克常量测定', submitted: '2026-03-18 11:05', status: '已审批' as ApprovalStatus, result: '安排至第 8 周周五第 5–8 节，近代物理实验室 2，由周老师指导。' },
-  { id: 'SP20260315002', source: '学生申请', applicant: '周同学 · 2024****08', type: '换组申请', subject: '霍尔效应及磁场测量 → 密立根油滴实验', submitted: '2026-03-15 14:26', status: '已驳回' as ApprovalStatus, result: '驳回理由：目标项目已达到实验室安全容量上限，暂无可用名额。' },
-])
+const notifications = ref<Array<{ request_no: string; student_name: string; type: string; time: string }>>([])
+const showNotifications = ref(false)
+const unreadCount = computed(() => notifications.value.length)
+
+async function fetchNotifications() {
+  try { notifications.value = await api.get<any[]>('/admin/notifications') } catch { notifications.value = [] }
+}
+async function readOne(idx: number, val: string) {
+  notifications.value.splice(idx, 1)
+  await api.post('/admin/notifications/read', { value: val }).catch(() => {})
+}
+
+const approvals = ref<Array<{ id: string; rawId: string; source: string; applicant: string; type: string; subject: string; submitted: string; status: ApprovalStatus; result: string; reason_text: string; source_info: Record<string,any>; target_info: Record<string,any> }>>([])
+const rejectReason = ref('')
+function formatAdjustSession(info: any) {
+  if (!info) return '—'
+  const dayNames = ['','周日','周一','周二','周三','周四','周五','周六']
+  const w = info.week_no ? `第${info.week_no}周` : ''
+  const d = info.day_of_week ? dayNames[info.day_of_week] : ''
+  const s = info.start_slot ? `第${info.start_slot}–${info.end_slot || info.start_slot}节` : ''
+  const p = info.project_name || ''
+  return [w, d, s, p].filter(Boolean).join(' · ') || '—'
+}
+
+const rejectDialogOpen = ref(false)
+const rejectTargetId = ref('')
+
+async function fetchApprovals() {
+  try {
+    const items = await api.get<any[]>('/admin/adjustments')
+    const statusMap: Record<string, ApprovalStatus> = {
+      PENDING_REVIEW: '待审批', EXECUTED: '已通过', APPROVED: '已通过',
+      REJECTED: '已驳回', CANCELLED: '已取消', AUTO_EXECUTED: '已通过',
+    }
+    approvals.value = items.map((item: any) => ({
+      id: item.request_no,
+      rawId: item.id,
+      source: '学生申请',
+      applicant: item.student_name || '',
+      type: item.request_type === 'RESCHEDULE' ? '调课申请' : item.request_type === 'PROJECT_CHANGE' ? '换组申请' : '补做申请',
+      subject: item.project_name || '',
+      submitted: (item.created_at || '').slice(0, 16).replace('T', ' '),
+      status: statusMap[item.status] || item.status,
+      result: item.status === 'REJECTED' ? (item.review_comment || `驳回 · ${item.reviewed_at?.slice(0, 10) || ''}`) : item.executed_at ? `已于 ${item.executed_at.slice(0, 10)} 执行` : item.status === 'CANCELLED' ? '已取消' : '等待审核',
+      reason_text: item.reason_text || '',
+      source_info: item.source_info || {},
+      target_info: item.target_info || {},
+    }))
+  } catch { /* keep mock */ }
+}
+
+async function approveApplication(id: string) {
+  try {
+    await api.post(`/admin/adjustments/${id}/review`, { decision: 'APPROVED', comment: '' })
+    showToast('已通过')
+    selectedApprovalId.value = null
+    await fetchApprovals()
+  } catch (e: any) { showToast(e?.message || '操作失败') }
+}
+function openReject(id: string) {
+  rejectTargetId.value = id
+  rejectReason.value = ''
+  rejectDialogOpen.value = true
+}
+async function confirmReject() {
+  if (!rejectReason.value.trim()) return showToast('请填写驳回理由')
+  try {
+    await api.post(`/admin/adjustments/${rejectTargetId.value}/review`, { decision: 'REJECTED', comment: rejectReason.value.trim() })
+    showToast('已驳回')
+    rejectDialogOpen.value = false
+    selectedApprovalId.value = null
+    await fetchApprovals()
+  } catch (e: any) { showToast(e?.message || '操作失败') }
+}
 
 const currentLab = computed(() => labs.value.find((lab) => lab.name === activeLab.value) ?? labs.value[0])
 const filteredEquipment = computed(() => {
@@ -1108,6 +1181,8 @@ onMounted(async () => {
     await fetchSemesterCourses(true)
     await fetchLabs()
     await loadPublishedSchedule()
+    await fetchApprovals()
+    await fetchNotifications()
   } catch (error) {
     showToast(error instanceof Error ? error.message : '培养方案基础数据加载失败')
   }
@@ -1187,7 +1262,7 @@ const selectedCandidate = computed(() => {
       <div class="system-brand"><span class="system-logo"><i></i></span><div><strong>物理实验</strong><small>智能选课系统</small></div></div>
       <nav class="system-nav">
         <p>系统管理中心</p>
-        <button v-for="item in navItems" :key="item.id" :class="{ active: activeView === item.id }" @click="navigate(item.id)"><span>{{ item.icon }}</span>{{ item.label }}<i v-if="item.id === 'approvals'" class="system-nav-count">4</i></button>
+        <button v-for="item in navItems" :key="item.id" :class="{ active: activeView === item.id }" @click="navigate(item.id)"><span>{{ item.icon }}</span>{{ item.label }}<i v-if="item.id === 'approvals'" class="system-nav-count">{{ approvals.filter(a=>a.status==='待审批').length || '' }}</i></button>
       </nav>
       <div class="system-status"><span><i></i>系统运行正常</span><small>当前为前端演示环境</small></div>
       <button class="system-logout" @click="emit('logout')">↪　退出演示</button>
@@ -1198,12 +1273,19 @@ const selectedCandidate = computed(() => {
       <header class="system-topbar">
         <button class="system-menu" @click="sidebarOpen = true">☰</button>
         <div class="system-breadcrumb"><span>系统端</span><b>/</b>{{ viewMeta[activeView].title }}</div>
-        <div class="system-top-actions"><span class="system-demo-badge">演示数据</span><button class="system-notice" @click="showToast('当前有 4 条申请需要关注')">♢<i>4</i></button><div class="system-profile"><span>{{ adminInitial }}</span><div><strong>{{ adminName }}</strong><small>{{ adminLoginId }}</small></div></div></div>
+        <div class="system-top-actions"><div style="position:relative"><button class="system-notice" @click="showNotifications=!showNotifications">♢<i v-if="unreadCount">{{ unreadCount }}</i></button><div v-if="showNotifications && unreadCount" style="position:absolute;right:0;top:38px;z-index:20;width:300px;max-height:340px;overflow-y:auto;background:#fff;border:1px solid #dce4e8;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:0"><div style="padding:8px 12px;border-bottom:1px solid #eee;font-size:9px;color:#657885">未读通知 · {{ unreadCount }} 条</div><div v-for="(n,i) in notifications" :key="n.request_no" style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid #f5f5f5;font-size:8px;gap:8px"><div @click="navigate('approvals'); showNotifications=false" style="cursor:pointer;flex:1;min-width:0"><div style="color:#405562;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ n.student_name }} · {{ n.type }}</div><div style="color:#919da7;margin-top:2px">{{ n.time }}</div></div><button @click="readOne(i, JSON.stringify(n))" style="flex-shrink:0;padding:2px 6px;border:1px solid #dce4e8;border-radius:3px;background:#fff;color:#277e82;font-size:7px;cursor:pointer">已读</button></div></div></div><div class="system-profile"><span>{{ adminInitial }}</span><div><strong>{{ adminName }}</strong><small>{{ adminLoginId }}</small></div></div></div>
       </header>
 
       <main class="system-content">
         <div class="system-page-heading">
           <div><h1>{{ viewMeta[activeView].title }}</h1><p>{{ viewMeta[activeView].subtitle }}</p></div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <label style="font-size:8px;color:#657885;display:flex;align-items:center;gap:4px">校区
+              <select v-model="selectedCampus" style="font-size:8px;padding:3px 6px;border:1px solid #d0d7de;border-radius:4px;color:#405562">
+                <option v-for="c in campusOptions" :key="c" :value="c">{{ c }}</option>
+              </select>
+            </label>
+          </div>
           <button v-if="activeView === 'plans'" @click="openNewPlan">＋ 新建培养方案</button>
           <button v-else-if="activeView === 'courses'" @click="openAddCourseDialog">＋ 添加实验课程</button>
           <button v-else-if="activeView === 'labs'" @click="openAddLabDialog">＋ 添加实验室</button>
@@ -1361,13 +1443,13 @@ const selectedCandidate = computed(() => {
 
         <template v-else>
           <section class="approval-summary">
-            <article><span>待审批</span><strong>1</strong><i class="pending"></i></article><article><span>已审批</span><strong>1</strong><i class="approved"></i></article><article><span>AI 自动审批</span><strong>1</strong><i class="ai"></i></article><article><span>已驳回</span><strong>1</strong><i class="rejected"></i></article>
+            <article><span>待审批</span><strong>{{ approvals.filter(a=>a.status==='待审批').length }}</strong><i class="pending"></i></article><article><span>已通过</span><strong>{{ approvals.filter(a=>a.status==='已通过').length }}</strong><i class="approved"></i></article><article><span>已驳回</span><strong>{{ approvals.filter(a=>a.status==='已驳回').length }}</strong><i class="rejected"></i></article><article><span>已取消</span><strong>{{ approvals.filter(a=>a.status==='已取消').length }}</strong><i class="cancelled"></i></article>
           </section>
           <section class="system-panel approval-panel">
-            <div class="system-panel-title"><div><h3>申请审批列表</h3><p>审批结果需包含具体执行方案或明确驳回理由</p></div><div><label class="system-search">⌕<input placeholder="搜索申请人、编号或项目" /></label><select v-model="approvalFilter"><option>全部状态</option><option>待审批</option><option>已审批</option><option>AI 自动审批</option><option>已驳回</option></select></div></div>
+            <div class="system-panel-title"><div><h3>申请审批列表</h3><p>审批结果需包含具体执行方案或明确驳回理由</p></div><div><label class="system-search">⌕<input placeholder="搜索申请人、编号或项目" /></label><select v-model="approvalFilter"><option>全部状态</option><option>待审批</option><option>已通过</option><option>已驳回</option><option>已取消</option></select></div></div>
             <div class="approval-table">
               <div class="approval-row approval-head"><span>申请编号 / 来源</span><span>申请人</span><span>申请类型</span><span>关联项目</span><span>提交时间</span><span>审批状态</span><span>操作</span></div>
-              <div v-for="item in visibleApprovals" :key="item.id" class="approval-row"><span><b>{{ item.id }}</b><small>{{ item.source }}</small></span><span>{{ item.applicant }}</span><span>{{ item.type }}</span><span>{{ item.subject }}</span><span>{{ item.submitted }}</span><span><i class="approval-status" :class="{ pending: item.status === '待审批', approved: item.status === '已审批', ai: item.status === 'AI 自动审批', rejected: item.status === '已驳回' }">{{ item.status }}</i></span><span><button @click="selectedApprovalId = item.id">{{ item.status === '待审批' ? '去审批' : '查看结果' }}</button></span></div>
+              <div v-for="item in visibleApprovals" :key="item.id" class="approval-row"><span><b>{{ item.id }}</b><small>{{ item.source }}</small></span><span>{{ item.applicant }}</span><span><i class="approval-type" :class="item.type === '调课申请' ? 'type-reschedule' : item.type === '换组申请' ? 'type-change' : 'type-makeup'">{{ item.type }}</i></span><span>{{ item.subject }}</span><span>{{ item.submitted }}</span><span><i class="approval-status" :class="{ pending: item.status === '待审批', approved: item.status === '已通过', rejected: item.status === '已驳回', cancelled: item.status === '已取消' }">{{ item.status }}</i></span><span><button @click="selectedApprovalId = item.id">{{ item.status === '待审批' ? '去审批' : '查看结果' }}</button></span></div>
             </div>
           </section>
         </template>
@@ -1445,9 +1527,9 @@ const selectedCandidate = computed(() => {
     <div v-if="selectedApproval" class="system-dialog-backdrop" @click.self="selectedApprovalId = null">
       <aside class="approval-detail">
         <header><div><span>✓</span><div><h2>审批详情</h2><p>{{ selectedApproval.id }}</p></div></div><button @click="selectedApprovalId = null">×</button></header>
-        <dl><div><dt>申请人</dt><dd>{{ selectedApproval.applicant }}</dd></div><div><dt>申请类型</dt><dd>{{ selectedApproval.type }}</dd></div><div><dt>关联项目</dt><dd>{{ selectedApproval.subject }}</dd></div><div><dt>当前状态</dt><dd><i class="approval-status" :class="{ pending: selectedApproval.status === '待审批', approved: selectedApproval.status === '已审批', ai: selectedApproval.status === 'AI 自动审批', rejected: selectedApproval.status === '已驳回' }">{{ selectedApproval.status }}</i></dd></div></dl>
-        <section :class="{ rejection: selectedApproval.status === '已驳回' }"><span>{{ selectedApproval.status === '已驳回' ? '驳回理由' : selectedApproval.status === '待审批' ? 'AI 审批建议' : '审批通过方案' }}</span><p>{{ selectedApproval.result }}</p></section>
-        <footer v-if="selectedApproval.status === '待审批'"><button @click="showToast('已生成驳回意见草稿，未提交'); selectedApprovalId = null">驳回（演示）</button><button @click="showToast('已生成审批通过方案，未提交'); selectedApprovalId = null">通过（演示）</button></footer><footer v-else><button @click="selectedApprovalId = null">关闭</button></footer>
+        <dl><div><dt>申请人</dt><dd>{{ selectedApproval.applicant }}</dd></div><div><dt>申请类型</dt><dd><i class="approval-type" :class="selectedApproval.type === '调课申请' ? 'type-reschedule' : selectedApproval.type === '换组申请' ? 'type-change' : 'type-makeup'">{{ selectedApproval.type }}</i></dd></div><div><dt>原项目</dt><dd>{{ formatAdjustSession(selectedApproval.source_info?.session) || selectedApproval.source_info?.project_name || selectedApproval.subject }}</dd></div><div><dt>新项目</dt><dd>{{ formatAdjustSession(selectedApproval.target_info) || selectedApproval.subject }}</dd></div><div><dt>申请原因</dt><dd>{{ selectedApproval.reason_text || '—' }}</dd></div><div><dt>当前状态</dt><dd><i class="approval-status" :class="{ pending: selectedApproval.status === '待审批', approved: selectedApproval.status === '已通过', rejected: selectedApproval.status === '已驳回', cancelled: selectedApproval.status === '已取消' }">{{ selectedApproval.status }}</i></dd></div></dl>
+        <section v-if="selectedApproval.status === '已驳回'" class="rejection"><span>驳回理由</span><p>{{ selectedApproval.result }}</p></section>
+        <footer v-if="selectedApproval.status === '待审批'"><button @click="openReject(selectedApproval.rawId)">驳回</button><button @click="approveApplication(selectedApproval.rawId)">通过</button></footer><footer v-else><button @click="selectedApprovalId = null">关闭</button></footer>
       </aside>
     </div>
 
@@ -1484,14 +1566,25 @@ const selectedCandidate = computed(() => {
       </div>
     </Teleport>
 
+    <!-- 驳回理由弹窗 -->
+    <div v-if="rejectDialogOpen" class="system-dialog-backdrop" @click.self="rejectDialogOpen = false">
+      <form class="approval-detail" style="width:400px" @submit.prevent="confirmReject">
+        <header><div><span>✕</span><div><h2>驳回申请</h2></div></div><button type="button" @click="rejectDialogOpen = false">×</button></header>
+        <label style="display:block;margin-bottom:1rem">驳回理由<textarea v-model="rejectReason" rows="4" style="width:100%" placeholder="请填写驳回的具体理由"></textarea></label>
+        <footer><button type="button" @click="rejectDialogOpen = false">取消</button><button type="submit">确认驳回</button></footer>
+      </form>
+    </div>
+
     <!-- 学期设置弹窗 -->
     <Teleport to="body">
       <div v-if="termEditorOpen" class="system-dialog-backdrop" @click.self="termEditorOpen = false">
         <form class="approval-detail" style="width:440px" @submit.prevent="saveTermSettings">
-          <header><div><span>⚙</span><div><h2>学期设置</h2><p v-if="termInfo">{{ termInfo.academic_year }} 学年 第{{ termInfo.semester_no === 1 ? '一' : termInfo.semester_no === 2 ? '二' : '三' }}学期</p></div></div><button type="button" @click="termEditorOpen = false">×</button></header>
+          <header><div><span>⚙</span><div><h2>学期设置</h2></div></div><button type="button" @click="termEditorOpen = false">×</button></header>
           <div v-if="termInfo" style="display:flex;gap:8px;margin-bottom:1rem;padding:10px 14px;border-radius:8px;background:#e8f4f3;color:#287d82;font-size:.9rem">
             <strong>当前第 {{ termInfo.current_week }} 周</strong>
           </div>
+          <label style="display:block;margin-bottom:.75rem">学年<input v-model="termEdit.academic_year" type="text" placeholder="如 2025-2026" style="width:100%" /></label>
+          <label style="display:block;margin-bottom:.75rem">学期<select v-model.number="termEdit.semester_no" style="width:100%"><option :value="1">第一学期</option><option :value="2">第二学期</option></select></label>
           <label style="display:block;margin-bottom:.75rem">开学日期<input v-model="termEdit.start_date" type="date" style="width:100%" /></label>
           <label style="display:block;margin-bottom:.75rem">结束日期<input v-model="termEdit.end_date" type="date" style="width:100%" /></label>
           <label style="display:block;margin-bottom:.75rem">总教学周数<input v-model.number="termEdit.total_weeks" type="number" min="1" max="30" style="width:100%" /></label>

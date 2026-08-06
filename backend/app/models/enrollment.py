@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import (
@@ -7,11 +8,13 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import AuditMixin, BaseModel
 
@@ -120,3 +123,30 @@ class StudentProjectRecord(AuditMixin, BaseModel):
         String(20), nullable=False, default="NOT_REQUIRED"
     )
     version_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    # relationships
+    session: Mapped[Optional["ExperimentSession"]] = relationship(
+        "ExperimentSession", foreign_keys=[session_id], viewonly=True
+    )
+
+
+class StudentCourseCompletion(AuditMixin, BaseModel):
+    """学生课程完成情况——每门课一条记录。"""
+    __tablename__ = "student_course_completion"
+    __table_args__ = (
+        UniqueConstraint("student_id", "course_id", name="student_course"),
+        CheckConstraint(
+            "status IN ('PASSED', 'FAILED', 'IN_PROGRESS')",
+            name="completion_status_allowed",
+        ),
+    )
+
+    student_id: Mapped[UUID] = mapped_column(
+        ForeignKey("student.id", ondelete="CASCADE"), nullable=False
+    )
+    course_id: Mapped[UUID] = mapped_column(
+        ForeignKey("experiment_course.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="IN_PROGRESS"
+    )

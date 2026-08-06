@@ -18,7 +18,20 @@ from app.models.scheduling import ProjectDemand, TeachingTask, TeachingTaskCohor
 
 
 async def get_or_create_active_term(session: AsyncSession) -> AcademicTerm:
-    """获取或创建 2026-2027 第一学期。"""
+    """获取活跃学期。优先返回有教学任务数据的学期，否则创建当前学期。"""
+    # 1. 查找有教学任务的学期（含演示数据）
+    task_term_stmt = (
+        select(AcademicTerm)
+        .join(TeachingTask, TeachingTask.term_id == AcademicTerm.id)
+        .order_by(AcademicTerm.start_date.desc())
+        .limit(1)
+    )
+    result = await session.execute(task_term_stmt)
+    term = result.scalar_one_or_none()
+    if term is not None:
+        return term
+
+    # 2. 查找当前学期
     stmt = select(AcademicTerm).where(
         AcademicTerm.academic_year == "2026-2027",
         AcademicTerm.semester_no == 1,
@@ -28,6 +41,7 @@ async def get_or_create_active_term(session: AsyncSession) -> AcademicTerm:
     if term is not None:
         return term
 
+    # 3. 创建新学期
     term = AcademicTerm(
         id=uuid4(),
         code="2026-2027-1",

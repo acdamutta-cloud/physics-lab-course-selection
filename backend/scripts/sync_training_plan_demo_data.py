@@ -67,31 +67,55 @@ YEAR_PREREQUISITES = {
 }
 PROJECT_ORDER_RULES = {
     "DEMO-PHY101": [
-        ("DEMO-PHY101-P01", "DEMO-PHY101-P02", "完成基础测量训练后再进入单摆测量。"),
+        (
+            "DEMO-PHY101-P01",
+            "DEMO-PHY101-P02",
+            "完成“长度与密度测量”后再进入“单摆测重力加速度”。",
+        ),
     ],
     "DEMO-PHY201": [
-        ("DEMO-PHY201-P01", "DEMO-PHY201-P02", "完成霍尔效应测量后再进入 RLC 暂态过程。"),
+        (
+            "DEMO-PHY201-P01",
+            "DEMO-PHY201-P02",
+            "完成“霍尔效应与磁场测量”后再进入“RLC暂态过程”。",
+        ),
     ],
     "DEMO-PHY301": [
-        ("DEMO-PHY301-P01", "DEMO-PHY301-P02", "完成光电效应后再进入弗兰克-赫兹实验。"),
+        (
+            "DEMO-PHY301-P01",
+            "DEMO-PHY301-P02",
+            "完成“光电效应与普朗克常量”后再进入“弗兰克—赫兹实验”。",
+        ),
     ],
 }
 MAJOR_PROJECT_ORDER_RULES = {
     "DEMO-AP": {
         "DEMO-PHY301": [
-            ("DEMO-PHY301-P02", "DEMO-PHY301-P03", "完成能级实验后再进入密立根油滴实验。"),
+            (
+                "DEMO-PHY301-P02",
+                "DEMO-PHY301-P03",
+                "完成“弗兰克—赫兹实验”后再进入“密立根油滴实验”。",
+            ),
         ],
     },
     "DEMO-OPTO": {
         "DEMO-PHY101": [
-            ("DEMO-PHY101-P09", "DEMO-PHY101-P10", "完成薄透镜焦距测量后再进入干涉与衍射。"),
+            (
+                "DEMO-PHY101-P09",
+                "DEMO-PHY101-P10",
+                "完成“薄透镜焦距测量”后再进入“光的干涉与衍射”。",
+            ),
         ],
     },
 }
 for _major_code in ("DEMO-EEA", "DEMO-EIE", "DEMO-AU", "DEMO-EPE"):
     MAJOR_PROJECT_ORDER_RULES[_major_code] = {
         "DEMO-PHY201": [
-            ("DEMO-PHY201-P02", "DEMO-PHY201-P03", "完成暂态过程分析后再进入交流电桥。"),
+            (
+                "DEMO-PHY201-P02",
+                "DEMO-PHY201-P03",
+                "完成“RLC暂态过程”后再进入“交流电桥”。",
+            ),
         ],
     }
 THEORY_COURSE_SPECS = [
