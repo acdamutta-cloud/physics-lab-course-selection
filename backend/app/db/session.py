@@ -8,13 +8,15 @@ from sqlalchemy.ext.asyncio import (
 
 from app.core.config.settings import get_settings
 
-
 settings = get_settings()
 
 async_engine = create_async_engine(
     settings.sqlalchemy_database_url,
     echo=settings.database_echo,
     connect_args=settings.sqlalchemy_connect_args,
+    pool_size=settings.database_pool_size,
+    max_overflow=settings.database_max_overflow,
+    pool_timeout=settings.database_pool_timeout_seconds,
     pool_pre_ping=True,
     pool_recycle=1800,
 )

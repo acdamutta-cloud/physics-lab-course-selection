@@ -129,13 +129,18 @@ def calculate_effective_capacity(
     capability_capacity: int,
     requirements: list[EquipmentRequirementInput],
     usable_inventory: dict[UUID, int],
+    students_per_unit: dict[UUID, int] | None = None,
 ) -> CapacityCalculation:
     """计算一间实验室对一个项目的有效容量。
 
     所有必需器材都从同一个 ``usable_inventory`` 读取，因此不会把不同
     实验室的部分库存拼接在一起。
+
+    ``students_per_unit`` 来自已确认的设备使用规则（如"2人一台"）。
+    未提供时沿用项目的“每组所需器材数”口径。
     """
 
+    spu = students_per_unit or {}
     required_items = [item for item in requirements if item.required]
     invalid = tuple(
         item.equipment_type_id
@@ -171,9 +176,14 @@ def calculate_effective_capacity(
     equipment_capacities = {
         item.equipment_type_id: (
             usable_inventory.get(item.equipment_type_id, 0)
-            // item.units_per_group
+            * spu[item.equipment_type_id]
+            if item.equipment_type_id in spu
+            else (
+                usable_inventory.get(item.equipment_type_id, 0)
+                // item.units_per_group
+            )
+            * group_size
         )
-        * group_size
         for item in required_items
     }
     equipment_capacity = min(equipment_capacities.values())
@@ -287,6 +297,7 @@ async def evaluate_project_lab_resources(
             )
         ).all()
     inventory_by_lab: dict[UUID, dict[UUID, int]] = {}
+    spu_by_lab: dict[UUID, dict[UUID, int]] = {}
     for inventory, equipment in inventory_rows:
         usable = (
             inventory.usable_quantity
@@ -296,6 +307,13 @@ async def evaluate_project_lab_resources(
         inventory_by_lab.setdefault(
             inventory.laboratory_id, {}
         )[inventory.equipment_type_id] = usable
+        if (
+            inventory.sharing_rule_status == "CONFIRMED"
+            and inventory.students_per_unit
+        ):
+            spu_by_lab.setdefault(
+                inventory.laboratory_id, {}
+            )[inventory.equipment_type_id] = inventory.students_per_unit
 
     capabilities_by_project: dict[
         UUID, list[tuple[LabProjectCapability, Laboratory]]
@@ -343,90 +361,33 @@ async def evaluate_project_lab_resources(
             )
             continue
         for capability, laboratory in capabilities:
-            target_capacity = min(
-                laboratory.safety_capacity,
-                capability.effective_capacity,
-            )
-            target_capacity -= (
-                target_capacity % project.default_group_size
-            )
-            blocking, reserve_shortages = assess_inventory_thresholds(
-                target_capacity=target_capacity,
-                group_size=project.default_group_size,
-                requirements=requirements,
-                usable_inventory=inventory_by_lab.get(laboratory.id, {}),
-            )
-            if blocking:
-                missing_names = tuple(
-                    item.equipment_name for item in blocking
-                )
-                issues.append(
-                    ProjectLabIssue(
-                        project_id=project_id,
-                        project_name=project.project_name,
-                        laboratory_id=laboratory.id,
-                        laboratory_code=laboratory.lab_code,
-                        message=(
-                            "器材数量不足以满足项目核定容量："
-                            + "、".join(missing_names)
-                        ),
-                        missing_equipment_names=missing_names,
-                    )
-                )
-                continue
             calculation = calculate_effective_capacity(
                 group_size=project.default_group_size,
                 safety_capacity=laboratory.safety_capacity,
                 capability_capacity=capability.effective_capacity,
                 requirements=requirements,
                 usable_inventory=inventory_by_lab.get(laboratory.id, {}),
+                students_per_unit=spu_by_lab.get(laboratory.id, {}),
             )
-            if calculation.feasible:
-                options[project_id].append(
-                    ProjectLabOption(
+            if not calculation.feasible:
+                issues.append(
+                    ProjectLabIssue(
                         project_id=project_id,
+                        project_name=project.project_name,
                         laboratory_id=laboratory.id,
                         laboratory_code=laboratory.lab_code,
-                        effective_capacity=target_capacity,
-                        limiting_equipment_ids=(
-                            calculation.limiting_equipment_ids
-                        ),
+                        message="器材不足或安全/组大小不满足要求。",
+                        missing_equipment_names=calculation.missing_equipment_names,
                     )
                 )
-                if reserve_shortages:
-                    warnings.append(
-                        ProjectLabWarning(
-                            project_id=project_id,
-                            project_name=project.project_name,
-                            laboratory_id=laboratory.id,
-                            laboratory_code=laboratory.lab_code,
-                            code="RESERVE_SHORTAGE",
-                            message=(
-                                "器材够正常开课，但不足 2 个备用实验组"
-                            ),
-                            shortages=reserve_shortages,
-                        )
-                    )
                 continue
-            if calculation.invalid_requirement_ids:
-                message = "器材需求的每组数量必须大于零"
-            elif calculation.missing_equipment_names:
-                message = (
-                    "同一实验室缺少或可用数量不足的必需器材："
-                    + "、".join(calculation.missing_equipment_names)
-                )
-            else:
-                message = "安全容量或项目能力容量不足一组"
-            issues.append(
-                ProjectLabIssue(
+            options[project_id].append(
+                ProjectLabOption(
                     project_id=project_id,
-                    project_name=project.project_name,
                     laboratory_id=laboratory.id,
                     laboratory_code=laboratory.lab_code,
-                    message=message,
-                    missing_equipment_names=(
-                        calculation.missing_equipment_names
-                    ),
+                    effective_capacity=calculation.effective_capacity,
+                    limiting_equipment_ids=calculation.limiting_equipment_ids,
                 )
             )
 

@@ -37,6 +37,8 @@ class ProjectDemandOut(BaseModel):
     required_session_count: int
     teachers: list[str] = []
     equipment: list[str] = []
+    teacher_ids: list[UUID] = []
+    equipment_ids: list[UUID] = []
 
 
 class TeachingTaskOut(BaseModel):

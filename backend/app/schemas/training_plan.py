@@ -39,7 +39,7 @@ class ProjectInfo(BaseModel):
 
 
 class CreateProjectRequest(BaseModel):
-    project_code: str = Field(min_length=1, max_length=32)
+    project_code: str | None = Field(default=None, min_length=1, max_length=32)
     project_name: str = Field(min_length=1, max_length=150)
     category: ProjectCategory
     required_slots: int = Field(ge=1, le=24)

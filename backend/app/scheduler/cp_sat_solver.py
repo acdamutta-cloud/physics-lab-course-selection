@@ -213,6 +213,7 @@ def solve_candidate(
     variation_seed: int,
     course_early_week_preferences: Mapping[UUID, int] | None = None,
     project_early_week_preferences: Mapping[UUID, int] | None = None,
+    min_session_counts: Mapping[UUID, int] | None = None,
 ) -> SolverResult:
     """构造一个候选版本，并对每一次放置即时执行硬冲突检查。"""
 
@@ -230,6 +231,7 @@ def solve_candidate(
     project_early_week_preferences = (
         project_early_week_preferences or {}
     )
+    min_session_counts = min_session_counts or {}
 
     ordered_demands = sorted(
         demands,
@@ -279,13 +281,13 @@ def solve_candidate(
                 coverage = min(row[1] for row in availability_rows)
                 availability_penalty = 1.0 - free_ratio
 
-                for teacher in demand.teachers:
+                def _evaluate(teacher):
                     if any(
                         (teacher.teacher_id, week, day, slot)
                         in occupied_teachers
                         for slot in slot_range
                     ):
-                        continue
+                        return None
                     teacher_count = teacher_load.get(teacher.teacher_id, 0)
                     day_key = (teacher.teacher_id, week, day)
                     same_day = teacher_day_load.get(day_key, 0)
@@ -296,6 +298,7 @@ def solve_candidate(
                         if existing_starts
                         else 1.0
                     )
+                    best_for_teacher = None
                     for laboratory in demand.laboratories:
                         if any(
                             (laboratory.laboratory_id, week, day, slot)
@@ -363,8 +366,44 @@ def solve_candidate(
                             availability_penalty,
                             coverage,
                         )
-                        if best is None or candidate[0] < best[0]:
-                            best = candidate
+                        if (
+                            best_for_teacher is None
+                            or candidate[0] < best_for_teacher[0]
+                        ):
+                            best_for_teacher = candidate
+                    return best_for_teacher
+
+                # 两阶段教师选择：未达每学期最少场次下限的教师优先，
+                # 其在本块可行时不再考虑其他教师；全部不可行时回退，
+                # 保证下限不会导致排课失败。
+                protected_ids = {
+                    teacher.teacher_id
+                    for teacher in demand.teachers
+                    if teacher_load.get(teacher.teacher_id, 0)
+                    < min_session_counts.get(teacher.teacher_id, 0)
+                }
+                block_best = None
+                for teacher in demand.teachers:
+                    if teacher.teacher_id not in protected_ids:
+                        continue
+                    candidate = _evaluate(teacher)
+                    if candidate is not None and (
+                        block_best is None or candidate[0] < block_best[0]
+                    ):
+                        block_best = candidate
+                if block_best is None:
+                    for teacher in demand.teachers:
+                        if teacher.teacher_id in protected_ids:
+                            continue
+                        candidate = _evaluate(teacher)
+                        if candidate is not None and (
+                            block_best is None or candidate[0] < block_best[0]
+                        ):
+                            block_best = candidate
+                if block_best is not None and (
+                    best is None or block_best[0] < best[0]
+                ):
+                    best = block_best
             if best is None:
                 errors.append(
                     f"{demand.project_name} 第 {occurrence_index + 1} 个场次"

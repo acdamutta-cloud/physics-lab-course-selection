@@ -13,6 +13,7 @@ class SchedulingState(TypedDict, total=False):
     total_weeks: int
     rule_priorities: dict[str, int]
     max_candidate_count: int
+    model: Any
 
     parsed_preferences: list[dict[str, Any]]
     comparison_weights: dict[str, float]

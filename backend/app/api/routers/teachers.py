@@ -11,7 +11,7 @@ from app.crud.teaching_tasks import get_or_create_active_term
 from app.db.session import get_db_session
 from app.models.curriculum import ExperimentCourse, ExperimentProject
 from app.models.identity import StudentBusyBitmap, Teacher
-from app.models.resources import TeacherProjectQualification
+from app.models.resources import Laboratory, TeacherProjectQualification
 from app.models.scheduling import (
     ExperimentSession,
     ProjectDemand,
@@ -19,6 +19,7 @@ from app.models.scheduling import (
     TeacherTimetableEntry,
     TeachingTask,
 )
+from app.services.effective_session_service import effective_session_values
 
 router = APIRouter(prefix="/teachers", tags=["教师"])
 
@@ -150,8 +151,6 @@ async def get_my_timetable(
 
     session_ids = [e.experiment_session_id for e in entries]
     where_clause = [ExperimentSession.id.in_(session_ids)]
-    if week > 0:
-        where_clause.append(ExperimentSession.week_no == week)
 
     es_list = (await session.execute(
         select(ExperimentSession)
@@ -162,9 +161,13 @@ async def get_my_timetable(
         .where(*where_clause)
         .order_by(ExperimentSession.week_no, ExperimentSession.day_of_week, ExperimentSession.start_slot)
     )).scalars().all()
+    effective = await effective_session_values(session, es_list)
 
     result = []
     for s in es_list:
+        actual = effective[s.id]
+        if week > 0 and actual["week_no"] != week:
+            continue
         course = None
         if s.project:
             course = (await session.execute(
@@ -173,16 +176,16 @@ async def get_my_timetable(
 
         result.append({
             "id": str(s.id),
-            "day_of_week": s.day_of_week,
-            "start_slot": s.start_slot,
-            "end_slot": s.end_slot,
-            "week_no": s.week_no,
+            "day_of_week": actual["day_of_week"],
+            "start_slot": actual["start_slot"],
+            "end_slot": actual["end_slot"],
+            "week_no": actual["week_no"],
             "capacity": s.capacity,
             "selected_count": s.selected_count,
             "project_name": s.project.project_name if s.project else "",
             "course_name": course.course_name if course else "",
             "course_code": course.course_code if course else "",
-            "lab_name": s.laboratory.name if s.laboratory else "",
+            "lab_name": (await session.get(Laboratory, actual["laboratory_id"])).name if actual["laboratory_id"] else "",
         })
     return {"week": week, "sessions": result, "total": len(result)}
 
@@ -214,23 +217,32 @@ async def get_upcoming_sessions(
         return {"sessions": [], "current_week": cw}
 
     session_ids = [e.experiment_session_id for e in entries]
-    # 取当前周及之后的场次
     es_list = (await session.execute(
         select(ExperimentSession)
         .options(
             selectinload(ExperimentSession.project),
             selectinload(ExperimentSession.laboratory),
         )
-        .where(
-            ExperimentSession.id.in_(session_ids),
-            ExperimentSession.week_no >= max(1, cw),
-        )
+        .where(ExperimentSession.id.in_(session_ids))
         .order_by(ExperimentSession.week_no, ExperimentSession.day_of_week, ExperimentSession.start_slot)
-        .limit(5)
     )).scalars().all()
+    effective = await effective_session_values(session, es_list)
+    es_list = sorted(
+        (
+            item
+            for item in es_list
+            if effective[item.id]["week_no"] >= max(1, cw)
+        ),
+        key=lambda item: (
+            effective[item.id]["week_no"],
+            effective[item.id]["day_of_week"],
+            effective[item.id]["start_slot"],
+        ),
+    )[:5]
 
     result = []
     for s in es_list:
+        actual = effective[s.id]
         course = None
         if s.project:
             course = (await session.execute(
@@ -238,13 +250,13 @@ async def get_upcoming_sessions(
             )).scalar_one_or_none()
         result.append({
             "id": str(s.id),
-            "week_no": s.week_no,
-            "day_of_week": s.day_of_week,
-            "start_slot": s.start_slot,
-            "end_slot": s.end_slot,
+            "week_no": actual["week_no"],
+            "day_of_week": actual["day_of_week"],
+            "start_slot": actual["start_slot"],
+            "end_slot": actual["end_slot"],
             "project_name": s.project.project_name if s.project else "",
             "course_name": course.course_name if course else "",
-            "lab_name": s.laboratory.name if s.laboratory else "",
+            "lab_name": (await session.get(Laboratory, actual["laboratory_id"])).name if actual["laboratory_id"] else "",
             "selected_count": s.selected_count,
             "capacity": s.capacity,
         })
@@ -314,8 +326,8 @@ async def export_schedule(
                     select(ExperimentCourse).where(ExperimentCourse.id == s.project.course_id)
                 )).scalar_one_or_none()
             text = f"{s.project.project_name if s.project else ''}\n{getattr(course, 'course_name', '')}\n{s.laboratory.name if s.laboratory else ''}"
-            # DB day_of_week: 1=Mon..7=Sun → Excel col: 2=Sun(B)..8=Sat(H)
-            col = 2 if s.day_of_week == 7 else s.day_of_week + 2
+            # DB day_of_week: 1=Sun..7=Sat → Excel col: 2=Sun(B)..8=Sat(H)
+            col = s.day_of_week + 1
             start_row = s.start_slot + 1
             end_row = s.end_slot + 1
             cell = ws.cell(row=start_row, column=col, value=text)
@@ -555,3 +567,19 @@ async def get_project_students(
         })
 
     return {"project_id": str(project_id), "students": result}
+
+
+@router.get("/me/notifications")
+async def get_teacher_notifs(current_user=Depends(get_current_user)):
+    if current_user.user_type != "TEACHER": raise HTTPException(403)
+    from json import loads; from app.db.redis_client import get_redis_client
+    items = await get_redis_client().lrange(f"teacher:{current_user.id}:notifications", 0, -1)
+    return [loads(i) for i in items]
+
+
+@router.post("/me/notifications/read")
+async def read_teacher_notif(body: dict, current_user=Depends(get_current_user)):
+    if current_user.user_type != "TEACHER": raise HTTPException(403)
+    from app.services.notification_service import remove_notification_by_value
+    await remove_notification_by_value(f"teacher:{current_user.id}:notifications", body.get("value", ""))
+    return {"ok": True}

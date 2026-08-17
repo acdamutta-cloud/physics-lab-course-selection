@@ -1,0 +1,69 @@
+{
+  "student_default": {
+    "student": {
+      "display_name": "测试学生",
+      "enrollment_year": 2024,
+      "major_name": "物理学",
+      "campus_name": "主校区"
+    },
+    "term": {
+      "academic_year": "2025-2026",
+      "semester_no": 2
+    },
+    "current_selections": [
+      {
+        "status": "SELECTED",
+        "course_name": "工程物理实验",
+        "project_name": "RLC暂态过程",
+        "requirement_type": "REQUIRED",
+        "week_no": 6,
+        "day_name": "周一",
+        "start_slot": 1,
+        "end_slot": 4,
+        "teacher_name": "李强",
+        "laboratory_name": "电学综合实验室 B102"
+      },
+      {
+        "status": "SELECTED",
+        "course_name": "工程物理实验",
+        "project_name": "交流电桥",
+        "requirement_type": "REQUIRED",
+        "week_no": 4,
+        "day_name": "周一",
+        "start_slot": 5,
+        "end_slot": 8,
+        "teacher_name": "李强",
+        "laboratory_name": "电学综合实验室 B102"
+      },
+      {
+        "status": "SELECTED",
+        "course_name": "工程物理实验",
+        "project_name": "超声波声速测量",
+        "requirement_type": "REQUIRED",
+        "week_no": 7,
+        "day_name": "周三",
+        "start_slot": 1,
+        "end_slot": 4,
+        "teacher_name": "王芳",
+        "laboratory_name": "综合实验室 D102"
+      }
+    ],
+    "training_plan_summary": {
+      "plan_code": "EVAL-PHYSICS-2024",
+      "courses": [
+        {
+          "course_name": "工程物理实验",
+          "completion_status": "IN_PROGRESS",
+          "eligibility": {"decision": "ALLOW", "violations": []},
+          "projects": [
+            {"project_name": "RLC暂态过程", "student_status": "SELECTED"},
+            {"project_name": "交流电桥", "student_status": "SELECTED"},
+            {"project_name": "超声波声速测量", "student_status": "SELECTED"}
+          ]
+        }
+      ]
+    },
+    "page": {"view": "ai", "course_id": null, "project_id": null, "session_id": null}
+  }
+}
+

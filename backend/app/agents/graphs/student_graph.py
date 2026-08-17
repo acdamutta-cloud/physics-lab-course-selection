@@ -15,6 +15,7 @@ from app.agents.nodes.student_advisor import (
     emit_error,
     execute_student_tools,
     finalize_response,
+    load_base_context,
     normalize_request,
     plan_with_llm,
     resolve_entities,
@@ -36,6 +37,7 @@ BUSINESS_TYPE = "STUDENT_CONSULTATION"
 def build_student_graph():
     builder = StateGraph(StudentConsultationState)
     builder.add_node("normalize_request", normalize_request)
+    builder.add_node("load_base_context", load_base_context)
     builder.add_node("plan_with_llm", plan_with_llm)
     builder.add_node("validate_plan", validate_plan)
     builder.add_node("emit_error", emit_error)
@@ -53,7 +55,8 @@ def build_student_graph():
     builder.add_node("finalize_response", finalize_response)
 
     builder.add_edge(START, "normalize_request")
-    builder.add_edge("normalize_request", "plan_with_llm")
+    builder.add_edge("normalize_request", "load_base_context")
+    builder.add_edge("load_base_context", "plan_with_llm")
     builder.add_edge("plan_with_llm", "validate_plan")
     builder.add_conditional_edges(
         "validate_plan",
@@ -72,6 +75,7 @@ def build_student_graph():
         route_after_entities,
         {
             "compose_clarification": "compose_clarification",
+            "build_grounding_bundle": "build_grounding_bundle",
             "execute_student_tools": "execute_student_tools",
         },
     )

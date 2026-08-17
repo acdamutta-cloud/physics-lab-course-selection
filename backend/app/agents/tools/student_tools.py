@@ -5,7 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.data.student_selection_rules import rules_for_topics
-from app.models.curriculum import AcademicTerm
+from app.models.curriculum import AcademicTerm, ExperimentCourse
+from app.models.enrollment import StudentProjectRecord
 from app.models.identity import Teacher
 from app.models.rules import RuleConfig, RuleSet
 from app.models.scheduling import ExperimentSession, ScheduleVersion
@@ -15,8 +16,12 @@ from app.schemas.student_consultation import (
     SelectionPreferences,
     StudentAgentPlan,
     StudentRuleTopic,
+    weekday_name,
     weekday_number,
 )
+from app.services.effective_session_service import effective_session_values
+from app.services.operation_guide_service import search_operation_guides
+from app.services.student_adjustment_service import get_adjustment_context
 from app.services.student_consultation_service import (
     check_selection_eligibility,
     get_remaining_projects,
@@ -150,6 +155,158 @@ async def remaining_projects_tool(
     return await get_remaining_projects(session, student_id=student_id, term=term)
 
 
+async def prepare_adjustment_entry_tool(
+    session: AsyncSession,
+    *,
+    student_id: UUID,
+    term: AcademicTerm,
+    plan: StudentAgentPlan,
+    question: str,
+) -> dict[str, object]:
+    request_type = plan.requested_application_type
+    if request_type not in {"RESCHEDULE", "PROJECT_CHANGE", "MAKEUP"}:
+        return {
+            "status": "NOT_FOUND",
+            "title": "无法确定申请类型",
+            "message": "请说明你想调课、换组还是申请补做。",
+            "sources": [],
+        }
+    context = await get_adjustment_context(
+        session,
+        student_id=student_id,
+        term=term,
+        request_type=None,
+    )
+    reference = plan.entity_reference or EntityReference()
+    has_source_locator = any(
+        (
+            reference.project_name,
+            reference.course_name,
+            reference.week_no is not None,
+            reference.day_name,
+            reference.start_slot is not None,
+            reference.end_slot is not None,
+            reference.teacher_name,
+        )
+    )
+    matched_all: list[dict[str, object]] = []
+    for source in context.get("sources", []):
+        if not isinstance(source, dict) or not isinstance(source.get("session"), dict):
+            continue
+        item = source["session"]
+        if reference.project_name and not _canonical_name_matches(
+            str(item.get("project_name", "")), reference.project_name
+        ):
+            continue
+        if reference.course_name and not _canonical_name_matches(
+            str(item.get("course_name", "")), reference.course_name
+        ):
+            continue
+        if reference.week_no is not None and item.get("week_no") != reference.week_no:
+            continue
+        if reference.day_name is not None and item.get("day_name") != reference.day_name:
+            continue
+        if reference.start_slot is not None and item.get("start_slot") != reference.start_slot:
+            continue
+        if reference.end_slot is not None and item.get("end_slot") != reference.end_slot:
+            continue
+        if reference.teacher_name and not _canonical_name_matches(
+            str(item.get("teacher_name", "")), reference.teacher_name
+        ):
+            continue
+        matched_all.append(source)
+    matched = [
+        source
+        for source in matched_all
+        if request_type in source.get("available_for", [])
+    ]
+    status = "UNIQUE" if len(matched) == 1 else "MULTIPLE" if matched else "NOT_FOUND"
+    labels = {
+        "RESCHEDULE": "调课",
+        "PROJECT_CHANGE": "换组",
+        "MAKEUP": "补做",
+    }
+    if status == "UNIQUE":
+        message = "已根据你的描述匹配到以下原实验，请核对后开始操作。"
+    elif status == "MULTIPLE":
+        message = "匹配到多个可申请的原实验，请选择你要调整的一个。"
+    elif matched_all and has_source_locator:
+        status = "INELIGIBLE"
+        source = matched_all[0]
+        source_session = source.get("session", {})
+        project_name = str(source_session.get("project_name") or "该实验")
+        week_no = source_session.get("week_no")
+        day_name = str(source_session.get("day_name") or "")
+        start_slot = source_session.get("start_slot")
+        end_slot = source_session.get("end_slot")
+        time_text = (
+            f"第{week_no}周{day_name} 第{start_slot}—{end_slot}节"
+            if week_no is not None and start_slot is not None and end_slot is not None
+            else "当前场次"
+        )
+        started = bool(source_session.get("started"))
+        record_status = str(source.get("status") or "")
+        requirement_type = str(source_session.get("requirement_type") or "")
+        if request_type == "RESCHEDULE" and started:
+            reason = "该场次已经开始，当前不能申请调课"
+        elif request_type == "RESCHEDULE":
+            reason = "该记录当前不是可调课的已选状态"
+        elif request_type == "PROJECT_CHANGE" and requirement_type != "OPTIONAL":
+            reason = "该实验是必做项目，不能申请换组；换组只适用于选做项目"
+        elif request_type == "PROJECT_CHANGE" and started:
+            reason = "该选做项目的场次已经开始，当前不能申请换组"
+        elif request_type == "PROJECT_CHANGE":
+            reason = "该记录当前不是可换组的已选状态"
+        elif request_type == "MAKEUP" and not started:
+            reason = "原场次尚未开始，当前不能申请补做"
+        elif request_type == "MAKEUP" and record_status == "COMPLETED":
+            reason = "该实验已经完成，当前不能申请补做"
+        else:
+            reason = f"该记录当前不符合{labels[request_type]}申请条件"
+        message = f"已找到“{project_name}”（{time_text}），但{reason}。"
+    elif matched_all and request_type == "PROJECT_CHANGE":
+        status = "INELIGIBLE"
+        required_count = sum(
+            1
+            for source in matched_all
+            if str(source.get("session", {}).get("requirement_type") or "")
+            != "OPTIONAL"
+        )
+        started_optional_count = sum(
+            1
+            for source in matched_all
+            if str(source.get("session", {}).get("requirement_type") or "")
+            == "OPTIONAL"
+            and bool(source.get("session", {}).get("started"))
+        )
+        details: list[str] = []
+        if required_count:
+            details.append(f"{required_count}个是必做项目")
+        if started_optional_count:
+            details.append(f"{started_optional_count}个选做项目的场次已经开始")
+        detail_text = "，".join(details)
+        message = "当前已选记录中没有可以申请换组的项目。换组只适用于尚未开始的选做项目。"
+        if detail_text:
+            message += f"当前记录中{detail_text}。"
+    else:
+        message = "没有在当前可申请的已选实验中找到同时符合这些条件的记录，请核对项目、周次、时间或教师。"
+    return {
+        "status": status,
+        "title": (
+            f"当前不能{labels[request_type]}"
+            if status == "INELIGIBLE"
+            else f"确认{labels[request_type]}原实验"
+        ),
+        "message": message,
+        "request_type": request_type,
+        "sources": matched,
+        "matched_sources": matched_all,
+        "preferences": plan.preferences.model_dump(mode="json"),
+        "original_question": question,
+        "requires_confirmation": bool(matched),
+    }
+
+
 async def recommendation_tool(
     session: AsyncSession,
     *,
@@ -171,6 +328,137 @@ async def recommendation_tool(
     return {"plans": [item.model_dump(mode="json") for item in plans]}
 
 
+async def preview_deselection_tool(
+    session: AsyncSession,
+    *,
+    student_id: UUID,
+    term: AcademicTerm,
+    plan: StudentAgentPlan,
+    resolved: dict[str, object],
+) -> dict[str, object]:
+    records = list(
+        (
+            await session.execute(
+                select(StudentProjectRecord)
+                .options(
+                    selectinload(StudentProjectRecord.session).selectinload(
+                        ExperimentSession.project
+                    )
+                )
+                .where(
+                    StudentProjectRecord.student_id == student_id,
+                    StudentProjectRecord.term_id == term.id,
+                    StudentProjectRecord.status == "SELECTED",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not records:
+        return {"sessions": [], "message": "你本学期当前没有可以取消的已选实验场次。"}
+
+    course_ids = {str(item) for item in resolved.get("course_ids", [])}
+    project_ids = {str(item) for item in resolved.get("project_ids", [])}
+    reference = plan.entity_reference or EntityReference()
+    has_target_locator = bool(
+        course_ids
+        or project_ids
+        or reference.week_no is not None
+        or reference.day_name is not None
+        or reference.start_slot is not None
+        or reference.end_slot is not None
+        or reference.teacher_name
+    )
+    if plan.deselection_scope != "ALL" and not has_target_locator:
+        return {
+            "sessions": [],
+            "status": "NEED_TARGET",
+            "message": "请说明要取消的课程、实验项目或场次；只有明确说“取消全部选课”时，系统才会展示全部退选清单。",
+        }
+    session_models = [record.session for record in records if record.session is not None]
+    effective = await effective_session_values(session, session_models)
+    course_map = {
+        str(course.id): course
+        for course in (
+            await session.execute(
+                select(ExperimentCourse).where(
+                    ExperimentCourse.id.in_({record.course_id for record in records})
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+    matched: list[dict[str, object]] = []
+    for record in records:
+        item = record.session
+        if item is None or item.project is None:
+            continue
+        actual = effective[item.id]
+        if plan.deselection_scope != "ALL":
+            if course_ids and str(record.course_id) not in course_ids:
+                continue
+            if project_ids and str(record.project_id) not in project_ids:
+                continue
+            if reference.week_no is not None and actual["week_no"] != reference.week_no:
+                continue
+            if (
+                reference.day_name is not None
+                and actual["day_of_week"] != weekday_number(reference.day_name)
+            ):
+                continue
+            if (
+                reference.start_slot is not None
+                and actual["start_slot"] != reference.start_slot
+            ):
+                continue
+            if reference.end_slot is not None and actual["end_slot"] != reference.end_slot:
+                continue
+            if reference.teacher_name:
+                teacher = await session.get(Teacher, actual["teacher_id"])
+                if teacher is None or not _canonical_name_matches(
+                    teacher.name, reference.teacher_name
+                ):
+                    continue
+        course = course_map.get(str(record.course_id))
+        teacher = await session.get(Teacher, actual["teacher_id"])
+        matched.append(
+            {
+                "session_id": str(item.id),
+                "course_id": str(record.course_id),
+                "course_name": course.course_name if course else "",
+                "course_code": course.course_code if course else "",
+                "project_id": str(record.project_id),
+                "project_name": item.project.project_name,
+                "week_no": actual["week_no"],
+                "day_of_week": actual["day_of_week"],
+                "day_name": weekday_name(actual["day_of_week"]),
+                "start_slot": actual["start_slot"],
+                "end_slot": actual["end_slot"],
+                "teacher_name": teacher.name if teacher else "",
+            }
+        )
+    matched.sort(
+        key=lambda item: (
+            str(item["course_name"]),
+            int(item["week_no"]),
+            int(item["day_of_week"]),
+            int(item["start_slot"]),
+        )
+    )
+    if not matched:
+        return {
+            "sessions": [],
+            "message": "没有在你本学期当前已选场次中找到同时符合这些条件的记录，请调整课程、项目、周次、时间或教师描述。",
+        }
+    return {
+        "sessions": matched,
+        "scope": plan.deselection_scope,
+        "requires_confirmation": True,
+    }
+
+
 async def lookup_student_rules_tool(
     session: AsyncSession,
     *,
@@ -178,7 +466,7 @@ async def lookup_student_rules_tool(
     term: AcademicTerm,
     topics: list[StudentRuleTopic],
 ) -> dict[str, object]:
-    """Return only published rules and current-plan facts for controlled topics."""
+    """Return only published public rules for controlled topics."""
 
     definitions = rules_for_topics(topics)
     rule_codes = [item["rule_code"] for item in definitions]
@@ -211,46 +499,15 @@ async def lookup_student_rules_tool(
         }
         for row in published_rows
     ]
-    training_plan_facts: list[dict[str, object]] = []
-    unknowns: list[str] = []
-    if "TRAINING_PLAN" in topics:
-        context = await get_training_plan_context(
-            session, student_id=student_id, term=term
-        )
-        if unknown := context.get("unknown"):
-            unknowns.append(str(unknown))
-        else:
-            training_plan_facts = [
-                {
-                    "course_name": course.get("course_name"),
-                    "study_year": course.get("study_year"),
-                    "semester_no": course.get("semester_no"),
-                    "required_project_count": course.get("required_project_count"),
-                    "optional_project_min_count": course.get(
-                        "optional_project_min_count"
-                    ),
-                    "prerequisites": course.get("prerequisites", []),
-                    "order_rules": course.get("order_rules", []),
-                }
-                for course in context.get("courses", [])
-                if isinstance(course, dict)
-            ]
-
-    status = "FOUND" if matched_rules or training_plan_facts else "NOT_FOUND"
+    status = "FOUND" if matched_rules else "NOT_FOUND"
     return {
         "status": status,
         "matched_rules": matched_rules,
-        "training_plan_facts": training_plan_facts,
         "source_references": [
             {"source_type": "SELECTION_RULE", "rule_code": item["rule_code"]}
             for item in matched_rules
-        ]
-        + (
-            [{"source_type": "TRAINING_PLAN", "term_id": str(term.id)}]
-            if training_plan_facts
-            else []
-        ),
-        "unknowns": unknowns,
+        ],
+        "unknowns": [],
     }
 
 
@@ -268,6 +525,58 @@ async def resolve_plan_entities(
     context = await get_training_plan_context(session, student_id=student_id, term=term)
     courses = context.get("courses", []) if isinstance(context, dict) else []
     resolved: dict[str, object] = {}
+
+    if plan.intent == "DESELECT_SELECTION" and plan.deselection_scope == "TARGETED":
+        course_names = [*reference.course_names]
+        if reference.course_name:
+            course_names.append(reference.course_name)
+        resolved_course_ids: list[str] = []
+        for name in dict.fromkeys(course_names):
+            matches = [
+                item
+                for item in courses
+                if isinstance(item, dict)
+                and _canonical_name_matches(str(item.get("course_name", "")), name)
+            ]
+            if len(matches) != 1:
+                return resolved, f"无法唯一确定课程“{name}”，请换一种说法描述课程名称。"
+            resolved_course_ids.append(str(matches[0]["course_id"]))
+        resolved["course_ids"] = resolved_course_ids
+
+        project_names = [*reference.project_names]
+        if reference.project_name:
+            project_names.append(reference.project_name)
+        resolved_project_ids: list[str] = []
+        for name in dict.fromkeys(project_names):
+            matches: list[dict[str, object]] = []
+            for course in courses:
+                if not isinstance(course, dict):
+                    continue
+                if resolved_course_ids and str(course.get("course_id")) not in set(
+                    resolved_course_ids
+                ):
+                    continue
+                for project in course.get("projects", []):
+                    if isinstance(project, dict) and _canonical_name_matches(
+                        str(project.get("project_name", "")), name
+                    ):
+                        matches.append(project)
+            if len(matches) != 1:
+                return resolved, f"无法唯一确定实验项目“{name}”，请换一种说法描述项目名称。"
+            resolved_project_ids.append(str(matches[0]["project_id"]))
+        resolved["project_ids"] = resolved_project_ids
+
+        has_locator = bool(
+            resolved_course_ids
+            or resolved_project_ids
+            or reference.week_no is not None
+            or reference.day_name is not None
+            or reference.start_slot is not None
+            or reference.end_slot is not None
+            or reference.teacher_name
+        )
+        if not has_locator:
+            return resolved, "请说明要取消的课程、实验项目或场次条件，也可以直接说“取消全部选课”。"
 
     if plan.intent == "RECOMMEND_SELECTION":
         scope = plan.recommendation_scope
@@ -353,6 +662,10 @@ async def resolve_plan_entities(
                     "project_name": project_matches[0]["project_name"],
                     "course_id": project_matches[0]["course_id"],
                     "course_name": project_matches[0]["course_name"],
+                    "student_status": project_matches[0].get(
+                        "student_status", "NOT_SELECTED"
+                    ),
+                    "requirement_type": project_matches[0].get("requirement_type"),
                 }
             )
         elif len(project_matches) > 1:
@@ -444,6 +757,54 @@ def _filter_course_context(
     }
 
 
+async def _deselect_single(
+    session: AsyncSession, *, student_id: UUID, term_id: UUID, session_id: UUID
+) -> dict[str, object]:
+    from app.db.redis_client import get_redis_client
+    from app.services.selection_service import deselect_session
+
+    redis = get_redis_client()
+    result = await deselect_session(
+        redis, session, student_id=student_id, term_id=term_id, session_id=session_id
+    )
+    return {"session_id": str(session_id), "result": result.result, "message": result.message}
+
+
+async def _deselect_all(
+    session: AsyncSession, *, student_id: UUID, term_id: UUID
+) -> dict[str, object]:
+    from sqlalchemy import select as _select
+
+    from app.db.redis_client import get_redis_client
+    from app.models.enrollment import StudentProjectRecord
+    from app.services.selection_service import deselect_session
+
+    redis = get_redis_client()
+    records = (
+        await session.execute(
+            _select(StudentProjectRecord).where(
+                StudentProjectRecord.student_id == student_id,
+                StudentProjectRecord.term_id == term_id,
+                StudentProjectRecord.status == "SELECTED",
+            )
+        )
+    ).scalars().all()
+    results = []
+    for record in records:
+        result = await deselect_session(
+            redis, session, student_id=student_id, term_id=term_id,
+            session_id=record.session_id,
+        )
+        results.append(
+            {
+                "session_id": str(record.session_id),
+                "result": result.result,
+                "message": result.message,
+            }
+        )
+    return {"total": len(records), "deselected": sum(1 for r in results if r["result"] == "ok"), "details": results}
+
+
 async def execute_planned_tools(
     session: AsyncSession,
     *,
@@ -451,6 +812,7 @@ async def execute_planned_tools(
     term: AcademicTerm,
     plan: StudentAgentPlan,
     resolved: dict[str, object],
+    question: str = "",
 ) -> list[dict[str, object]]:
     """Execute the validated student read-only tool plan."""
 
@@ -462,6 +824,16 @@ async def execute_planned_tools(
                 student_id=student_id,
                 term=term,
                 topics=plan.rule_topics,
+            )
+        elif request.name == "lookup_operation_guide":
+            data = await search_operation_guides(session, query=question)
+        elif request.name == "prepare_adjustment_entry":
+            data = await prepare_adjustment_entry_tool(
+                session,
+                student_id=student_id,
+                term=term,
+                plan=plan,
+                question=question,
             )
         elif request.name == "get_training_plan_context":
             data = await training_plan_tool(session, student_id=student_id, term=term)
@@ -523,6 +895,29 @@ async def execute_planned_tools(
                 preferences=plan.preferences,
                 scope=plan.recommendation_scope,
                 resolved=resolved,
+            )
+        elif request.name == "preview_deselection":
+            data = await preview_deselection_tool(
+                session,
+                student_id=student_id,
+                term=term,
+                plan=plan,
+                resolved=resolved,
+            )
+        elif request.name == "deselect_course":
+            session_ids = [UUID(str(sid)) for sid in resolved.get("session_ids", [])]
+            details = []
+            for sid in session_ids:
+                details.append(
+                    await _deselect_single(
+                        session, student_id=student_id, term_id=term.id,
+                        session_id=sid,
+                    )
+                )
+            data = {"details": details}
+        elif request.name == "deselect_all_courses":
+            data = await _deselect_all(
+                session, student_id=student_id, term_id=term.id
             )
         else:  # pragma: no cover - validate_plan rejects this first
             continue

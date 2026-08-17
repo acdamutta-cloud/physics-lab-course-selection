@@ -1,5 +1,3 @@
-# ruff: noqa: B008
-
 import json
 from uuid import UUID, uuid4
 
@@ -8,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
-from app.agents.graphs.adjustment_graph import stream_student_adjustment
+from app.agents.registry import stream_registered_graph
 from app.api.dependencies import get_current_user
 from app.crud.teaching_tasks import get_or_create_active_term
 from app.db.session import get_db_session
@@ -134,8 +132,10 @@ async def stream_adjustment_recommendations(
 
     async def events():
         try:
-            async for event in stream_student_adjustment(
-                {
+            async for event in stream_registered_graph(
+                business_type="STUDENT_ADJUSTMENT",
+                actor_type=user.user_type,
+                payload={
                     "session": session,
                     "student_id": student.id,
                     "term": term,
@@ -144,7 +144,7 @@ async def stream_adjustment_recommendations(
                     "source_record_id": body.source_record_id,
                     "message": body.message,
                     "max_options": body.max_options,
-                }
+                },
             ):
                 if await request.is_disconnected():
                     break
@@ -199,32 +199,40 @@ async def list_my_adjustments(
 ):
     student = await _student(session, user)
     items = await list_adjustment_applications(session, student_id=student.id)
+    # 过滤掉资源异常导致的系统自动迁移记录（非学生发起）
+    items = [i for i in items if not (i.payload or {}).get("resource_issue_id")]
     # 为已驳回项附加驳回理由
     from app.models.application import ApprovalRecord
-    from app.models.identity import UserAccount, Teacher as TeacherModel
+    from app.models.identity import Teacher as TeacherModel
+
     # 收集所有已处理申请的审批记录
     processed_ids = [i.id for i in items if i.status in ("REJECTED", "EXECUTED")]
     comment_map = {}
     reviewer_map: dict = {}
     if processed_ids:
-        rows = (await session.execute(
-            select(
-                ApprovalRecord.application_id,
-                ApprovalRecord.decision,
-                ApprovalRecord.comment,
-                ApprovalRecord.approver_user_id,
-                ApprovalRecord.approval_type,
+        rows = (
+            await session.execute(
+                select(
+                    ApprovalRecord.application_id,
+                    ApprovalRecord.decision,
+                    ApprovalRecord.comment,
+                    ApprovalRecord.approver_user_id,
+                    ApprovalRecord.approval_type,
+                )
+                .where(ApprovalRecord.application_id.in_(processed_ids))
+                .order_by(ApprovalRecord.decided_at.desc())
             )
-            .where(ApprovalRecord.application_id.in_(processed_ids))
-            .order_by(ApprovalRecord.decided_at.desc())
-        )).all()
+        ).all()
         user_ids = [r[3] for r in rows if r[3]]
         teacher_names = {}
         if user_ids:
-            trows = (await session.execute(
-                select(TeacherModel.user_id, TeacherModel.name)
-                .where(TeacherModel.user_id.in_(user_ids))
-            )).all()
+            trows = (
+                await session.execute(
+                    select(TeacherModel.user_id, TeacherModel.name).where(
+                        TeacherModel.user_id.in_(user_ids)
+                    )
+                )
+            ).all()
             teacher_names = {r[0]: r[1] for r in trows}
         # 按 app_id 收集所有审核人
         app_reviewers: dict = {}
@@ -328,35 +336,58 @@ async def list_teacher_pending(
         raise HTTPException(status_code=403, detail="仅教师可查")
     from app.models.identity import Teacher
     from app.models.scheduling import ExperimentSession
-    teacher = (await session.execute(
-        select(Teacher).where(Teacher.employee_no == user.login_name.upper())
-    )).scalar_one_or_none()
+
+    teacher = (
+        await session.execute(
+            select(Teacher).where(Teacher.employee_no == user.login_name.upper())
+        )
+    ).scalar_one_or_none()
     if teacher is None:
         raise HTTPException(status_code=404, detail="教师信息不存在")
     # 找该教师授课的场次 IDs
-    session_ids = (await session.execute(
-        select(ExperimentSession.id).where(ExperimentSession.teacher_id == teacher.id)
-    )).scalars().all()
+    session_ids = (
+        (
+            await session.execute(
+                select(ExperimentSession.id).where(
+                    ExperimentSession.teacher_id == teacher.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     if not session_ids:
         return []
-    items = (await session.execute(
-        select(ApplicationRequest)
-        .where(
-            ApplicationRequest.approval_route.in_(["TEACHER", "TEACHER_THEN_ADMIN"]),
-            ApplicationRequest.original_session_id.in_(session_ids),
-            ApplicationRequest.status == "PENDING_REVIEW",
+    items = (
+        (
+            await session.execute(
+                select(ApplicationRequest)
+                .where(
+                    ApplicationRequest.approval_route.in_(
+                        ["TEACHER", "TEACHER_THEN_ADMIN"]
+                    ),
+                    ApplicationRequest.original_session_id.in_(session_ids),
+                    ApplicationRequest.status == "PENDING_REVIEW",
+                )
+                .order_by(ApplicationRequest.created_at.desc())
+            )
         )
-        .order_by(ApplicationRequest.created_at.desc())
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
 
     from app.models.identity import Student as StudentModel
+
     student_ids = [i.student_id for i in items if i.student_id]
     student_map = {}
     if student_ids:
-        rows = (await session.execute(
-            select(StudentModel.id, StudentModel.name, StudentModel.student_no)
-            .where(StudentModel.id.in_(student_ids))
-        )).all()
+        rows = (
+            await session.execute(
+                select(
+                    StudentModel.id, StudentModel.name, StudentModel.student_no
+                ).where(StudentModel.id.in_(student_ids))
+            )
+        ).all()
         student_map = {r[0]: (r[1], r[2]) for r in rows}
 
     result = []
@@ -391,7 +422,7 @@ async def teacher_review_adjustment(
 
 @router.get("/admin/adjustments")
 async def list_all_adjustments(
-    status: str | None = Query(None),
+    status: str | None = None,
     session: AsyncSession = Depends(get_db_session),
     user: UserProfile = Depends(get_current_user),
 ):
@@ -399,29 +430,37 @@ async def list_all_adjustments(
     if user.user_type != "ADMIN":
         raise HTTPException(status_code=403, detail="仅管理员可查")
     from sqlalchemy import select as sa_select
+
     stmt = sa_select(ApplicationRequest).order_by(ApplicationRequest.created_at.desc())
-    if status:
+    if status is not None:
         stmt = stmt.where(ApplicationRequest.status == status)
     items = list((await session.execute(stmt)).scalars())
 
     # 批量加载学生和项目
-    from app.models.identity import Student as StudentModel
     from app.models.curriculum import ExperimentProject
+    from app.models.identity import Student as StudentModel
+
     student_ids = [i.student_id for i in items if i.student_id]
     project_ids = [i.project_id for i in items if i.project_id]
     student_map = {}
     project_map = {}
     if student_ids:
-        rows = (await session.execute(
-            sa_select(StudentModel.id, StudentModel.name, StudentModel.student_no)
-            .where(StudentModel.id.in_(student_ids))
-        )).all()
+        rows = (
+            await session.execute(
+                sa_select(
+                    StudentModel.id, StudentModel.name, StudentModel.student_no
+                ).where(StudentModel.id.in_(student_ids))
+            )
+        ).all()
         student_map = {r[0]: (r[1], r[2]) for r in rows}
     if project_ids:
-        rows = (await session.execute(
-            sa_select(ExperimentProject.id, ExperimentProject.project_name)
-            .where(ExperimentProject.id.in_(project_ids))
-        )).all()
+        rows = (
+            await session.execute(
+                sa_select(ExperimentProject.id, ExperimentProject.project_name).where(
+                    ExperimentProject.id.in_(project_ids)
+                )
+            )
+        ).all()
         project_map = {r[0]: r[1] for r in rows}
 
     result = []
@@ -432,24 +471,112 @@ async def list_all_adjustments(
             out["student_name"] = f"{student_map[sid][0]} · {student_map[sid][1]}"
         else:
             out["student_name"] = ""
+        # 教师申请：查教师姓名
+        from app.models.identity import Teacher as TeacherModel, UserAccount
+        if item.teacher_id:
+            t = await session.get(TeacherModel, item.teacher_id)
+            if t:
+                out["teacher_name"] = t.name
+        elif item.applicant_user_id and not out.get("student_name"):
+            u = await session.get(UserAccount, item.applicant_user_id)
+            if u:
+                out["teacher_name"] = u.login_name
         pid = item.project_id
         out["project_name"] = project_map.get(pid, "") if pid else ""
         out["reason_text"] = item.reason
         payload = item.payload or {}
         out["source_info"] = payload.get("source", {}) or {}
         out["target_info"] = payload.get("target", {}) or {}
+        # 教师调课: 从原始场次和 payload 补 source/target 信息
+        if item.request_type in ("TEACHER_ADJUSTMENT", "LAB_CHANGE", "TEACHER_SUBSTITUTION") and item.original_session_id:
+            from app.models.scheduling import ExperimentSession as ES
+            from app.models.teaching_adjustment import SessionExecutionOverride as SEO
+            orig_sess = await session.get(ES, item.original_session_id)
+            if orig_sess:
+                from app.models.curriculum import ExperimentProject as EP
+                proj = await session.get(EP, orig_sess.project_id) if orig_sess.project_id else None
+                # 已执行的调整从 SessionExecutionOverride.before_snapshot 取原始时间
+                before: dict[str, object] = {}
+                if item.status == "EXECUTED":
+                    ov = await session.scalar(
+                        select(SEO).where(
+                            SEO.application_id == item.id,
+                            SEO.status == "ACTIVE",
+                        )
+                    )
+                    if ov is not None:
+                        before = ov.before_snapshot
+                out["source_info"] = {
+                    "week_no": before.get("week_no") if "week_no" in before else orig_sess.week_no,
+                    "day_of_week": before.get("day_of_week") if "day_of_week" in before else orig_sess.day_of_week,
+                    "start_slot": before.get("start_slot") if "start_slot" in before else orig_sess.start_slot,
+                    "end_slot": before.get("end_slot") if "end_slot" in before else orig_sess.end_slot,
+                    "project_name": proj.project_name if proj else "",
+                }
+            if item.request_type == "TEACHER_ADJUSTMENT":
+                tgt = payload.get("target_time", {})
+                out["target_info"] = {
+                    "week_no": tgt.get("week_no"), "day_of_week": tgt.get("day_of_week"),
+                    "start_slot": tgt.get("start_slot"), "end_slot": tgt.get("end_slot"),
+                    "project_name": out.get("project_name", ""),
+                }
+            elif item.request_type == "TEACHER_SUBSTITUTION":
+                sub_tid = payload.get("substitute_teacher_id")
+                if sub_tid:
+                    from app.models.identity import Teacher as TModel
+                    st = await session.get(TModel, sub_tid)
+                    out["target_info"] = {"teacher_name": st.name if st else ""}
         # 最新审批记录的驳回意见
-        if item.status in ("REJECTED",) and 'reviewed_at' not in out:
+        if item.status in ("REJECTED",) and "reviewed_at" not in out:
             from app.models.application import ApprovalRecord
-            last_record = (await session.execute(
-                select(ApprovalRecord.comment).where(
-                    ApprovalRecord.application_id == item.id,
-                ).order_by(ApprovalRecord.decided_at.desc()).limit(1)
-            )).scalar_one_or_none()
+
+            last_record = (
+                await session.execute(
+                    select(ApprovalRecord.comment)
+                    .where(
+                        ApprovalRecord.application_id == item.id,
+                    )
+                    .order_by(ApprovalRecord.decided_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
             out["review_comment"] = last_record or ""
         else:
             out["review_comment"] = ""
         result.append(out)
+
+    # 为已执行的教师调整附加安置方案
+    from app.models.teaching_adjustment import AdjustmentRemediationPlan as ARP2, AdjustmentRemediationItem as ARI2
+    from app.models.identity import Student as Stu2
+    from app.models.scheduling import ExperimentSession as ES3
+    executed = []
+    for r in result:
+        rid = r["id"]
+        if isinstance(rid, str):
+            rid = UUID(rid)
+        if r.get("status") == "EXECUTED" and r.get("request_type") in ("TEACHER_ADJUSTMENT", "LAB_CHANGE"):
+            executed.append(rid)
+    if executed:
+        eplans = (await session.execute(select(ARP2).where(ARP2.application_id.in_(executed), ARP2.status == "EXECUTED"))).scalars().all()
+        eitems: dict[UUID, list[dict]] = {}
+        if eplans:
+            eitem_rows = (await session.execute(
+                select(ARI2, Stu2, ES3)
+                .join(Stu2, Stu2.id == ARI2.student_id)
+                .join(ES3, ES3.id == ARI2.target_session_id)
+                .where(ARI2.plan_id.in_([p.id for p in eplans]))
+            )).all()
+            for ri, stu, sess in eitem_rows:
+                eitems.setdefault(ri.plan_id, []).append({
+                    "student_name": stu.name, "student_no": stu.student_no,
+                    "week_no": sess.week_no, "day_of_week": sess.day_of_week,
+                    "start_slot": sess.start_slot, "end_slot": sess.end_slot,
+                })
+        plan_by_app = {p.application_id: {"id": str(p.id), "plan_no": p.plan_no, "summary": p.summary, "items": eitems.get(p.id, [])} for p in eplans}
+        for r in result:
+            rid2 = r["id"] if isinstance(r["id"], UUID) else UUID(r["id"])
+            if rid2 in plan_by_app:
+                r["executed_plan"] = plan_by_app[rid2]
     return result
 
 
@@ -478,7 +605,9 @@ async def get_notifications(user: UserProfile = Depends(get_current_user)):
     if user.user_type != "ADMIN":
         raise HTTPException(status_code=403, detail="仅管理员可查")
     from json import loads
+
     from app.db.redis_client import get_redis_client
+
     items = await get_redis_client().lrange("admin:notifications", 0, -1)
     return [loads(i) for i in items]
 
@@ -488,6 +617,7 @@ async def read_notification(body: dict, user: UserProfile = Depends(get_current_
     """标记单条通知已读（按值删除）。"""
     if user.user_type != "ADMIN":
         raise HTTPException(status_code=403, detail="仅管理员可查")
-    from app.db.redis_client import get_redis_client
-    await get_redis_client().lrem("admin:notifications", 1, body.get("value", ""))
+    from app.services.notification_service import remove_notification_by_value
+
+    await remove_notification_by_value("admin:notifications", body.get("value", ""))
     return {"ok": True}

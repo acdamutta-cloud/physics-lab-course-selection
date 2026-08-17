@@ -6,11 +6,12 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.graphs.scheduling_graph import resolve_runtime_strategy
 from app.agents.nodes.validation_agent import (
+    evaluate_candidate_preference_effects,
     review_candidate_soft_constraints,
 )
 from app.models.curriculum import AcademicTerm, ExperimentCourse, ExperimentProject
@@ -462,6 +463,19 @@ async def generate_initial_schedule(
             if item.get("rule_code") == "TEACHER_TARGET_LOAD_SCORE"
             for teacher_id in item.get("target_teacher_ids", [])
         }
+        # 每位教师每学期最少上课场次下限（默认 20），防止减负偏好把教师减到没课。
+        active_teachers = list(
+            (
+                await session.execute(
+                    select(Teacher).where(Teacher.status == "ACTIVE")
+                )
+            ).scalars()
+        )
+        min_session_counts = {
+            teacher.id: teacher.min_session_count
+            for teacher in active_teachers
+            if teacher.min_session_count > 0
+        }
         course_early_week_preferences = {
             UUID(preference["course_id"]): int(
                 preference["preferred_end_week"]
@@ -497,6 +511,7 @@ async def generate_initial_schedule(
         versions: list[ScheduleVersion] = []
         solved_profiles: list[tuple[dict[str, Any], Any, float]] = []
 
+        shortfall_warnings: set[str] = set()
         for profile_index, profile in enumerate(strategy["profiles"]):
             result = solve_candidate(
                 demands=demands,
@@ -512,6 +527,7 @@ async def generate_initial_schedule(
                 project_early_week_preferences=(
                     project_early_week_preferences
                 ),
+                min_session_counts=min_session_counts,
             )
             if not result.hard_constraint_passed:
                 raise ScheduleServiceError(
@@ -519,11 +535,25 @@ async def generate_initial_schedule(
                     + "；".join(result.errors[:3]),
                     code="HARD_CONSTRAINT_INFEASIBLE",
                 )
+            teacher_session_counts: dict[UUID, int] = {}
+            for item in result.sessions:
+                teacher_session_counts[item.teacher_id] = (
+                    teacher_session_counts.get(item.teacher_id, 0) + 1
+                )
+            for teacher in active_teachers:
+                floor = teacher.min_session_count
+                if floor > 0 and teacher_session_counts.get(teacher.id, 0) < floor:
+                    shortfall_warnings.add(
+                        f"教师{teacher.name}本学期已排 "
+                        f"{teacher_session_counts.get(teacher.id, 0)} 场，"
+                        f"低于最少场次下限 {floor} 场"
+                    )
             common_score = _common_score(
                 result.metrics,
                 comparison_weights,
             )
             solved_profiles.append((profile, result, common_score))
+        warnings.extend(sorted(shortfall_warnings))
 
         peer_metrics = [
             result.metrics for _, result, _ in solved_profiles
@@ -535,6 +565,11 @@ async def generate_initial_schedule(
                 result.metrics,
                 comparison_weights,
                 peer_metrics,
+            )
+            preference_effects = evaluate_candidate_preference_effects(
+                strategy.get("parsed_preferences", []),
+                result.metrics,
+                comparison_weights,
             )
             version = ScheduleVersion(
                 term_id=term.id,
@@ -551,6 +586,7 @@ async def generate_initial_schedule(
                         "agent": "validation_agent",
                         "hard_constraint_passed": True,
                         "soft_constraint_review": soft_review,
+                        "preference_effects": preference_effects,
                     },
                 },
                 optimization_params={
@@ -755,7 +791,21 @@ async def publish_selected_schedule(
             version.id,
         )
 
+        # 新课表发布后，将该学期所有学生的选课记录标记为 WITHDRAWN
+        from app.models.enrollment import StudentProjectRecord
+
+        withdrawn_result = await session.execute(
+            update(StudentProjectRecord)
+            .where(
+                StudentProjectRecord.term_id == job.term_id,
+                StudentProjectRecord.status.in_(["SELECTED", "MAKEUP_PENDING"]),
+            )
+            .values(status="WITHDRAWN", updated_by=actor_id)
+        )
+        withdrawn_count = withdrawn_result.rowcount
+
         snapshot = dict(job.input_snapshot)
+        snapshot["withdrawn_student_records"] = withdrawn_count
         snapshot["published_candidate_version_id"] = str(version.id)
         snapshot["published_at"] = now.isoformat()
         snapshot["published_by"] = str(actor_id)
@@ -875,6 +925,23 @@ async def get_schedule_job(
                     metrics,
                     comparison_weights,
                     peer_metrics,
+                )
+            )
+        if "preference_effects" not in validation:
+            metrics = details.get("normalized_penalties") or {}
+            comparison_weights = (
+                version.optimization_params.get("comparison_weights")
+                or snapshot.get("comparison_weights", {})
+            )
+            parsed_preferences = (
+                version.optimization_params.get("preference_adjustments")
+                or snapshot.get("parsed_preferences", [])
+            )
+            validation["preference_effects"] = (
+                evaluate_candidate_preference_effects(
+                    parsed_preferences,
+                    metrics,
+                    comparison_weights,
                 )
             )
         details["validation"] = validation

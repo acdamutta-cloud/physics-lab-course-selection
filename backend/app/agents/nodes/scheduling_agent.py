@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Any
 
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from app.agents.model_provider import get_chat_model, provider_failure_message
 from app.agents.states.scheduling import SchedulingState
 from app.scheduler.objective import (
     build_comparison_weights,
     build_profile_weights,
 )
+from app.schemas.schedule import SchedulingPreferencePlan
+
+PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts" / "scheduling"
+SCHEDULING_PLANNER_PROMPT = PROMPT_DIR / "v1.md"
 
 RULE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "STUDENT_AVAILABILITY_COVERAGE": (
@@ -25,6 +34,8 @@ RULE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "课时紧凑",
         "排得紧凑",
         "尽量紧凑",
+        "更紧凑",
+        "紧凑",
         "减少分散",
         "不要分散",
     ),
@@ -207,14 +218,96 @@ def parse_preferences(
     return parsed
 
 
-def scheduling_agent_node(state: SchedulingState) -> dict[str, Any]:
-    parsed = parse_preferences(
-        state.get("preference_text", ""),
-        teacher_directory=state.get("teacher_directory", {}),
-        course_directory=state.get("course_directory", {}),
-        project_directory=state.get("project_directory", {}),
-    )
+def _extract_plan_json(content: object) -> SchedulingPreferencePlan:
+    """Parse an LLM JSON response without provider-specific response_format."""
+
+    if isinstance(content, list):
+        text = "".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    else:
+        text = str(content or "")
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("planner response does not contain a JSON object")
+    return SchedulingPreferencePlan.model_validate(json.loads(text[start : end + 1]))
+
+
+async def _parse_preferences_with_llm(
+    state: SchedulingState,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Preference parsing via the LLM; None result means the caller should
+    fall back to deterministic keyword parsing."""
+
+    model = state.get("model") or get_chat_model()
+    if model is None:
+        return None, "偏好解析模型尚未配置，已使用确定性关键词解析。"
+    payload = {
+        "preference_text": state.get("preference_text", ""),
+        "teacher_directory": state.get("teacher_directory", {}),
+        "course_directory": state.get("course_directory", {}),
+        "project_directory": state.get("project_directory", {}),
+        "total_weeks": state.get("total_weeks", 0),
+        "schema": SchedulingPreferencePlan.model_json_schema(),
+    }
+    messages = [
+        SystemMessage(content=SCHEDULING_PLANNER_PROMPT.read_text(encoding="utf-8")),
+        HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+    ]
+    try:
+        response = await model.ainvoke(messages)
+        plan = _extract_plan_json(response.content)
+    except Exception as first_error:  # noqa: BLE001 - provider/schema failures vary
+        provider_message = provider_failure_message(first_error)
+        if provider_message:
+            return None, f"{provider_message}已回退到确定性关键词解析。"
+        try:
+            repair_messages = [
+                *messages,
+                HumanMessage(
+                    content="上一次输出无法解析。请只输出一个符合给定Schema的JSON对象，"
+                    f"不要解释。校验错误：{type(first_error).__name__}"
+                ),
+            ]
+            response = await model.ainvoke(repair_messages)
+            plan = _extract_plan_json(response.content)
+        except Exception as repair_error:  # noqa: BLE001 - provider/schema failures vary
+            provider_message = provider_failure_message(repair_error)
+            if provider_message:
+                return None, f"{provider_message}已回退到确定性关键词解析。"
+            return None, (
+                f"偏好解析输出无法解析（{type(repair_error).__name__}），"
+                "已回退到确定性关键词解析。"
+            )
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in plan.preferences:
+        deduped.setdefault(item.rule_code, item.model_dump(mode="json"))
+    return list(deduped.values()), None
+
+
+async def scheduling_agent_node(state: SchedulingState) -> dict[str, Any]:
+    parsed, fallback_warning = await _parse_preferences_with_llm(state)
+    if parsed is None:
+        parsed = parse_preferences(
+            state.get("preference_text", ""),
+            teacher_directory=state.get("teacher_directory", {}),
+            course_directory=state.get("course_directory", {}),
+            project_directory=state.get("project_directory", {}),
+        )
     warnings: list[str] = []
+    if fallback_warning:
+        warnings.append(fallback_warning)
     applicability = dict(state.get("applicability", {}))
 
     for item in parsed:

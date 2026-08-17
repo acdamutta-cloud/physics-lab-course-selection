@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -11,13 +12,16 @@ from langgraph.config import get_stream_writer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.model_provider import get_chat_model
+from app.agents.model_provider import get_chat_model, provider_failure_message
 from app.agents.states.student import StudentConsultationState
 from app.agents.tools.student_tools import (
+    _canonical_name_matches,
     execute_planned_tools,
     resolve_plan_entities,
     training_plan_tool,
 )
+from app.cache.student_views import ai_context_key, get_or_build
+from app.core.config.settings import get_settings
 from app.models.identity import Campus, Major, Student
 from app.models.scheduling import ExperimentSession, ScheduleVersion
 from app.schemas.student_consultation import (
@@ -26,22 +30,36 @@ from app.schemas.student_consultation import (
     StudentAgentPlan,
     weekday_name,
 )
+from app.services.student_adjustment_service import get_adjustment_context
 
 PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts" / "student_advisor"
 PLANNER_PROMPT = PROMPT_DIR / "planner_v2.md"
 COMPOSER_PROMPT = PROMPT_DIR / "composer_v2.md"
 GENERAL_CHAT_PROMPT = PROMPT_DIR / "general_chat_v1.md"
 
+logger = logging.getLogger(__name__)
+
 REQUIRED_TOOL_BY_INTENT = {
-    "BUSINESS_RULE_QUERY": {"lookup_student_rules"},
-    "CHECK_ELIGIBILITY": {"check_selection_eligibility"},
-    "EXPLAIN_CONFLICT": {"explain_selection_conflicts"},
-    "QUERY_TRAINING_PLAN": {
+    "BASIC_INFO_QUERY": {
+        "lookup_student_rules",
         "get_training_plan_context",
         "get_remaining_projects",
     },
+    "CHECK_ELIGIBILITY": {"check_selection_eligibility"},
+    "EXPLAIN_CONFLICT": {"explain_selection_conflicts"},
     "RECOMMEND_SELECTION": {"recommend_selection_plans"},
+    "DESELECT_SELECTION": {"preview_deselection"},
+    "SYSTEM_GUIDE": {"lookup_operation_guide"},
+    "START_ADJUSTMENT": {"prepare_adjustment_entry"},
 }
+
+
+async def _release_read_transaction(state: StudentConsultationState) -> None:
+    """Return a read-only DB connection before waiting on the model provider."""
+
+    session = state.get("session")
+    if isinstance(session, AsyncSession) and session.in_transaction():
+        await session.commit()
 
 
 def _emit(event: str, data: dict[str, object]) -> None:
@@ -97,6 +115,18 @@ async def normalize_request(
 async def load_base_context(
     state: StudentConsultationState,
 ) -> dict[str, object]:
+    if "base_context" in state:
+        return {}
+    settings = get_settings()
+    base_context = await get_or_build(
+        ai_context_key(state["student_id"], state["term"].id),
+        ttl=settings.student_ai_context_cache_ttl_seconds,
+        builder=lambda: _build_base_context(state),
+    )
+    return {"base_context": base_context}
+
+
+async def _build_base_context(state: StudentConsultationState) -> dict[str, object]:
     session: AsyncSession = state["session"]
     student = await session.get(Student, state["student_id"])
     if student is None:
@@ -107,6 +137,12 @@ async def load_base_context(
         session,
         student_id=state["student_id"],
         term=state["term"],
+    )
+    selection_context = await get_adjustment_context(
+        session,
+        student_id=state["student_id"],
+        term=state["term"],
+        request_type=None,
     )
     course_summaries: list[dict[str, object]] = []
     for course in plan.get("courses", []) if isinstance(plan, dict) else []:
@@ -161,6 +197,28 @@ async def load_base_context(
         )
         if valid_session is None:
             page["session_id"] = None
+    current_selections: list[dict[str, object]] = []
+    for source in selection_context.get("sources", []):
+        if not isinstance(source, dict):
+            continue
+        session_fact = source.get("session")
+        if not isinstance(session_fact, dict):
+            continue
+        current_selections.append(
+            {
+                "status": source.get("status", "SELECTED"),
+                "course_name": session_fact.get("course_name"),
+                "project_name": session_fact.get("project_name"),
+                "requirement_type": session_fact.get("requirement_type"),
+                "week_no": session_fact.get("week_no"),
+                "day_of_week": session_fact.get("day_of_week"),
+                "day_name": session_fact.get("day_name"),
+                "start_slot": session_fact.get("start_slot"),
+                "end_slot": session_fact.get("end_slot"),
+                "teacher_name": session_fact.get("teacher_name"),
+                "laboratory_name": session_fact.get("laboratory_name"),
+            }
+        )
     base_context = {
         "student": {
             "display_name": student.name,
@@ -176,9 +234,10 @@ async def load_base_context(
             "plan_code": plan.get("plan_code") if isinstance(plan, dict) else None,
             "courses": course_summaries,
         },
+        "current_selections": current_selections,
         "page": page,
     }
-    return {"base_context": base_context}
+    return base_context
 
 
 def _planner_input(state: StudentConsultationState) -> list[object]:
@@ -237,11 +296,18 @@ def _extract_plan_json(content: object) -> StudentAgentPlan:
     return StudentAgentPlan.model_validate(json.loads(text[start : end + 1]))
 
 
+def _provider_failure_message(error: Exception) -> str | None:
+    """See model_provider.provider_failure_message (kept for back-compat)."""
+
+    return provider_failure_message(error)
+
+
 async def plan_with_llm(
     state: StudentConsultationState,
 ) -> dict[str, object]:
     if state.get("model_error"):
         return {}
+    await _release_read_transaction(state)
     model = state.get("model") or get_chat_model()
     if model is None:
         return {"model_error": "智能咨询模型尚未配置。", "intent": "UNKNOWN"}
@@ -257,6 +323,18 @@ async def plan_with_llm(
             "repaired_plan_attempted": False,
         }
     except Exception as first_error:  # noqa: BLE001 - provider/schema failures vary
+        provider_message = _provider_failure_message(first_error)
+        if provider_message:
+            logger.warning(
+                "Student AI planner provider failure: %s",
+                provider_message,
+                exc_info=True,
+            )
+            return {
+                "model_error": provider_message,
+                "intent": "UNKNOWN",
+                "repaired_plan_attempted": False,
+            }
         try:
             repair_messages = [
                 *messages,
@@ -275,6 +353,18 @@ async def plan_with_llm(
                 "repaired_plan_attempted": True,
             }
         except Exception as repair_error:  # noqa: BLE001 - provider/schema failures vary
+            provider_message = _provider_failure_message(repair_error)
+            if provider_message:
+                logger.warning(
+                    "Student AI planner provider failure during repair: %s",
+                    provider_message,
+                    exc_info=True,
+                )
+                return {
+                    "model_error": provider_message,
+                    "intent": "UNKNOWN",
+                    "repaired_plan_attempted": True,
+                }
             return {
                 "model_error": f"规划输出无法解析：{type(repair_error).__name__}",
                 "intent": "UNKNOWN",
@@ -290,10 +380,27 @@ async def validate_plan(
     plan = state.get("plan")
     if plan is None:
         return {"model_error": "模型没有生成执行计划。"}
+    reference = plan.entity_reference
+    if (
+        plan.operation_stage == "PLAN_DRAFT"
+        and reference is not None
+        and reference.project_name is not None
+        and re.fullmatch(r"(?:AI)?(?:推荐)?方案(?:草稿|[一二三123])?", reference.project_name.strip(), re.IGNORECASE)
+    ):
+        # “方案1/推荐方案”是草稿标识，不是实验项目实体。
+        plan = plan.model_copy(
+            update={"entity_reference": reference.model_copy(update={"project_name": None})}
+        )
+    # 需要澄清时不会执行任何工具。弱模型有时会一边提问一边附带工具，
+    # 服务端在安全边界统一去除，避免旧对话中的实体被误用于个人业务查询。
+    plan_sanitized = bool(plan.needs_clarification and plan.tool_requests)
+    if plan_sanitized:
+        plan = plan.model_copy(update={"tool_requests": []})
     errors: list[str] = []
     names = {request.name for request in plan.tool_requests}
+    action_tools = {"preview_deselection", "prepare_adjustment_entry"}
     allowed_for_intent = REQUIRED_TOOL_BY_INTENT.get(plan.intent, set())
-    if plan.intent in REQUIRED_TOOL_BY_INTENT and not names.intersection(
+    if not plan.needs_clarification and plan.intent in REQUIRED_TOOL_BY_INTENT and not names.intersection(
         allowed_for_intent
     ):
         errors.append("当前意图缺少必须的只读工具调用。")
@@ -303,8 +410,33 @@ async def validate_plan(
         errors.append("普通交互和业务外问题不得调用业务工具。")
     if plan.intent == "GENERAL_CHAT" and not plan.direct_answer_allowed:
         errors.append("普通交互必须明确允许直接回答。")
-    if plan.intent == "BUSINESS_RULE_QUERY" and not plan.rule_topics:
+    if plan.request_mode in {"ASK_CAPABILITY", "ASK_STEPS"} and names.intersection(
+        action_tools
+    ):
+        errors.append("询问能力或步骤时不得执行退选预览或个人调整工具。")
+    if plan.operation_stage == "PLAN_DRAFT" and names.intersection(action_tools):
+        errors.append("推荐方案草稿不得调用已选课退选或调整工具。")
+    if plan.request_mode == "SAFETY_REFUSAL" and names:
+        errors.append("安全拒绝场景不得调用业务工具。")
+    if plan.intent == "QUERY_CURRENT_SELECTION" and names.difference(
+        {"get_training_plan_context"}
+    ):
+        errors.append("当前选课项目状态查询包含不相关的工具调用。")
+    if plan.intent == "BASIC_INFO_QUERY" and "lookup_student_rules" in names and not plan.rule_topics:
         errors.append("业务规则咨询必须提供受控规则主题。")
+    if plan.intent == "BASIC_INFO_QUERY" and names.difference(allowed_for_intent):
+        errors.append("基本信息查询包含不相关的工具调用。")
+    if (
+        plan.intent == "BASIC_INFO_QUERY"
+        and "lookup_student_rules" not in names
+        and plan.rule_topics
+    ):
+        errors.append("培养方案查询不应提供公共规则主题。")
+    if plan.requested_application_type is not None and plan.intent not in {
+        "SYSTEM_GUIDE",
+        "START_ADJUSTMENT",
+    }:
+        errors.append("打开申请界面的动作只能用于系统操作指南意图。")
     for request in plan.tool_requests:
         forbidden = {"student_id", "term_id", "sql", "url"}.intersection(
             request.arguments
@@ -315,6 +447,12 @@ async def validate_plan(
         return {
             "plan_validation_errors": errors,
             "model_error": "模型执行计划未通过安全校验。",
+        }
+    if plan_sanitized:
+        return {
+            "plan": plan,
+            "tool_requests": plan.tool_requests,
+            "plan_validation_errors": [],
         }
     return {"plan_validation_errors": []}
 
@@ -333,7 +471,11 @@ def route_after_plan(state: StudentConsultationState) -> str:
         return "compose_boundary_notice"
     if plan.intent == "UNKNOWN":
         return "compose_clarification"
-    if plan.intent == "BUSINESS_RULE_QUERY":
+    if plan.intent == "SYSTEM_GUIDE":
+        return "execute_student_tools"
+    if plan.intent == "BASIC_INFO_QUERY" and {
+        request.name for request in plan.tool_requests
+    } == {"lookup_student_rules"}:
         return "execute_student_tools"
     return "resolve_entities"
 
@@ -343,6 +485,160 @@ async def resolve_entities(
 ) -> dict[str, object]:
     plan = state["plan"]
     assert plan is not None
+    if plan.intent == "QUERY_CURRENT_SELECTION":
+        reference = plan.entity_reference
+        selection_scope = (
+            "FILTERED"
+            if reference
+            and any(
+                (
+                    reference.course_name,
+                    reference.project_name,
+                    reference.teacher_name,
+                    reference.week_no,
+                    reference.day_name,
+                    reference.start_slot,
+                    reference.end_slot,
+                )
+            )
+            else "ALL"
+        )
+        project_name = reference.project_name if reference else None
+        if project_name and not (reference and reference.conversation_reference):
+            compact_name = "".join(project_name.split())
+            compact_question = "".join(state.get("current_question", "").split())
+            if compact_name not in compact_question:
+                project_name = None
+        courses = (
+            state.get("base_context", {})
+            .get("training_plan_summary", {})
+            .get("courses", [])
+        )
+        selection_items: list[dict[str, object]] = []
+        current_selections = state.get("base_context", {}).get("current_selections")
+        if isinstance(current_selections, list):
+            for source in current_selections:
+                if not isinstance(source, dict):
+                    continue
+                if project_name and not _canonical_name_matches(
+                    str(source.get("project_name") or ""), project_name
+                ):
+                    continue
+                if reference and reference.course_name and not _canonical_name_matches(
+                    str(source.get("course_name") or ""), reference.course_name
+                ):
+                    continue
+                if reference and reference.teacher_name and not _canonical_name_matches(
+                    str(source.get("teacher_name") or ""), reference.teacher_name
+                ):
+                    continue
+                if reference and reference.week_no is not None and (
+                    source.get("week_no") != reference.week_no
+                ):
+                    continue
+                if reference and reference.day_name is not None and (
+                    source.get("day_name") != reference.day_name
+                ):
+                    continue
+                if reference and reference.start_slot is not None and (
+                    source.get("start_slot") != reference.start_slot
+                ):
+                    continue
+                if reference and reference.end_slot is not None and (
+                    source.get("end_slot") != reference.end_slot
+                ):
+                    continue
+                selection_items.append(
+                    {
+                        **source,
+                        "student_status": source.get("status", "SELECTED"),
+                    }
+                )
+            if selection_items or not project_name:
+                return {
+                    "resolved_entities": {
+                        "selection_items": selection_items,
+                        "selection_scope": selection_scope,
+                    },
+                    "clarification_question": None,
+                }
+        if not project_name:
+            matched_course = False
+            for course in courses if isinstance(courses, list) else []:
+                if not isinstance(course, dict):
+                    continue
+                if (
+                    reference
+                    and reference.course_name
+                    and not _canonical_name_matches(
+                        str(course.get("course_name") or ""),
+                        reference.course_name,
+                    )
+                ):
+                    continue
+                matched_course = True
+                for project in course.get("projects", []):
+                    if not isinstance(project, dict):
+                        continue
+                    if str(project.get("student_status") or "NOT_SELECTED") not in {
+                        "SELECTED",
+                        "COMPLETED",
+                        "ABSENT",
+                        "MAKEUP_PENDING",
+                    }:
+                        continue
+                    selection_items.append(
+                        {
+                            **project,
+                            "course_id": course.get("course_id"),
+                            "course_name": course.get("course_name"),
+                        }
+                    )
+            if reference and reference.course_name and not matched_course:
+                return {
+                    "resolved_entities": {},
+                    "clarification_question": "当前培养方案中未找到这门实验课程，请确认课程名称。",
+                }
+            return {
+                "resolved_entities": {
+                    "selection_items": selection_items,
+                    "selection_scope": selection_scope,
+                },
+                "clarification_question": None,
+            }
+        matches: list[dict[str, object]] = []
+        for course in courses if isinstance(courses, list) else []:
+            if not isinstance(course, dict):
+                continue
+            if reference.course_name and not _canonical_name_matches(
+                str(course.get("course_name") or ""), reference.course_name
+            ):
+                continue
+            for project in course.get("projects", []):
+                if isinstance(project, dict) and _canonical_name_matches(
+                    str(project.get("project_name") or ""), project_name
+                ):
+                    matches.append(
+                        {
+                            **project,
+                            "course_id": course.get("course_id"),
+                            "course_name": course.get("course_name"),
+                        }
+                    )
+        if len(matches) == 1:
+            return {
+                "resolved_entities": matches[0],
+                "clarification_question": None,
+            }
+        if len(matches) > 1:
+            return {
+                "resolved_entities": {},
+                "clarification_question": "找到多个名称相近的实验项目，请补充所属课程。",
+            }
+        return {
+            "resolved_entities": {},
+            "clarification_question": "当前培养方案中未找到这个实验项目，请确认项目名称。",
+        }
     page_context = state.get("page_context")
     resolved, clarification = await resolve_plan_entities(
         state["session"],
@@ -358,11 +654,68 @@ async def resolve_entities(
 
 
 def route_after_entities(state: StudentConsultationState) -> str:
-    return (
-        "compose_clarification"
-        if state.get("clarification_question")
-        else "execute_student_tools"
-    )
+    if state.get("clarification_question"):
+        return "compose_clarification"
+    if state.get("intent") == "QUERY_CURRENT_SELECTION":
+        return "build_grounding_bundle"
+    return "execute_student_tools"
+
+
+def _format_current_selection_answer(resolved: dict[str, object]) -> str:
+    selection_items = resolved.get("selection_items")
+    if isinstance(selection_items, list):
+        if not selection_items:
+            if resolved.get("selection_scope") == "FILTERED":
+                return "你本学期已选课表中没有找到符合这些条件的实验场次。"
+            return "你本学期当前还没有已选择或已完成的实验项目。"
+        status_labels = {
+            "SELECTED": "已选",
+            "COMPLETED": "已完成",
+            "ABSENT": "缺席",
+            "MAKEUP_PENDING": "补做处理中",
+        }
+        grouped: dict[str, list[str]] = {}
+        for item in selection_items:
+            if not isinstance(item, dict):
+                continue
+            course_name = str(item.get("course_name") or "未标明课程")
+            project_name = str(item.get("project_name") or "未命名项目")
+            status = str(item.get("student_status") or "SELECTED")
+            details: list[str] = []
+            if item.get("week_no") is not None and item.get("day_name"):
+                details.append(f"第{item['week_no']}周{item['day_name']}")
+            if item.get("start_slot") is not None and item.get("end_slot") is not None:
+                details.append(f"第{item['start_slot']}—{item['end_slot']}节")
+            if item.get("teacher_name"):
+                details.append(f"{item['teacher_name']}老师")
+            if item.get("laboratory_name"):
+                details.append(str(item["laboratory_name"]))
+            detail_text = f"，{'，'.join(details)}" if details else ""
+            grouped.setdefault(course_name, []).append(
+                f"{project_name}（{status_labels.get(status, status)}{detail_text}）"
+            )
+        if resolved.get("selection_scope") == "FILTERED":
+            lines = [f"在你本学期的已选课表中，找到 {len(selection_items)} 个匹配场次："]
+        else:
+            lines = [f"你本学期共选择过 {len(selection_items)} 个实验项目："]
+        lines.extend(
+            f"- {course_name}：{'、'.join(projects)}"
+            for course_name, projects in grouped.items()
+        )
+        return "\n".join(lines)
+    project_name = str(resolved.get("project_name") or "该实验项目")
+    course_name = str(resolved.get("course_name") or "")
+    course_text = f"（{course_name}）" if course_name else ""
+    status = str(resolved.get("student_status") or "NOT_SELECTED")
+    if status == "SELECTED":
+        return f"是的，你当前已经选择了“{project_name}”{course_text}。"
+    if status == "COMPLETED":
+        return f"是的，你已经完成了“{project_name}”{course_text}。"
+    if status == "ABSENT":
+        return f"你选择过“{project_name}”{course_text}，但当前记录状态为缺席，可以查看是否符合补做申请条件。"
+    if status == "MAKEUP_PENDING":
+        return f"你选择过“{project_name}”{course_text}，当前正在等待补做安排完成。"
+    return f"没有，你当前尚未选择“{project_name}”{course_text}。"
 
 
 async def execute_student_tools(
@@ -371,9 +724,11 @@ async def execute_student_tools(
     plan = state["plan"]
     assert plan is not None
     status_message = {
-        "BUSINESS_RULE_QUERY": "正在查询已发布的选课规则…",
-        "QUERY_TRAINING_PLAN": "正在查询你的培养方案…",
+        "BASIC_INFO_QUERY": "正在查询相关规则或培养方案信息…",
         "RECOMMEND_SELECTION": "正在筛选符合条件的实验场次…",
+        "DESELECT_SELECTION": "正在匹配你当前已选的实验场次…",
+        "SYSTEM_GUIDE": "正在查找学生端操作指南…",
+        "START_ADJUSTMENT": "正在匹配你当前已选的实验…",
         "CHECK_ELIGIBILITY": "正在核验场次资格和时间冲突…",
         "EXPLAIN_CONFLICT": "正在分析不能选择的具体原因…",
     }.get(plan.intent, "正在查询相关规则…")
@@ -384,12 +739,18 @@ async def execute_student_tools(
         term=state["term"],
         plan=plan,
         resolved=state.get("resolved_entities", {}),
+        question=state.get("current_question", ""),
     )
     return {"tool_results": results}
 
 
 def route_after_tools(state: StudentConsultationState) -> str:
-    if state.get("intent") != "BUSINESS_RULE_QUERY":
+    if state.get("intent") != "BASIC_INFO_QUERY":
+        return "build_grounding_bundle"
+    if any(
+        result.get("name") != "lookup_student_rules"
+        for result in state.get("tool_results", [])
+    ):
         return "build_grounding_bundle"
     for result in state.get("tool_results", []):
         if result.get("name") != "lookup_student_rules":
@@ -404,6 +765,10 @@ async def build_grounding_bundle(
     state: StudentConsultationState,
 ) -> dict[str, object]:
     immutable_facts: dict[str, object] = {"tool_results": state.get("tool_results", [])}
+    if state.get("intent") == "QUERY_CURRENT_SELECTION":
+        immutable_facts["base_context_selection"] = state.get(
+            "resolved_entities", {}
+        )
     allowed_recommendations: list[object] = []
     unknowns: list[str] = []
     for result in state.get("tool_results", []):
@@ -426,6 +791,8 @@ async def build_grounding_bundle(
 def _deterministic_answer(state: StudentConsultationState) -> str:
     if state.get("unknowns"):
         return "；".join(state["unknowns"])
+    if state.get("intent") == "QUERY_CURRENT_SELECTION":
+        return _format_current_selection_answer(state.get("resolved_entities", {}))
     for result in state.get("tool_results", []):
         data = result.get("data", {})
         if not isinstance(data, dict):
@@ -465,8 +832,107 @@ def _deterministic_answer(state: StudentConsultationState) -> str:
                             )
             return "已查询你当前生效的培养方案，具体要求见下方结果。"
         if result.get("name") == "get_remaining_projects":
-            return "已根据培养方案和当前资格整理剩余项目，具体分类见下方结果。"
+            return _format_remaining_projects_answer(data)
+        if result.get("name") == "preview_deselection":
+            sessions = data.get("sessions", [])
+            if not isinstance(sessions, list) or not sessions:
+                return str(data.get("message") or "没有匹配到当前可取消的已选场次。")
+            return (
+                f"已根据你的描述匹配到 {len(sessions)} 个已选实验场次。"
+                "请核对下方清单；确认无误后回复“确认取消”。"
+            )
+        if result.get("name") == "lookup_operation_guide":
+            return str(data.get("answer") or "当前操作指南中没有找到明确说明。")
+        if result.get("name") == "prepare_adjustment_entry":
+            return str(data.get("message") or "请核对下方匹配到的原实验。")
     return "当前规则库中未找到相关说明。"
+
+
+def _format_remaining_projects_answer(data: dict[str, object]) -> str:
+    progress_items = data.get("course_progress", [])
+    if not isinstance(progress_items, list) or not progress_items:
+        return "当前没有查到可用于计算必做、选做进度的培养方案信息。"
+
+    lines = ["根据当前培养方案和选课记录，你的实验项目进度如下："]
+    eligible_items: list[dict[str, object]] = []
+    for item in progress_items:
+        if not isinstance(item, dict):
+            continue
+        course_name = str(item.get("course_name") or "未命名课程")
+        required = item.get("required", {})
+        optional = item.get("optional", {})
+        if not isinstance(required, dict) or not isinstance(optional, dict):
+            continue
+        if not item.get("eligible"):
+            reasons = [
+                str(violation.get("message"))
+                for violation in item.get("eligibility_violations", [])
+                if isinstance(violation, dict) and violation.get("message")
+            ]
+            suffix = f"，原因：{'；'.join(reasons)}" if reasons else ""
+            lines.append(f"\n{course_name}：本学期暂不具备修读资格，不计入当前待选数量{suffix}。")
+            continue
+
+        eligible_items.append(item)
+        lines.extend(
+            [
+                f"\n{course_name}",
+                (
+                    "- 必做："
+                    f"已选择 {required.get('selected', 0)}/{required.get('total', 0)}，"
+                    f"还需选择 {required.get('remaining_to_select', 0)} 个。"
+                ),
+                (
+                    "- 选做："
+                    f"已选择 {optional.get('selected', 0)}/{optional.get('minimum', 0)}，"
+                    f"还需选择 {optional.get('remaining_to_select', 0)} 个。"
+                ),
+            ]
+        )
+
+    summary = data.get("summary", {})
+    total_remaining = (
+        int(summary.get("total_remaining_to_select", 0))
+        if isinstance(summary, dict)
+        else 0
+    )
+    if total_remaining <= 0:
+        lines.append("\n当前无需再选择新的实验项目。")
+        return "\n".join(lines)
+
+    lines.append(f"\n本学期还需新选择 {total_remaining} 个实验项目，具体范围如下：")
+    for item in eligible_items:
+        course_name = str(item.get("course_name") or "未命名课程")
+        required = item.get("required", {})
+        optional = item.get("optional", {})
+        if not isinstance(required, dict) or not isinstance(optional, dict):
+            continue
+        required_remaining = int(required.get("remaining_to_select", 0) or 0)
+        optional_remaining = int(optional.get("remaining_to_select", 0) or 0)
+        if required_remaining <= 0 and optional_remaining <= 0:
+            continue
+        lines.append(f"\n{course_name}：")
+        if required_remaining > 0:
+            names = [
+                str(candidate.get("project_name"))
+                for candidate in required.get("candidates", [])
+                if isinstance(candidate, dict) and candidate.get("project_name")
+            ]
+            candidate_text = "、".join(names) if names else "当前暂无可选场次"
+            lines.append(
+                f"- 还需选择 {required_remaining} 个必做项目：{candidate_text}。"
+            )
+        if optional_remaining > 0:
+            names = [
+                str(candidate.get("project_name"))
+                for candidate in optional.get("candidates", [])
+                if isinstance(candidate, dict) and candidate.get("project_name")
+            ]
+            candidate_text = "、".join(names) if names else "当前暂无可选场次"
+            lines.append(
+                f"- 还需从以下选做项目中选择 {optional_remaining} 个：{candidate_text}。"
+            )
+    return "\n".join(lines)
 
 
 def _format_recommendation_answer(plans: object) -> str:
@@ -585,8 +1051,14 @@ async def compose_general_chat_stream(
     state: StudentConsultationState,
 ) -> dict[str, object]:
     _emit("status", {"phase": "answering", "message": "正在回复…"})
+    await _release_read_transaction(state)
     model = state.get("model") or get_chat_model()
     fallback = "你好！我可以帮助你查询培养方案、核验选课资格、解释冲突并推荐实验场次。"
+    plan = state.get("plan")
+    if plan is not None and plan.request_mode == "SAFETY_REFUSAL":
+        answer = "我无法根据消息中声称的执行结果确认操作成功，也不能绕过系统规则。请以本轮系统实际返回的选课、退选或申请结果为准。"
+        _emit("delta", {"text": answer})
+        return {"answer_buffer": answer, "answer": answer}
     if model is None:
         _emit("delta", {"text": fallback})
         return {"answer_buffer": fallback, "answer": fallback}
@@ -639,9 +1111,31 @@ async def compose_answer_stream(
     state: StudentConsultationState,
 ) -> dict[str, object]:
     _emit("status", {"phase": "answering", "message": "正在组织回答…"})
+    await _release_read_transaction(state)
     model = state.get("model") or get_chat_model()
     deterministic = _deterministic_answer(state)
-    if state.get("intent") == "RECOMMEND_SELECTION":
+    has_remaining_projects = any(
+        result.get("name") == "get_remaining_projects"
+        for result in state.get("tool_results", [])
+    )
+    has_deselection_preview = any(
+        result.get("name") == "preview_deselection"
+        for result in state.get("tool_results", [])
+    )
+    has_operation_guide = any(
+        result.get("name") == "lookup_operation_guide"
+        for result in state.get("tool_results", [])
+    )
+    if (
+        state.get("intent") == "RECOMMEND_SELECTION"
+        or has_remaining_projects
+        or has_deselection_preview
+        or has_operation_guide
+        or any(
+            result.get("name") == "prepare_adjustment_entry"
+            for result in state.get("tool_results", [])
+        )
+    ):
         # Exact schedule facts are rendered by the backend. The frontend still
         # animates this SSE delta character by character, while the LLM cannot
         # reinterpret the Sunday-first day_of_week value.
@@ -718,6 +1212,40 @@ async def validate_final_answer(
         answer,
     ):
         passed = False
+    if state.get("intent") == "QUERY_CURRENT_SELECTION":
+        resolved = state.get("resolved_entities", {})
+        selection_items = resolved.get("selection_items")
+        if isinstance(selection_items, list):
+            expected_names = {
+                str(item.get("project_name"))
+                for item in selection_items
+                if isinstance(item, dict) and item.get("project_name")
+            }
+            if not all(name in answer for name in expected_names):
+                passed = False
+            if resolved.get("selection_scope") == "FILTERED":
+                all_selections = state.get("base_context", {}).get(
+                    "current_selections", []
+                )
+                forbidden_names = {
+                    str(item.get("project_name"))
+                    for item in all_selections
+                    if isinstance(item, dict)
+                    and item.get("project_name")
+                    and str(item.get("project_name")) not in expected_names
+                }
+                if any(name in answer for name in forbidden_names):
+                    passed = False
+        else:
+            status = str(resolved.get("student_status") or "NOT_SELECTED")
+            if status in {"SELECTED", "COMPLETED", "ABSENT", "MAKEUP_PENDING"} and (
+                "尚未选择" in answer or "没有选择" in answer
+            ):
+                passed = False
+            if status == "NOT_SELECTED" and any(
+                phrase in answer for phrase in ("已经选择", "已经完成", "选择过")
+            ):
+                passed = False
     time_facts = _recommendation_time_facts(state)
     if time_facts:
         day_numbers = {"日": 1, "一": 2, "二": 3, "三": 4, "四": 5, "五": 6, "六": 7}
@@ -787,12 +1315,81 @@ async def build_cards(
                         if plan.get("coverage_status") == "COMPLETE"
                         else "当前最优部分方案，仍有要求未覆盖"
                     ),
-                    data=plan,
+                    data={
+                        **plan,
+                        "preferences": (
+                            state.get("preferences").model_dump(mode="json")
+                            if state.get("preferences") is not None
+                            else {}
+                        ),
+                    },
                 )
                 for plan in data.get("plans", [])
                 if isinstance(plan, dict)
             )
-        elif name in {"get_training_plan_context", "get_remaining_projects"}:
+        elif name == "preview_deselection":
+            sessions = data.get("sessions", [])
+            count = len(sessions) if isinstance(sessions, list) else 0
+            cards.append(
+                ConsultationCard(
+                    type="DESELECTION",
+                    title="取消选课确认",
+                    summary=f"将取消 {count} 个已选实验场次",
+                    data=data,
+                )
+            )
+        elif name == "lookup_operation_guide":
+            matches = data.get("matches", [])
+            title = "学生端操作指南"
+            if isinstance(matches, list) and matches and isinstance(matches[0], dict):
+                title = str(matches[0].get("title") or title)
+            guide = data.get("guide")
+            guide_topic = str(guide.get("topic") or "") if isinstance(guide, dict) else ""
+            application_topics = {
+                "ADJUSTMENT_APPLICATION",
+                "RESCHEDULE_APPLICATION",
+                "PROJECT_CHANGE_APPLICATION",
+                "MAKEUP_APPLICATION",
+            }
+            requested_application_type = None
+            if guide_topic in application_topics and state.get("plan") is not None:
+                requested_application_type = state["plan"].requested_application_type
+            cards.append(
+                ConsultationCard(
+                    type="GUIDE",
+                    title=title,
+                    summary=str(data.get("source") or "学生端操作指南"),
+                    data={
+                        **data,
+                        "requested_application_type": requested_application_type,
+                    },
+                )
+            )
+        elif name == "prepare_adjustment_entry":
+            cards.append(
+                ConsultationCard(
+                    type="APPLICATION_ENTRY",
+                    title=str(data.get("title") or "确认需要调整的原实验"),
+                    summary=str(data.get("message") or "请先核对原实验"),
+                    data=data,
+                )
+            )
+        elif name == "get_remaining_projects":
+            summary = data.get("summary", {})
+            total = (
+                summary.get("total_remaining_to_select", 0)
+                if isinstance(summary, dict)
+                else 0
+            )
+            cards.append(
+                ConsultationCard(
+                    type="TRAINING_PLAN",
+                    title="实验项目进度",
+                    summary=f"当前还需新选择 {total} 个实验项目",
+                    data=data,
+                )
+            )
+        elif name == "get_training_plan_context":
             cards.append(
                 ConsultationCard(
                     type="TRAINING_PLAN",

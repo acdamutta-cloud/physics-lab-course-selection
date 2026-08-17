@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# LangSmith 离线实验、pytest 冒烟评测与轨迹评分
+langsmith[pytest]>=0.3.4,<1.0
+openevals>=0.1,<1.0
+agentevals>=0.0.9,<1.0
+python-dotenv>=1.0,<2.0
+

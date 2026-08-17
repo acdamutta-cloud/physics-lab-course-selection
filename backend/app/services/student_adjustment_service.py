@@ -40,6 +40,7 @@ from app.services.student_consultation_service import (
     check_selection_eligibility,
     weekday_name,
 )
+from app.services.student_cache_service import refresh_experiment_views_after_commit
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 ACTIVE_APPLICATION_STATUSES = {
@@ -798,6 +799,11 @@ async def create_adjustment_application(
         application.status = "PENDING_REVIEW"
     await session.commit()
     await session.refresh(application)
+    await refresh_experiment_views_after_commit(
+        student_id,
+        term.id,
+        dashboard=application.status == "EXECUTED",
+    )
 
     # 推送管理员通知
     try:
@@ -819,6 +825,34 @@ async def create_adjustment_application(
         }, ensure_ascii=False))
     except Exception:
         pass
+
+    # 推送待审批教师通知（补做申请需原场次教师审批）
+    if application.approval_route in ("TEACHER", "TEACHER_THEN_ADMIN"):
+        try:
+            from app.db.redis_client import get_redis_client
+            import json as _json
+
+            original = await session.get(
+                ExperimentSession, application.original_session_id
+            )
+            if original is not None and original.teacher_id is not None:
+                teacher = await session.get(Teacher, original.teacher_id)
+                if teacher is not None and teacher.user_id is not None:
+                    student = await session.get(Student, student_id)
+                    student_name = student.name if student else ""
+                    msg = f"学生{student_name}提交了补做申请，请审批"
+                    await get_redis_client().lpush(
+                        f"teacher:{teacher.user_id}:notifications",
+                        _json.dumps({
+                            "request_no": application.request_no,
+                            "title": "补做申请待审批",
+                            "msg": msg,
+                            "type": "补做",
+                            "time": now.strftime("%m-%d %H:%M"),
+                        }, ensure_ascii=False),
+                    )
+        except Exception:
+            pass
 
     return application_out(application)
 
@@ -862,6 +896,13 @@ async def cancel_adjustment_application(
     item.updated_by = actor_id
     await session.commit()
     await session.refresh(item)
+    target = await session.get(ExperimentSession, item.target_session_id)
+    if target is not None:
+        schedule = await session.get(ScheduleVersion, target.schedule_version_id)
+        if schedule is not None:
+            await refresh_experiment_views_after_commit(
+                student_id, schedule.term_id, dashboard=False
+            )
     return application_out(item)
 
 
@@ -940,28 +981,30 @@ async def review_adjustment_application(
     application.updated_by = actor_id
     await session.commit()
     await session.refresh(application)
+    if application.student_id is not None:
+        await refresh_experiment_views_after_commit(
+            application.student_id,
+            term.id,
+            dashboard=application.status == "EXECUTED",
+        )
 
-    # 推送学生通知
-    try:
-        from app.db.redis_client import get_redis_client
-        labels = {"RESCHEDULE": "调课", "PROJECT_CHANGE": "换组", "MAKEUP": "补做"}
-        if decision == 'APPROVED' and application.approval_route == "TEACHER_THEN_ADMIN" and actor_type == "TEACHER":
-            msg = f"{labels.get(application.request_type, application.request_type)}教师端审批已通过，待管理员审核"
-        elif decision == 'APPROVED':
-            msg = f"{labels.get(application.request_type, application.request_type)}通过"
-        else:
-            msg = f"{labels.get(application.request_type, application.request_type)}被驳回"
-        if comment and decision == 'REJECTED':
-            msg += f"（{comment[:30]}）"
-        import json as _json
-        redis = get_redis_client()
-        await redis.lpush(f"student:{application.student_id}:notifications", _json.dumps({
-            "request_no": application.request_no,
-            "msg": msg,
-            "decision": decision,
-            "time": datetime.now(UTC).strftime("%m-%d %H:%M"),
-        }, ensure_ascii=False))
-    except Exception:
-        pass
+    # 推送学生通知（双重审批时教师初审通过不单独发送，等终审结果统一通知）
+    if not (decision == 'APPROVED' and actor_type == "TEACHER"):
+        try:
+            from app.db.redis_client import get_redis_client
+            labels = {"RESCHEDULE": "调课", "PROJECT_CHANGE": "换组", "MAKEUP": "补做"}
+            msg = f"{labels.get(application.request_type, application.request_type)}{'通过' if decision == 'APPROVED' else '被驳回'}"
+            if comment and decision == 'REJECTED':
+                msg += f"（{comment[:30]}）"
+            import json as _json
+            redis = get_redis_client()
+            await redis.lpush(f"student:{application.student_id}:notifications", _json.dumps({
+                "request_no": application.request_no,
+                "msg": msg,
+                "decision": decision,
+                "time": datetime.now(UTC).strftime("%m-%d %H:%M"),
+            }, ensure_ascii=False))
+        except Exception:
+            pass
 
     return application_out(application)

@@ -41,7 +41,6 @@ from app.models import (
     StudentBusyBitmap,
     StudentClass,
     Teacher,
-    TeacherAvailability,
     TeacherProjectQualification,
     TeachingTask,
     TeachingTaskCohort,
@@ -837,7 +836,6 @@ async def seed_demo_data() -> None:
         await session.flush()
 
         qualifications: list[TeacherProjectQualification] = []
-        availabilities: list[TeacherAvailability] = []
         for teacher_index, teacher in enumerate(teachers):
             assigned_projects = [
                 projects[teacher_index],
@@ -857,25 +855,7 @@ async def seed_demo_data() -> None:
                         status="ACTIVE",
                     )
                 )
-            for day_of_week in range(2, 7):
-                availabilities.append(
-                    TeacherAvailability(
-                        id=demo_id(
-                            "availability",
-                            f"{teacher.employee_no}:{day_of_week}",
-                        ),
-                        teacher_id=teacher.id,
-                        term_id=term.id,
-                        week_start=1,
-                        week_end=17,
-                        day_of_week=day_of_week,
-                        start_slot=1,
-                        end_slot=8,
-                        availability_type="AVAILABLE",
-                        reason="模拟可用时间",
-                    )
-                )
-        session.add_all(qualifications + availabilities)
+        session.add_all(qualifications)
         await session.flush()
 
         rule_sets = {
@@ -1155,10 +1135,10 @@ async def seed_demo_data() -> None:
                 id=demo_id("selection_window", "DEMO-2026"),
                 term_id=term.id,
                 selection_rule_set_id=rule_sets["SELECTION"].id,
-                start_at=datetime(2026, 2, 25, 0, 0, tzinfo=UTC),
-                end_at=datetime(2026, 3, 8, 23, 59, tzinfo=UTC),
-                withdraw_end_at=datetime(2026, 3, 15, 23, 59, tzinfo=UTC),
-                status="CLOSED",
+                start_at=datetime(2026, 2, 16, 8, 0, tzinfo=UTC),
+                end_at=datetime(2026, 7, 28, 15, 59, tzinfo=UTC),
+                withdraw_end_at=datetime(2026, 8, 4, 15, 59, tzinfo=UTC),
+                status="OPEN",
             )
         )
         await session.flush()
@@ -1182,6 +1162,7 @@ async def seed_demo_data() -> None:
             )
         )
         await session.flush()
+
 
     print("模拟数据写入完成：")
     print(f"- 工科专业：{len(MAJOR_SPECS)}")

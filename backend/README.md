@@ -18,7 +18,27 @@
 Copy-Item .env.example .env
 ```
 
-编辑 `.env` 并注入自己的 DeepSeek API Key：
+编辑 `.env` 并注入所选聊天模型供应方的 API Key。使用阿里云百炼
+Qwen3-14B 时配置：
+
+```dotenv
+MODEL_PROVIDER=dashscope
+DASHSCOPE_API_KEY=
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+DASHSCOPE_MODEL=qwen3-14b
+DASHSCOPE_ENABLE_THINKING=false
+```
+
+如需切回 Hugging Face：
+
+```dotenv
+MODEL_PROVIDER=huggingface
+HF_TOKEN=
+HUGGINGFACE_BASE_URL=https://router.huggingface.co/v1
+HUGGINGFACE_MODEL=Qwen/Qwen3.5-4B:featherless-ai
+```
+
+如需切回 DeepSeek：
 
 ```dotenv
 DEEPSEEK_API_KEY=
@@ -33,9 +53,33 @@ MODEL_PROVIDER=deepseek
 ```dotenv
 MODEL_PROVIDER=mock
 DEEPSEEK_API_KEY=
+HF_TOKEN=
+DASHSCOPE_API_KEY=
 ```
 
-## 3. DeepSeek 配置说明
+## 3. 聊天模型配置说明
+
+阿里云百炼、Hugging Face Router 和 DeepSeek 均提供 OpenAI 兼容接口，项目统一通过
+`ChatOpenAI` 调用。切换供应方不会改变选课、调课、排课或审批算法。
+
+阿里云百炼配置为：
+
+```dotenv
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+DASHSCOPE_MODEL=qwen3-14b
+DASHSCOPE_ENABLE_THINKING=false
+```
+
+`DASHSCOPE_ENABLE_THINKING=false` 用于关闭思考过程输出，避免将模型推理内容展示给学生。
+
+Hugging Face 配置为：
+
+```dotenv
+HUGGINGFACE_BASE_URL=https://router.huggingface.co/v1
+HUGGINGFACE_MODEL=Qwen/Qwen3.5-4B:featherless-ai
+```
+
+DeepSeek 配置为：
 
 项目按当前约定提供：
 
@@ -137,3 +181,28 @@ app/db/langgraph_checkpoint.py
 - Redis 只保存缓存、锁和临时状态；
 - LangGraph Checkpoint 不替代正式业务表；
 - 生产环境不得使用示例 JWT Secret 和数据库密码。
+
+## 9. 学生操作指南知识库
+
+操作指南使用 BM25 与 `BAAI/bge-m3` 语义向量混合检索。硅基流动配置可使用：
+
+```dotenv
+SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+SILICONFLOW_API_KEY=
+EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_DIMENSIONS=1024
+```
+
+API Key 只能写入本机 `backend/.env` 或生产密钥服务，不得提交到版本库。
+
+未安装 pgvector 或尚未同步索引时，后端会使用进程内向量索引；完成数据库
+备份并确认 PostgreSQL 支持 pgvector 后，可执行：
+
+```powershell
+alembic upgrade head
+python -m scripts.sync_operation_guides
+python -m scripts.verify_operation_guide_search
+```
+
+指南内容位于 `app/data/student_operation_guides.py`。修改指南后重新执行同步
+命令即可更新数据库向量索引。

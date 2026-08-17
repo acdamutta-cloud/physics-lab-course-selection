@@ -87,6 +87,7 @@ async def build_user_profile(
     if user.user_type == "STUDENT":
         student = await user_crud.get_student_by_user_id(session, user.id)
         if student:
+            profile.student_id = student.id
             profile.name = student.name
             profile.student_no = student.student_no
             profile.enrollment_year = student.enrollment_year
@@ -97,6 +98,7 @@ async def build_user_profile(
     elif user.user_type == "TEACHER":
         teacher = await user_crud.get_teacher_by_user_id(session, user.id)
         if teacher:
+            profile.teacher_id = teacher.id
             profile.name = teacher.name
             profile.employee_no = teacher.employee_no
             profile.department = teacher.department
@@ -170,6 +172,10 @@ async def reset_password(
     user.password_hash = pwd_hash.hash(new_password)
     user.password_changed_at = datetime.now(timezone.utc)
     await session.commit()
+    # A committed password change must evict any cached authentication profile.
+    from app.cache.auth_principals import invalidate_auth_profile
+
+    await invalidate_auth_profile(user.id)
     return True
 
 

@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.schemas.student_consultation import SelectionPreferences
 
-AdjustmentRequestType = Literal["RESCHEDULE", "PROJECT_CHANGE", "MAKEUP"]
+AdjustmentRequestType = Literal["RESCHEDULE", "PROJECT_CHANGE", "MAKEUP", "TEACHER_ADJUSTMENT", "LAB_CHANGE", "TEACHER_SUBSTITUTION"]
 AdjustmentDecision = Literal["ALLOW", "BLOCK", "REVIEW"]
 ApprovalRoute = Literal["AUTO", "ADMIN", "TEACHER", "TEACHER_THEN_ADMIN"]
 AdjustmentIntent = Literal[

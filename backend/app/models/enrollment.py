@@ -40,8 +40,8 @@ class SelectionWindow(AuditMixin, BaseModel):
     course_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("experiment_course.id", ondelete="CASCADE")
     )
-    selection_rule_set_id: Mapped[UUID] = mapped_column(
-        ForeignKey("rule_set.id", ondelete="RESTRICT"), nullable=False
+    selection_rule_set_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("rule_set.id", ondelete="RESTRICT")
     )
     start_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False

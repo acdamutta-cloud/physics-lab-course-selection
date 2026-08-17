@@ -103,7 +103,7 @@ async function demoLogin(loginName: string) {
     emit('loginSuccess', result.user)
   } catch {
     isSubmitting.value = false
-    setMessage('演示登录失败，请确认服务器已启动')
+    setMessage('登录失败，请确认服务器已启动')
   }
 }
 
@@ -279,11 +279,10 @@ onBeforeUnmount(() => {
           <button class="submit-button" type="submit" :disabled="isSubmitting"><span>{{ isSubmitting ? '正在验证...' : `登录${roleName}端` }}</span><span>→</span></button>
         </form>
         <div class="demo-entries">
-          <button class="demo-entry admin-demo-entry" type="button" :disabled="isSubmitting" @click="demoLogin('demo_admin')"><span>新增</span> 进入系统端演示 <b>→</b></button>
-          <button class="demo-entry" type="button" :disabled="isSubmitting" @click="demoLogin('d2024010001')"><span>无需账号</span> 进入学生端演示 <b>→</b></button>
-          <button class="demo-entry teacher-demo-entry" type="button" :disabled="isSubmitting" @click="demoLogin('demo-t001')"><span>新增</span> 进入教师端演示 <b>→</b></button>
+          <button class="demo-entry admin-demo-entry" type="button" :disabled="isSubmitting" @click="demoLogin('demo_admin')"><span>新增</span> 进入系统端 <b>→</b></button>
+          <button class="demo-entry" type="button" :disabled="isSubmitting" @click="demoLogin('d2024010001')"><span>无需账号</span> 进入学生端 <b>→</b></button>
+          <button class="demo-entry teacher-demo-entry" type="button" :disabled="isSubmitting" @click="demoLogin('demo-t001')"><span>新增</span> 进入教师端 <b>→</b></button>
         </div>
-        <p class="service-tip">当前为交互原型，页面数据均为演示数据</p>
       </div>
       <p class="copyright">© 2026 物理实验中心 · 智慧教学服务平台</p>
     </section>

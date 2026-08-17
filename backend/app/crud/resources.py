@@ -9,6 +9,7 @@ from app.models.resources import (
     LabEquipmentInventory,
     Laboratory,
 )
+from app.services.equipment_usage_note_service import interpret_equipment_usage_note
 
 
 # ── Labs ──
@@ -82,12 +83,20 @@ async def delete_lab(session: AsyncSession, lab_id: UUID) -> bool:
 async def add_equipment_to_lab(
     session: AsyncSession, lab_id: UUID, data: dict
 ) -> LabEquipmentInventory:
+    rule = interpret_equipment_usage_note(
+        data.get("usage_note", data.get("note"))
+    )
     inv = LabEquipmentInventory(
         laboratory_id=lab_id,
         equipment_type_id=UUID(data["equipment_type_id"]),
         total_quantity=data.get("total_quantity", 1),
         usable_quantity=data.get("usable_quantity", 1),
         disabled_quantity=data.get("disabled_quantity", 0),
+        usage_note=rule.usage_note or None,
+        students_per_unit=rule.students_per_unit,
+        sharing_rule_status=rule.sharing_rule_status,
+        sharing_rule_source="SEMANTIC_PARSER" if rule.usage_note else None,
+        sharing_rule_evidence=rule.evidence,
     )
     session.add(inv)
     await session.flush()
@@ -114,6 +123,16 @@ async def update_equipment_inventory(
     inv.total_quantity = total
     inv.usable_quantity = usable
     inv.disabled_quantity = max(0, total - usable)
+
+    if "usage_note" in data or "note" in data:
+        rule = interpret_equipment_usage_note(
+            data.get("usage_note", data.get("note"))
+        )
+        inv.usage_note = rule.usage_note or None
+        inv.students_per_unit = rule.students_per_unit
+        inv.sharing_rule_status = rule.sharing_rule_status
+        inv.sharing_rule_source = "SEMANTIC_PARSER" if rule.usage_note else None
+        inv.sharing_rule_evidence = rule.evidence
 
     await session.flush()
     return inv

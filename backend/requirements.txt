@@ -24,6 +24,7 @@ langgraph-checkpoint-postgres>=3.0,<4.0
 langchain-core>=1.0,<2.0
 langchain-openai>=1.0,<2.0
 openai>=2.0,<3.0
+jieba>=0.42,<1.0
 
 # 排课求解
 ortools>=9.14,<10.0

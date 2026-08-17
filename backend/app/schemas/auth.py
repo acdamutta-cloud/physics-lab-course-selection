@@ -13,6 +13,10 @@ class UserProfile(BaseModel):
     id: UUID
     login_name: str
     user_type: str  # STUDENT / TEACHER / ADMIN
+    # Internal relation ids avoid a database lookup on cache-hit request paths.
+    # They are never accepted from clients and do not change public responses.
+    student_id: UUID | None = Field(default=None, exclude=True)
+    teacher_id: UUID | None = Field(default=None, exclude=True)
 
     name: str | None = None
     # 学生专用

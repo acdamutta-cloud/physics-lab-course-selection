@@ -181,6 +181,9 @@ class Teacher(AuditMixin, BaseModel):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="ACTIVE"
     )
+    min_session_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=20, server_default="20"
+    )
 
 
 class StudentBusyBitmap(BaseModel):

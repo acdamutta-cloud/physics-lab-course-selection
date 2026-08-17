@@ -1,0 +1,55 @@
+{
+  "selected_standard": {
+    "relative_term_clock": {
+      "current_teaching_week": 5
+    },
+    "records": [
+      {
+        "status": "SELECTED",
+        "requirement_type": "REQUIRED",
+        "project_name": "RLC暂态过程",
+        "week_no": 6,
+        "day_name": "周一",
+        "start_slot": 1,
+        "end_slot": 4,
+        "teacher_name": "王芳"
+      },
+      {
+        "status": "SELECTED",
+        "requirement_type": "REQUIRED",
+        "project_name": "交流电桥",
+        "week_no": 7,
+        "day_name": "周一",
+        "start_slot": 1,
+        "end_slot": 4,
+        "teacher_name": "李强"
+      },
+      {
+        "status": "SELECTED",
+        "requirement_type": "OPTIONAL",
+        "project_name": "振动系统频率响应",
+        "week_no": 9,
+        "day_name": "周一",
+        "start_slot": 5,
+        "end_slot": 8,
+        "teacher_name": "周颖"
+      },
+      {
+        "status": "ABSENT",
+        "requirement_type": "REQUIRED",
+        "project_name": "超声波声速测量",
+        "week_no": 3,
+        "day_name": "周一",
+        "start_slot": 1,
+        "end_slot": 4,
+        "teacher_name": "杨静"
+      }
+    ]
+  },
+  "no_selections": {
+    "relative_term_clock": {
+      "current_teaching_week": 5
+    },
+    "records": []
+  }
+}

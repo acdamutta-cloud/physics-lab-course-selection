@@ -57,6 +57,10 @@ logs/
 *.db
 tmp/
 temp/
+backend/evals/reports/*
+!backend/evals/reports/.gitkeep
+backend/load-data/
+backend/reports/
 
 # =========================
 # IDE、系统和本地 Agent 配置

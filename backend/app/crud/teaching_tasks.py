@@ -248,13 +248,13 @@ async def get_training_plan_courses_for_course(
 
 async def get_teachers_by_project_ids(
     session: AsyncSession, project_ids: list[UUID]
-) -> dict[UUID, list[str]]:
+) -> dict[UUID, list[tuple[UUID, str]]]:
     if not project_ids:
         return {}
     from app.models.identity import Teacher
     from app.models.resources import TeacherProjectQualification
     stmt = (
-        select(TeacherProjectQualification.project_id, Teacher.name)
+        select(TeacherProjectQualification.project_id, Teacher.id, Teacher.name)
         .join(Teacher, Teacher.id == TeacherProjectQualification.teacher_id)
         .where(
             TeacherProjectQualification.project_id.in_(project_ids),
@@ -263,25 +263,25 @@ async def get_teachers_by_project_ids(
         )
     )
     result = await session.execute(stmt)
-    mapping: dict[UUID, list[str]] = {pid: [] for pid in project_ids}
-    for pid, name in result.all():
-        mapping.setdefault(pid, []).append(name)
+    mapping: dict[UUID, list[tuple[UUID, str]]] = {pid: [] for pid in project_ids}
+    for pid, teacher_id, name in result.all():
+        mapping.setdefault(pid, []).append((teacher_id, name))
     return mapping
 
 
 async def get_equipment_by_project_ids(
     session: AsyncSession, project_ids: list[UUID]
-) -> dict[UUID, list[str]]:
+) -> dict[UUID, list[tuple[UUID, str]]]:
     if not project_ids:
         return {}
     from app.models.resources import EquipmentType, ProjectEquipmentRequirement
     stmt = (
-        select(ProjectEquipmentRequirement.project_id, EquipmentType.name)
+        select(ProjectEquipmentRequirement.project_id, EquipmentType.id, EquipmentType.name)
         .join(EquipmentType, EquipmentType.id == ProjectEquipmentRequirement.equipment_type_id)
         .where(ProjectEquipmentRequirement.project_id.in_(project_ids))
     )
     result = await session.execute(stmt)
-    mapping: dict[UUID, list[str]] = {pid: [] for pid in project_ids}
-    for pid, name in result.all():
-        mapping.setdefault(pid, []).append(name)
+    mapping: dict[UUID, list[tuple[UUID, str]]] = {pid: [] for pid in project_ids}
+    for pid, equipment_id, name in result.all():
+        mapping.setdefault(pid, []).append((equipment_id, name))
     return mapping

@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import '../asset-ledger.css'
+import '../resource-issue.css'
 import { api } from '../api/client'
+import NotificationBell from './NotificationBell.vue'
 import type { UserProfile } from '../api/auth'
 
 type SystemView = 'plans' | 'courses' | 'labs' | 'schedule' | 'approvals'
@@ -102,6 +105,15 @@ type ScheduleCandidate = {
         advantages: Array<{ rule_code: string; text: string; penalty: number }>
         tradeoffs: Array<{ rule_code: string; text: string; penalty: number }>
       }
+      preference_effects?: Array<{
+        rule_code: string
+        label: string
+        evidence: string
+        status: 'SATISFIED' | 'MOSTLY_SATISFIED' | 'PARTIALLY_SATISFIED' | 'NOT_SATISFIED' | 'NOT_APPLIED'
+        status_text: string
+        achievement_rate: number | null
+        text: string
+      }>
     }
   }
   sessions: ScheduleSession[]
@@ -262,12 +274,102 @@ async function saveTermSettings() {
     await fetchSemesterCourses(true)
   } catch (err) { showToast(err instanceof Error ? err.message : '保存失败') }
 }
+
+// ── 选课时间窗口 ──
+const selectionWindow = ref<{ id: string; term_id: string; start_at: string; end_at: string; withdraw_end_at: string | null; status: string } | null>(null)
+const selectionWindowEdit = ref({ start_at: '', end_at: '', withdraw_end_at: '' })
+const selectionWindowSaving = ref(false)
+
+function toLocalInputValue(value: string | null | undefined): string {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+function selectionWindowStatusLabel(): string {
+  const w = selectionWindow.value
+  if (!w) return '未配置'
+  const now = Date.now()
+  if (w.status !== 'OPEN') return '已关闭'
+  if (now < new Date(w.start_at).getTime()) return '未开始'
+  if (now > new Date(w.end_at).getTime()) return '已结束'
+  return '开放中'
+}
+
+async function fetchSelectionWindow() {
+  try {
+    const data = await api.get<NonNullable<typeof selectionWindow.value> | null>('/admin/selection-window')
+    selectionWindow.value = data
+    selectionWindowEdit.value = {
+      start_at: toLocalInputValue(data?.start_at),
+      end_at: toLocalInputValue(data?.end_at),
+      withdraw_end_at: toLocalInputValue(data?.withdraw_end_at),
+    }
+  } catch { selectionWindow.value = null }
+}
+
+async function saveSelectionWindow() {
+  if (!selectionWindowEdit.value.start_at || !selectionWindowEdit.value.end_at) {
+    showToast('请填写选课开始和结束时间')
+    return
+  }
+  const startMs = new Date(selectionWindowEdit.value.start_at).getTime()
+  const endMs = new Date(selectionWindowEdit.value.end_at).getTime()
+  if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs <= startMs) {
+    showToast('结束时间必须晚于开始时间')
+    return
+  }
+  if (selectionWindowEdit.value.withdraw_end_at) {
+    const withdrawMs = new Date(selectionWindowEdit.value.withdraw_end_at).getTime()
+    if (Number.isNaN(withdrawMs) || withdrawMs < endMs) {
+      showToast('退选截止时间不得早于选课结束时间')
+      return
+    }
+  }
+  selectionWindowSaving.value = true
+  try {
+    await api.put('/admin/selection-window', {
+      start_at: new Date(selectionWindowEdit.value.start_at).toISOString(),
+      end_at: new Date(selectionWindowEdit.value.end_at).toISOString(),
+      withdraw_end_at: selectionWindowEdit.value.withdraw_end_at
+        ? new Date(selectionWindowEdit.value.withdraw_end_at).toISOString()
+        : null,
+    })
+    showToast('选课时间窗口已保存')
+    await fetchSelectionWindow()
+  } catch (err) { showToast(err instanceof Error ? err.message : '保存失败') } finally { selectionWindowSaving.value = false }
+}
 const totalStudents = ref(0)
+type ResourceOption = { id: string; name: string; model?: string }
+const projectResourceOptions = ref<{ teachers: ResourceOption[]; equipment: ResourceOption[] }>({ teachers: [], equipment: [] })
+function resourceOptionById(items: ResourceOption[], id: string) {
+  return items.find(item => item.id === id)
+}
+function normalizeResourceOptions(items: Array<ResourceOption | string>): ResourceOption[] {
+  return items.map(item => typeof item === 'string' ? { id: item, name: item } : item)
+}
+function resourceIdsFromNames(ids: string[], names: string[], items: ResourceOption[]) {
+  if (ids.length) return ids
+  return names.map(name => items.find(item => item.name === name)?.id).filter((id): id is string => Boolean(id))
+}
+function availableResourceOptions(items: ResourceOption[], selectedIds: string[]) {
+  const selected = new Set(selectedIds)
+  return items.filter(item => !selected.has(item.id))
+}
+function addResourceId(ids: string[], value: string) {
+  if (value && !ids.includes(value)) ids.push(value)
+}
+function removeResourceId(ids: string[], value: string) {
+  const index = ids.indexOf(value)
+  if (index >= 0) ids.splice(index, 1)
+}
 
 async function fetchSemesterCourses(syncAll = false) {
   try {
     if (syncAll) await api.post('/admin/teaching-tasks/sync-all', {})
-    const [term, tasksRes, stuRes] = await Promise.all([
+    const [term, tasksRes, stuRes, resourceOptions] = await Promise.all([
       api.get<{ id: string; academic_year: string; semester_no: number; start_date: string; end_date: string; total_weeks: number; current_week: number }>('/admin/active-term'),
       api.get<{ items: Array<{
         id: string; task_code: string
@@ -282,10 +384,18 @@ async function fetchSemesterCourses(syncAll = false) {
           required_capacity: number
           teachers: string[]
           equipment: string[]
+          teacher_ids: string[]
+          equipment_ids: string[]
         }>
       }>; total: number }>('/admin/teaching-tasks'),
       api.get<{ total: number }>('/admin/students/total'),
+      api.get<{ teachers: ResourceOption[]; equipment: ResourceOption[] }>('/admin/project-resource-options')
+        .catch(() => ({ teachers: [], equipment: [] })),
     ])
+    projectResourceOptions.value = {
+      teachers: normalizeResourceOptions(resourceOptions.teachers),
+      equipment: normalizeResourceOptions(resourceOptions.equipment),
+    }
     termInfo.value = term
     totalStudents.value = stuRes.total
     semesterCourses.value = tasksRes.items.map(t => {
@@ -307,6 +417,8 @@ async function fetchSemesterCourses(syncAll = false) {
           expected: d.required_capacity,
           teachers: d.teachers || [],
           equipment: d.equipment || [],
+          teacherIds: resourceIdsFromNames(d.teacher_ids || [], d.teachers || [], projectResourceOptions.value.teachers),
+          equipmentIds: resourceIdsFromNames(d.equipment_ids || [], d.equipment || [], projectResourceOptions.value.equipment),
         })),
       }
     })
@@ -378,6 +490,12 @@ const editProjectDialog = ref<{
   taskId: string
   groupMode: ProjectGroupMode
   groupSize: number
+  teacherIds: string[]
+  equipmentIds: string[]
+  teacherSearch: string
+  equipmentSearch: string
+  teacherChoice: string
+  equipmentChoice: string
 } | null>(null)
 
 function openEditProjectDialog(project: any, course: any) {
@@ -390,6 +508,12 @@ function openEditProjectDialog(project: any, course: any) {
     taskId: course._taskId,
     groupMode: project.groupMode || 'INDIVIDUAL',
     groupSize: project.groupMode === 'GROUP' ? project.groupSize : 1,
+    teacherIds: [...project.teacherIds],
+    equipmentIds: [...project.equipmentIds],
+    teacherSearch: '',
+    equipmentSearch: '',
+    teacherChoice: '',
+    equipmentChoice: '',
   }
 }
 
@@ -410,6 +534,7 @@ async function saveProjectDemand() {
       `/admin/teaching-tasks/${dialog.taskId}/demands/${dialog.demandId}`,
       { required_capacity: dialog.capacity },
     )
+    await api.put(`/admin/projects/${dialog.projectId}/resources`, { teacher_ids: dialog.teacherIds, equipment_ids: dialog.equipmentIds })
     editProjectDialog.value = null
     showToast('项目实验形式和需求已更新')
     await fetchSemesterCourses()
@@ -428,16 +553,17 @@ async function deleteProjectDemand(project: any, course: any) {
 const addProjectDialog = ref<{
   course: any
   // new project fields
-  project_code: string; project_name: string; category: string
+  project_name: string; category: string
   required_slots: number; group_mode: ProjectGroupMode
   default_group_size: number; historical_selection_ratio: number
-  reqType: string
+  teacherIds: string[]; equipmentIds: string[]; teacherSearch: string; equipmentSearch: string
+  teacherChoice: string; equipmentChoice: string
 } | null>(null)
 
 function openAddProjectDialog(course: any) {
   addProjectDialog.value = {
-    course, reqType: 'REQUIRED',
-    project_code: '', project_name: '', category: 'BASIC',
+    course, teacherIds: [], equipmentIds: [], teacherSearch: '', equipmentSearch: '', teacherChoice: '', equipmentChoice: '',
+    project_name: '', category: 'BASIC',
     required_slots: 4, group_mode: 'INDIVIDUAL',
     default_group_size: 1, historical_selection_ratio: 0.5,
   }
@@ -445,14 +571,13 @@ function openAddProjectDialog(course: any) {
 
 async function saveAddProject() {
   const d = addProjectDialog.value
-  if (!d || !d.project_code || !d.project_name) { showToast('请填写项目编号和名称'); return }
+  if (!d || !d.project_name) { showToast('请填写项目名称'); return }
   try {
     // 1. 找课程 ID
     const courseOpt = courseCatalog.value.find(c => c.course_code === d.course.code)
     if (!courseOpt) { showToast('未找到课程信息'); return }
     // 2. 创建项目
     const project = await api.post<{ id: string }>(`/admin/courses/${courseOpt.id}/projects`, {
-      project_code: d.project_code,
       project_name: d.project_name,
       category: d.category,
       required_slots: d.required_slots,
@@ -461,7 +586,8 @@ async function saveAddProject() {
       historical_selection_ratio: d.historical_selection_ratio,
     })
     // 3. 加入教学任务
-    await api.post(`/admin/teaching-tasks/${d.course._taskId}/demands`, { project_id: project.id, requirement_type: d.reqType })
+    await api.put(`/admin/projects/${project.id}/resources`, { teacher_ids: d.teacherIds, equipment_ids: d.equipmentIds })
+    await api.post(`/admin/teaching-tasks/${d.course._taskId}/demands`, { project_id: project.id, requirement_type: 'REQUIRED' })
     addProjectDialog.value = null
     showToast('项目已创建并添加')
     await fetchSemesterCourses()
@@ -470,8 +596,66 @@ async function saveAddProject() {
 
 const labs = ref<Array<{
   id: string; name: string; room_type: string; safety_capacity: number; status: string
-  equipment: Array<{ id: string; equipment_name: string; model: string; total_quantity: number; usable_quantity: number; note?: string }>
+  equipment: Array<{ id: string; equipment_type_id: string; equipment_name: string; model: string; total_quantity: number; usable_quantity: number; note?: string }>
 }>>([])
+const labAssets = ref<any[]>([])
+const assetDialogOpen = ref(false)
+const assetDialogTitle = ref('')
+const selectedAsset = ref<any | null>(null)
+const assetEvents = ref<any[]>([])
+const assetSearch = ref('')
+const assetStatusFilter = ref('ALL')
+const registrationDialog = ref<{ lab: any; equipment: any; quantity: number } | null>(null)
+const registrationBusy = ref(false)
+
+const filteredLabAssets = computed(() => {
+  const keyword = assetSearch.value.trim().toLowerCase()
+  return labAssets.value.filter((asset: any) =>
+    (assetStatusFilter.value === 'ALL' || asset.status === assetStatusFilter.value)
+    && (!keyword || asset.instrument_no.toLowerCase().includes(keyword)),
+  )
+})
+const assetStatusSummary = computed(() => ({
+  available: labAssets.value.filter((item: any) => item.status === 'AVAILABLE').length,
+  attention: labAssets.value.filter((item: any) => ['QUARANTINED', 'UNDER_REPAIR', 'DISABLED', 'LOST'].includes(item.status)).length,
+  scrapped: labAssets.value.filter((item: any) => item.status === 'SCRAPPED').length,
+}))
+
+function assetStatusName(status: string) {
+  const names: Record<string, string> = {
+    AVAILABLE: '可用', QUARANTINED: '已隔离', UNDER_REPAIR: '检修中',
+    DISABLED: '停用', LOST: '遗失', SCRAPPED: '已报废',
+  }
+  return names[status] || status
+}
+
+function assetEventName(eventType: string) {
+  const names: Record<string, string> = {
+    REGISTER: '资产登记', ISSUE_REPORT: '故障隔离', SCRAP_REQUEST: '报废申请',
+    STATUS_CHANGE: '状态变更', TRANSFER: '设备调拨', REPAIR: '维修处理',
+  }
+  return names[eventType] || eventType
+}
+
+async function openAssetList(lab: any, equip: any) {
+  assetDialogTitle.value = `${lab.name} · ${equip.equipment_name}`
+  selectedAsset.value = null
+  assetEvents.value = []
+  assetSearch.value = ''
+  assetStatusFilter.value = 'ALL'
+  try {
+    const result = await api.get<{items:any[]}>(`/admin/labs/${lab.id}/equipment-assets?equipment_type_id=${equip.equipment_type_id}&page_size=200`)
+    labAssets.value = result.items
+    assetDialogOpen.value = true
+  } catch (err) { showToast(err instanceof Error ? err.message : '加载仪器号失败') }
+}
+
+async function openAssetEvents(asset: any) {
+  selectedAsset.value = asset
+  try {
+    assetEvents.value = await api.get<any[]>(`/admin/equipment-assets/${asset.id}/events`)
+  } catch (err) { showToast(err instanceof Error ? err.message : '加载仪器履历失败') }
+}
 
 async function fetchLabs() {
   try {
@@ -527,42 +711,27 @@ async function batchDeleteLabs() {
   } catch (err) { showToast(err instanceof Error ? err.message : '删除失败') }
 }
 
-async function scrapEquip(lab: any, equip: any) {
-  const n = prompt(`报废数量（当前可用 ${equip.usable_quantity} 台）：`, '1')
-  if (!n || isNaN(+n) || +n <= 0) return
-  const qty = Math.min(+n, equip.usable_quantity)
-  if (!confirm(`确认报废 ${qty} 台"${equip.equipment_name}"？`)) return
-  try {
-    await api.put(`/admin/labs/${lab.id}/equipment/${equip.id}`, {
-      usable_quantity: equip.usable_quantity - qty,
-      total_quantity: equip.total_quantity - qty,
-    })
-    showToast(`已报废 ${qty} 台`)
-    await fetchLabs()
-  } catch (err) { showToast(err instanceof Error ? err.message : '操作失败') }
+function openEquipmentRegistration(lab: any, equipment: any) {
+  registrationDialog.value = { lab, equipment, quantity: 1 }
 }
 
-async function addEquip(lab: any, equip: any) {
-  const n = prompt(`新增数量（当前账面 ${equip.total_quantity} 台）：`, '1')
-  if (!n || isNaN(+n) || +n <= 0) return
-  const qty = +n
+async function submitEquipmentRegistration() {
+  const dialog = registrationDialog.value
+  if (!dialog || !Number.isInteger(dialog.quantity) || dialog.quantity < 1 || dialog.quantity > 500) {
+    showToast('登记数量必须是 1 到 500 之间的整数')
+    return
+  }
+  registrationBusy.value = true
   try {
-    await api.put(`/admin/labs/${lab.id}/equipment/${equip.id}`, {
-      usable_quantity: equip.usable_quantity + qty,
-      total_quantity: equip.total_quantity + qty,
+    const assets = await api.post<any[]>(`/admin/labs/${dialog.lab.id}/equipment-assets/batch`, {
+      equipment_type_id: dialog.equipment.equipment_type_id,
+      quantity: dialog.quantity,
     })
-    showToast(`已新增 ${qty} 台`)
+    registrationDialog.value = null
+    showToast(`已登记 ${assets.length} 台仪器并生成唯一编号`)
     await fetchLabs()
   } catch (err) { showToast(err instanceof Error ? err.message : '操作失败') }
-}
-
-async function deleteEquipment(lab: any, equip: any) {
-  if (!confirm(`确定删除"${equip.equipment_name}"吗？`)) return
-  try {
-    await api.delete(`/admin/labs/${lab.id}/equipment/${equip.id}`)
-    showToast('设备已删除')
-    await fetchLabs()
-  } catch (err) { showToast(err instanceof Error ? err.message : '删除失败') }
+  finally { registrationBusy.value = false }
 }
 
 async function saveNewLab() {
@@ -582,19 +751,40 @@ async function saveNewLab() {
   } catch (err) { showToast(err instanceof Error ? err.message : '创建失败') }
 }
 
-const notifications = ref<Array<{ request_no: string; student_name: string; type: string; time: string }>>([])
-const showNotifications = ref(false)
-const unreadCount = computed(() => notifications.value.length)
-
-async function fetchNotifications() {
-  try { notifications.value = await api.get<any[]>('/admin/notifications') } catch { notifications.value = [] }
-}
-async function readOne(idx: number, val: string) {
-  notifications.value.splice(idx, 1)
-  await api.post('/admin/notifications/read', { value: val }).catch(() => {})
+// 提示铃：点击通知跳转到审批视图
+function handleNotifItemClick() {
+  navigate('approvals')
 }
 
-const approvals = ref<Array<{ id: string; rawId: string; source: string; applicant: string; type: string; subject: string; submitted: string; status: ApprovalStatus; result: string; reason_text: string; source_info: Record<string,any>; target_info: Record<string,any> }>>([])
+const approvals = ref<Array<{ id: string; rawId: string; source: string; sourceKind?: 'student' | 'teacher'; applicant: string; type: string; subject: string; submitted: string; status: ApprovalStatus; result: string; reason_text: string; source_info: Record<string,any>; target_info: Record<string,any>; validation_result?: Record<string,any>; _executedPlan?: any; executed_plan?: any }>>([])
+const adminResourceIssues = ref<any[]>([])
+const adminRepairUpdates = ref<any[]>([])
+const adminIssueTypeFilter = ref<'ALL' | 'EQUIPMENT_FAILURE' | 'EQUIPMENT_SCRAP'>('ALL')
+const adminIssueStatusFilter = ref('ALL')
+const adminIssueKeyword = ref('')
+const filteredAdminResourceIssues = computed(() => {
+  const keyword = adminIssueKeyword.value.trim().toLowerCase()
+  return adminResourceIssues.value.filter((item: any) =>
+    (adminIssueTypeFilter.value === 'ALL' || item.issue_type === adminIssueTypeFilter.value)
+    && (adminIssueStatusFilter.value === 'ALL' || item.status === adminIssueStatusFilter.value)
+    && (!keyword || `${item.report_no}${item.asset?.instrument_no || ''}${item.asset?.equipment_name || ''}${item.reporter?.name || ''}${item.description || ''}`.toLowerCase().includes(keyword)),
+  )
+})
+const adminIssueSummary = computed(() => ({
+  total: adminResourceIssues.value.length,
+  pending: adminResourceIssues.value.filter((item: any) => item.status === 'PENDING_REVIEW').length,
+  relocation: adminResourceIssues.value.filter((item: any) => item.status === 'RELOCATION_REQUIRED').length,
+  processing: adminResourceIssues.value.filter((item: any) => ['PROCESSING', 'SCRAP_REVIEW', 'READY_TO_EXECUTE'].includes(item.status)).length,
+}))
+const remediationPlans = ref<any[]>([])
+const selectedRemediationPlanId = ref('')
+const remediationLoading = ref(false)
+// ── 资源异常学生分流弹窗 ──
+const relocationModalOpen = ref(false)
+const relocationPlans = ref<any[]>([])
+const relocationLoading = ref(false)
+const relocationIssueId = ref('')
+const selectedRelocationPlanIds = ref<Record<string, string>>({})
 const rejectReason = ref('')
 function formatAdjustSession(info: any) {
   if (!info) return '—'
@@ -603,7 +793,32 @@ function formatAdjustSession(info: any) {
   const d = info.day_of_week ? dayNames[info.day_of_week] : ''
   const s = info.start_slot ? `第${info.start_slot}–${info.end_slot || info.start_slot}节` : ''
   const p = info.project_name || ''
-  return [w, d, s, p].filter(Boolean).join(' · ') || '—'
+  const lab = info.laboratory_name || ''
+  const teacher = info.teacher_name ? `${info.teacher_name}老师` : ''
+  return [p, w, d, s, lab, teacher].filter(Boolean).join(' · ') || '—'
+}
+function resourceStatusName(status: string) {
+  const names: Record<string, string> = {
+    PENDING_REVIEW: '待审批', PROCESSING: '检修中', SCRAP_REVIEW: '报废审批中', RELOCATION_REQUIRED: '待分流',
+    READY_TO_EXECUTE: '可执行报废', RESOLVED: '已恢复', SCRAPPED: '已报废', REJECTED: '已驳回',
+  }
+  return names[status] || status
+}
+function formatResourceTime(value: string | null | undefined) {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value.slice(0, 16).replace('T', ' ')
+  return date.toLocaleString('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  })
+}
+function pendingExtensionForIssue(issueId: string) {
+  return adminRepairUpdates.value.find((item: any) =>
+    item.resource_issue_id === issueId
+    && item.update_type === 'EXTEND_REPAIR'
+    && item.approval_status === 'PENDING',
+  ) || null
 }
 
 const rejectDialogOpen = ref(false)
@@ -611,50 +826,192 @@ const rejectTargetId = ref('')
 
 async function fetchApprovals() {
   try {
-    const items = await api.get<any[]>('/admin/adjustments')
+    const [items, teacherItems] = await Promise.all([
+      api.get<any[]>('/admin/adjustments'),
+      api.get<any[]>('/admin/teacher-adjustments').catch(() => []),
+    ])
     const statusMap: Record<string, ApprovalStatus> = {
       PENDING_REVIEW: '待审批', EXECUTED: '已通过', APPROVED: '已通过',
       REJECTED: '已驳回', CANCELLED: '已取消', AUTO_EXECUTED: '已通过',
     }
-    approvals.value = items.map((item: any) => ({
-      id: item.request_no,
-      rawId: item.id,
-      source: '学生申请',
-      applicant: item.student_name || '',
-      type: item.request_type === 'RESCHEDULE' ? '调课申请' : item.request_type === 'PROJECT_CHANGE' ? '换组申请' : '补做申请',
-      subject: item.project_name || '',
-      submitted: (item.created_at || '').slice(0, 16).replace('T', ' '),
+    const typeMap: Record<string, string> = { TEACHER_ADJUSTMENT: '教师调课', LAB_CHANGE: '场地调整', TEACHER_SUBSTITUTION: '代课申请' }
+    const studentApprovals = items.map((item: any) => ({
+      id: item.request_no, rawId: item.id,
+      source: item.request_type && ['TEACHER_ADJUSTMENT','LAB_CHANGE','TEACHER_SUBSTITUTION'].includes(item.request_type) ? '教师申请' : '学生申请',
+      applicant: item.teacher_name || item.student_name || '',
+      type: item.request_type === 'RESCHEDULE' ? '调课申请' : item.request_type === 'PROJECT_CHANGE' ? '换组申请' : item.request_type === 'MAKEUP' ? '补做申请' : item.request_type === 'TEACHER_ADJUSTMENT' ? '教师调课' : item.request_type === 'LAB_CHANGE' ? '场地调整' : item.request_type === 'TEACHER_SUBSTITUTION' ? '代课申请' : item.request_type,
+      subject: item.project_name || '', submitted: (item.created_at || '').slice(0, 16).replace('T', ' '),
       status: statusMap[item.status] || item.status,
-      result: item.status === 'REJECTED' ? (item.review_comment || `驳回 · ${item.reviewed_at?.slice(0, 10) || ''}`) : item.executed_at ? `已于 ${item.executed_at.slice(0, 10)} 执行` : item.status === 'CANCELLED' ? '已取消' : '等待审核',
-      reason_text: item.reason_text || '',
-      source_info: item.source_info || {},
-      target_info: item.target_info || {},
+      result: item.status === 'REJECTED' ? (item.review_comment || '') : item.executed_at ? `已于 ${item.executed_at.slice(0, 10)} 执行` : item.status === 'CANCELLED' ? '已取消' : '等待审核',
+      reason_text: item.reason_text || '', source_info: item.source_info || {}, target_info: item.target_info || {},
+      validation_result: item.validation_result || {},
+      executed_plan: item.executed_plan || null,
+      sourceKind: (item.request_type && ['TEACHER_ADJUSTMENT','LAB_CHANGE','TEACHER_SUBSTITUTION'].includes(item.request_type) ? 'teacher' : 'student') as 'student' | 'teacher',
     }))
+    const teacherApprovals = teacherItems.map((item: any) => ({
+      id: item.request_no, rawId: item.id, source: '教师申请', sourceKind: 'teacher' as const,
+      applicant: item.teacher_name || '教师', type: typeMap[item.request_type] || item.request_type,
+      subject: item.validation_result?.impact_summary?.selected_students ? `涉及 ${item.validation_result.impact_summary.selected_students} 名学生` : '',
+      submitted: (item.submitted_at || '').slice(0, 16).replace('T', ' '),
+      status: statusMap[item.status] || item.status, result: item.status === 'EXECUTED' ? '调整已生效' : '等待审核',
+      reason_text: item.reason || '', source_info: item.source_info || {},
+      target_info: item.target_info || item.payload || {}, validation_result: item.validation_result || {},
+    }))
+    const seen = new Set(studentApprovals.map((a: any) => a.rawId))
+    teacherApprovals.forEach((a: any) => { if (!seen.has(a.rawId)) studentApprovals.push(a) })
+    approvals.value = studentApprovals
   } catch { /* keep mock */ }
 }
 
-async function approveApplication(id: string) {
+async function fetchAdminResourceIssues() {
   try {
-    await api.post(`/admin/adjustments/${id}/review`, { decision: 'APPROVED', comment: '' })
-    showToast('已通过')
-    selectedApprovalId.value = null
-    await fetchApprovals()
+    const [issues, updates] = await Promise.all([
+      api.get<any[]>('/admin/resource-issues'),
+      api.get<any[]>('/admin/resource-repair-updates'),
+    ])
+    adminResourceIssues.value = issues; adminRepairUpdates.value = updates
+  } catch { adminResourceIssues.value = []; adminRepairUpdates.value = [] }
+}
+
+async function approveApplication(id: string) {
+  const target = approvals.value.find(item => item.rawId === id)
+  try {
+    if (target?.sourceKind === 'teacher') {
+      const affected = target.validation_result?.affected_students?.length || 0
+      if (affected && !selectedRemediationPlanId.value) return showToast(`该调课影响 ${affected} 名学生，请先生成并选择完整安置方案`)
+      if (!window.confirm('确认批准该教师教学调整吗？批准后将写入实际执行安排。')) return
+      await api.post(`/admin/teacher-adjustments/${id}/review`, { approved: true, remediation_plan_id: selectedRemediationPlanId.value || null, comment: '' })
+      // 保存已执行的方案到记录中，供查看结果时展示
+      target._executedPlan = remediationPlans.value.find((p: any) => p.id === selectedRemediationPlanId.value) || null
+    } else {
+      await api.post(`/admin/adjustments/${id}/review`, { decision: 'APPROVED', comment: '' })
+    }
+    showToast('已通过'); selectedApprovalId.value = null
+    await fetchApprovals(); await fetchAdminResourceIssues()
   } catch (e: any) { showToast(e?.message || '操作失败') }
 }
 function openReject(id: string) {
-  rejectTargetId.value = id
-  rejectReason.value = ''
-  rejectDialogOpen.value = true
+  rejectTargetId.value = id; rejectReason.value = ''; rejectDialogOpen.value = true
 }
 async function confirmReject() {
   if (!rejectReason.value.trim()) return showToast('请填写驳回理由')
   try {
-    await api.post(`/admin/adjustments/${rejectTargetId.value}/review`, { decision: 'REJECTED', comment: rejectReason.value.trim() })
-    showToast('已驳回')
-    rejectDialogOpen.value = false
-    selectedApprovalId.value = null
+    const target = approvals.value.find(item => item.rawId === rejectTargetId.value)
+    if (target?.sourceKind === 'teacher') await api.post(`/admin/teacher-adjustments/${rejectTargetId.value}/review`, { approved: false, comment: rejectReason.value.trim() })
+    else await api.post(`/admin/adjustments/${rejectTargetId.value}/review`, { decision: 'REJECTED', comment: rejectReason.value.trim() })
+    showToast('已驳回'); rejectDialogOpen.value = false; selectedApprovalId.value = null
     await fetchApprovals()
   } catch (e: any) { showToast(e?.message || '操作失败') }
+}
+
+async function reviewResourceIssue(item: any, approved: boolean) {
+  const isScrap = item.issue_type === 'EQUIPMENT_SCRAP'
+  const target = item.asset?.instrument_no || `${item.affected_quantity} 件资源`
+  if (!window.confirm(approved
+    ? (isScrap ? `确认审批仪器 ${target} 的报废申请吗？系统会先校验全部相关课程。` : `确认批准仪器 ${target} 进入检修吗？`)
+    : `确认驳回该${isScrap ? '报废申请' : '资源异常'}吗？`)) return
+  try {
+    await api.post(`/admin/resource-issues/${item.id}/review`, { approved, approved_quantity: approved ? item.affected_quantity : null, comment: '' })
+    await fetchAdminResourceIssues(); await fetchLabs()
+    if (approved) {
+      const issues = adminResourceIssues.value
+      const updated = issues.find((i: any) => i.id === item.id)
+      if (updated && (updated.status === 'RELOCATION_REQUIRED' || updated.remediation_status === 'REMEDIATION_REQUIRED')) {
+        relocationIssueId.value = updated.id
+        await generateResourceRelocationPlans()
+        if (relocationPlans.value.length) {
+          relocationModalOpen.value = true
+          return
+        }
+      }
+    }
+    showToast(approved ? '已批准，资源台账已更新' : '已驳回')
+  } catch (e: any) { showToast(e?.message || '操作失败') }
+}
+
+async function reviewRepairUpdate(item: any, approved: boolean) {
+  if (!window.confirm(approved ? `确认该检修进展吗？` : '确认驳回该检修进展吗？')) return
+  try {
+    await api.post(`/admin/resource-repair-updates/${item.id}/review`, { approved, comment: '' })
+    await fetchAdminResourceIssues(); await fetchLabs()
+    if (approved && item.update_type === 'EXTEND_REPAIR') {
+      // 延期批准后检查是否需要调整学生
+      const issues = await api.get<any[]>('/admin/resource-issues')
+      const updated = issues.find((i: any) => i.id === item.resource_issue_id || i.id === item.issue_id)
+      if (updated && updated.remediation_status === 'REMEDIATION_REQUIRED') {
+        relocationIssueId.value = updated.id
+        await generateResourceRelocationPlans()
+        if (relocationPlans.value.length) {
+          relocationModalOpen.value = true
+          return
+        }
+      }
+    }
+    showToast(approved ? '检修进展已确认' : '检修进展已驳回')
+  } catch (e: any) { showToast(e?.message || '操作失败') }
+}
+
+async function generateResourceRelocationPlans() {
+  if (!relocationIssueId.value) return
+  relocationLoading.value = true; relocationPlans.value = []; selectedRelocationPlanIds.value = {}
+  try {
+    relocationPlans.value = await api.post<any[]>(`/admin/resource-issues/${relocationIssueId.value}/remediation/recommend`, {})
+    for (const plan of relocationPlans.value) {
+      if (!selectedRelocationPlanIds.value[plan.source_session_id] && !plan.remaining_unresolved_count) {
+        selectedRelocationPlanIds.value[plan.source_session_id] = plan.id
+      }
+    }
+  } catch (e: any) { showToast(e?.message || '生成分流方案失败') }
+  finally { relocationLoading.value = false }
+}
+
+async function generateRelocationPlans(issueId: string) {
+  relocationIssueId.value = issueId
+  await generateResourceRelocationPlans()
+  relocationModalOpen.value = true
+}
+
+async function executeResourceRelocationPlan(planId?: string) {
+  const issue = adminResourceIssues.value.find((item: any) => item.id === relocationIssueId.value)
+  const isScrap = issue?.issue_type === 'EQUIPMENT_SCRAP'
+  const planIds = isScrap ? Object.values(selectedRelocationPlanIds.value) : (planId ? [planId] : [])
+  const plan = relocationPlans.value.find((p: any) => p.id === (planId || planIds[0]))
+  if (!plan) return
+  const sourceCount = new Set(relocationPlans.value.map((item: any) => item.source_session_id)).size
+  if (isScrap && planIds.length !== sourceCount) { showToast('请为每个受影响场次选择一套完整分流方案'); return }
+  const unresolved = planIds.reduce((sum, id) => sum + (relocationPlans.value.find((p: any) => p.id === id)?.remaining_unresolved_count || 0), 0)
+  if (unresolved > 0) { showToast(`仍有 ${unresolved} 名学生未覆盖，不能执行最终报废`); return }
+  const msg = isScrap
+    ? `确认原子化执行该分流方案并批准报废 ${issue?.asset?.instrument_no || '该仪器'} 吗？`
+    : `确认执行该迁移方案吗？将迁移 ${plan.planned_relocation_count} 名学生。`
+  if (!window.confirm(msg)) return
+  try {
+    if (isScrap) {
+      await api.post(`/admin/resource-issues/${relocationIssueId.value}/execute-relocation-and-scrap`, { plan_ids: planIds })
+    } else {
+      await api.post(`/admin/resource-issues/${relocationIssueId.value}/remediation/plans/${planId}/execute`, {})
+    }
+    showToast(isScrap ? '分流已执行，仪器已报废' : '迁移方案已执行')
+    relocationModalOpen.value = false
+    await fetchAdminResourceIssues()
+  } catch (e: any) { showToast(e?.message || '执行失败') }
+}
+
+function fmtRelocationTarget(target: any) {
+  if (!target) return '—'
+  const dayNames = ['', '周日', '周一', '周二', '周三', '周四', '周五', '周六']
+  return `第${target.week_no}周 ${dayNames[target.day_of_week] || ''} 第${target.start_slot}—${target.end_slot}节`
+}
+
+async function generateRemediationPlans() {
+  if (!selectedApproval.value?.rawId) return
+  remediationLoading.value = true; remediationPlans.value = []; selectedRemediationPlanId.value = ''
+  try {
+    remediationPlans.value = await api.post<any[]>(`/admin/teacher-adjustments/${selectedApproval.value.rawId}/remediation/recommend`, {})
+    if (remediationPlans.value.length) selectedRemediationPlanId.value = remediationPlans.value[0].id
+    showToast(remediationPlans.value.length ? `已生成 ${remediationPlans.value.length} 组安置方案` : '该申请无需学生安置')
+  } catch (e: any) { showToast(e?.message || '生成安置方案失败') }
+  finally { remediationLoading.value = false }
 }
 
 const currentLab = computed(() => labs.value.find((lab) => lab.name === activeLab.value) ?? labs.value[0])
@@ -709,6 +1066,17 @@ const visibleScheduleEvents = computed(() =>
 )
 const visibleApprovals = computed(() => approvals.value.filter((item) => approvalFilter.value === '全部状态' || item.status === approvalFilter.value))
 const selectedApproval = computed(() => approvals.value.find((item) => item.id === selectedApprovalId.value) ?? null)
+const isTeacherType = computed(() => selectedApproval.value ? ['教师调课','场地调整','代课申请'].includes(selectedApproval.value.type) : false)
+watch(selectedApprovalId, (id) => {
+  remediationPlans.value = []; selectedRemediationPlanId.value = ''
+  if (!id) return
+  const target = approvals.value.find(item => item.id === id)
+  const plan = target?._executedPlan || target?.executed_plan
+  if (plan) {
+    remediationPlans.value = [plan]
+    selectedRemediationPlanId.value = plan.id
+  }
+})
 
 function navigate(view: SystemView) {
   activeView.value = view
@@ -1174,6 +1542,9 @@ async function loadPublishedSchedule() {
 }
 
 onMounted(async () => {
+  // 选课窗口独立先行加载：fetchAdminResourceIssues 等接口较慢（N+1），
+  // 串行等待会阻塞窗口时间的回显（刷新后看不到已保存的时间）。
+  fetchSelectionWindow()
   try {
     await loadLookups()
     selectedPlan.value = '全部专业'
@@ -1182,7 +1553,7 @@ onMounted(async () => {
     await fetchLabs()
     await loadPublishedSchedule()
     await fetchApprovals()
-    await fetchNotifications()
+    await fetchAdminResourceIssues()
   } catch (error) {
     showToast(error instanceof Error ? error.message : '培养方案基础数据加载失败')
   }
@@ -1264,8 +1635,8 @@ const selectedCandidate = computed(() => {
         <p>系统管理中心</p>
         <button v-for="item in navItems" :key="item.id" :class="{ active: activeView === item.id }" @click="navigate(item.id)"><span>{{ item.icon }}</span>{{ item.label }}<i v-if="item.id === 'approvals'" class="system-nav-count">{{ approvals.filter(a=>a.status==='待审批').length || '' }}</i></button>
       </nav>
-      <div class="system-status"><span><i></i>系统运行正常</span><small>当前为前端演示环境</small></div>
-      <button class="system-logout" @click="emit('logout')">↪　退出演示</button>
+      <div class="system-status"><span><i></i>系统运行正常</span></div>
+      <button class="system-logout" @click="emit('logout')">↪　退出</button>
     </aside>
     <button v-if="sidebarOpen" class="system-mask" @click="sidebarOpen = false"></button>
 
@@ -1273,7 +1644,7 @@ const selectedCandidate = computed(() => {
       <header class="system-topbar">
         <button class="system-menu" @click="sidebarOpen = true">☰</button>
         <div class="system-breadcrumb"><span>系统端</span><b>/</b>{{ viewMeta[activeView].title }}</div>
-        <div class="system-top-actions"><div style="position:relative"><button class="system-notice" @click="showNotifications=!showNotifications">♢<i v-if="unreadCount">{{ unreadCount }}</i></button><div v-if="showNotifications && unreadCount" style="position:absolute;right:0;top:38px;z-index:20;width:300px;max-height:340px;overflow-y:auto;background:#fff;border:1px solid #dce4e8;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:0"><div style="padding:8px 12px;border-bottom:1px solid #eee;font-size:9px;color:#657885">未读通知 · {{ unreadCount }} 条</div><div v-for="(n,i) in notifications" :key="n.request_no" style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid #f5f5f5;font-size:8px;gap:8px"><div @click="navigate('approvals'); showNotifications=false" style="cursor:pointer;flex:1;min-width:0"><div style="color:#405562;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ n.student_name }} · {{ n.type }}</div><div style="color:#919da7;margin-top:2px">{{ n.time }}</div></div><button @click="readOne(i, JSON.stringify(n))" style="flex-shrink:0;padding:2px 6px;border:1px solid #dce4e8;border-radius:3px;background:#fff;color:#277e82;font-size:7px;cursor:pointer">已读</button></div></div></div><div class="system-profile"><span>{{ adminInitial }}</span><div><strong>{{ adminName }}</strong><small>{{ adminLoginId }}</small></div></div></div>
+        <div class="system-top-actions"><NotificationBell fetch-path="/admin/notifications" read-path="/admin/notifications/read" :on-item-click="handleNotifItemClick" /><div class="system-profile"><span>{{ adminInitial }}</span><div><strong>{{ adminName }}</strong><small>{{ adminLoginId }}</small></div></div></div>
       </header>
 
       <main class="system-content">
@@ -1351,13 +1722,21 @@ const selectedCandidate = computed(() => {
             <div class="system-panel-title"><div><h3>{{ currentLab.name }} · 设备台账</h3><p>实验室单次最多容纳 {{ currentLab.safety_capacity }} 人开展实验</p></div><div><label class="system-search">⌕<input v-model="equipKeyword" placeholder="搜索器材名称或型号" /></label></div></div>
             <div class="equipment-table">
               <div class="equipment-row equipment-head"><span>器材名称</span><span>型号 / 规格</span><span>账面数量</span><span>可用数量</span><span>备注</span><span>操作</span></div>
-              <div v-for="item in filteredEquipment" :key="item.id" class="equipment-row"><span><i>◇</i><b>{{ item.equipment_name }}</b></span><span>{{ item.model }}</span><span>{{ item.total_quantity }} 台 / 套</span><span><strong>{{ item.usable_quantity }}</strong> 台 / 套</span><span>{{ item.note }}</span><span style="white-space:nowrap"><button @click="scrapEquip(currentLab, item)" style="color:#e67e22">报废</button><button @click="addEquip(currentLab, item)" style="color:#27ae60;margin:0 2px">新增</button><button @click="deleteEquipment(currentLab, item)" style="color:red">删除</button></span></div>
+              <div v-for="item in filteredEquipment" :key="item.id" class="equipment-row"><span><i>◇</i><b>{{ item.equipment_name }}</b></span><span>{{ item.model }}</span><span>{{ item.total_quantity }} 台 / 套</span><span><strong>{{ item.usable_quantity }}</strong> 台 / 套</span><span>{{ item.note }}</span><span class="equipment-actions"><button type="button" @click="openAssetList(currentLab, item)">查看编号</button><button type="button" class="register" @click="openEquipmentRegistration(currentLab, item)">登记仪器</button></span></div>
             </div>
           </section>
-          <section class="lab-capacity-note"><span>i</span><p>实验室容量应取场地安全容量、实验台位数及关键器材可用套数中的最小值。当前数据均为演示配置。</p></section>
+          <section class="lab-capacity-note"><span>i</span><p>实验室容量应取场地安全容量、实验台位数及关键器材可用套数中的最小值。</p></section>
         </template>
 
         <template v-else-if="activeView === 'schedule'">
+          <section class="schedule-control-bar system-panel" style="margin-bottom:14px">
+            <label style="flex:1"><strong>选课时间窗口</strong><small style="display:block;color:#919da7">未配置或窗口外学生无法选课；退选截止后不可退选</small></label>
+            <label>开始<input v-model="selectionWindowEdit.start_at" type="datetime-local" step="1" style="padding:4px 8px;border:1px solid #d0d7de;border-radius:4px;font-size:8px" /></label>
+            <label>结束<input v-model="selectionWindowEdit.end_at" type="datetime-local" step="1" style="padding:4px 8px;border:1px solid #d0d7de;border-radius:4px;font-size:8px" /></label>
+            <label>退选截止<input v-model="selectionWindowEdit.withdraw_end_at" type="datetime-local" step="1" style="padding:4px 8px;border:1px solid #d0d7de;border-radius:4px;font-size:8px" /></label>
+            <button type="button" :disabled="selectionWindowSaving" style="padding:5px 12px;border:1px solid #277e82;border-radius:4px;background:#fff;color:#277e82;font-size:8px;cursor:pointer" @click="saveSelectionWindow">{{ selectionWindowSaving ? '保存中…' : '保存选课窗口' }}</button>
+            <span :style="{ color: selectionWindowStatusLabel() === '开放中' ? '#2e9e5b' : selectionWindowStatusLabel() === '未配置' ? '#919da7' : '#c25e4a', fontSize: '8px', whiteSpace: 'nowrap' }">状态：{{ selectionWindowStatusLabel() }}</span>
+          </section>
           <section class="schedule-control-bar system-panel">
             <label>实验室<select v-model="scheduleLab"><option v-for="lab in labs" :key="lab.name">{{ lab.name }}</option></select></label>
             <label>教学周<select v-model="scheduleWeek"><option v-for="w in (termInfo?.total_weeks || 18)" :key="w" :value="w">第 {{ w }} 教学周</option></select></label>
@@ -1382,6 +1761,21 @@ const selectedCandidate = computed(() => {
             >
               <header><strong>方案 {{ index + 1 }}</strong><span v-if="aiJob.selected_candidate_version_id === candidate.id">已选择</span></header>
               <p><b>{{ candidate.soft_score.toFixed(2) }}</b> 综合分 · {{ candidate.session_count }} 个场次</p>
+              <section class="ai-preference-effect">
+                <header><strong>偏好实现效果</strong><small v-if="aiJob.preference_text">对应：{{ aiJob.preference_text }}</small></header>
+                <ul v-if="candidate.score_details?.validation?.preference_effects?.length">
+                  <li
+                    v-for="effect in candidate.score_details.validation.preference_effects"
+                    :key="effect.rule_code"
+                    :class="effect.status.toLowerCase()"
+                  >
+                    <div><b>{{ effect.label }}</b><em>{{ effect.status_text }}</em></div>
+                    <span v-if="effect.achievement_rate !== null">指标达成率 {{ effect.achievement_rate.toFixed(1) }}%</span>
+                    <span v-else>{{ effect.text }}</span>
+                  </li>
+                </ul>
+                <p v-else>本次未输入可量化偏好，方案按系统默认软约束综合优化。</p>
+              </section>
               <div class="ai-candidate-review">
                 <section class="advantage">
                   <strong>优点</strong>
@@ -1414,7 +1808,7 @@ const selectedCandidate = computed(() => {
             <span>✦</span>
             <div>
               <strong>告诉 AI 你更关注什么（可选）</strong>
-              <p>可以直接输入，也可以选择示例：</p>
+              <p>可以直接输入，也可以选择以下偏好：</p>
               <div class="ai-preference-examples">
                 <button type="button" @click="applyPreferenceExample('尽量减少周末实验')">减少周末实验</button>
                 <button type="button" @click="applyPreferenceExample('教师课时尽量紧凑')">教师课时更紧凑</button>
@@ -1449,11 +1843,80 @@ const selectedCandidate = computed(() => {
             <div class="system-panel-title"><div><h3>申请审批列表</h3><p>审批结果需包含具体执行方案或明确驳回理由</p></div><div><label class="system-search">⌕<input placeholder="搜索申请人、编号或项目" /></label><select v-model="approvalFilter"><option>全部状态</option><option>待审批</option><option>已通过</option><option>已驳回</option><option>已取消</option></select></div></div>
             <div class="approval-table">
               <div class="approval-row approval-head"><span>申请编号 / 来源</span><span>申请人</span><span>申请类型</span><span>关联项目</span><span>提交时间</span><span>审批状态</span><span>操作</span></div>
-              <div v-for="item in visibleApprovals" :key="item.id" class="approval-row"><span><b>{{ item.id }}</b><small>{{ item.source }}</small></span><span>{{ item.applicant }}</span><span><i class="approval-type" :class="item.type === '调课申请' ? 'type-reschedule' : item.type === '换组申请' ? 'type-change' : 'type-makeup'">{{ item.type }}</i></span><span>{{ item.subject }}</span><span>{{ item.submitted }}</span><span><i class="approval-status" :class="{ pending: item.status === '待审批', approved: item.status === '已通过', rejected: item.status === '已驳回', cancelled: item.status === '已取消' }">{{ item.status }}</i></span><span><button @click="selectedApprovalId = item.id">{{ item.status === '待审批' ? '去审批' : '查看结果' }}</button></span></div>
+              <div v-for="item in visibleApprovals" :key="item.id" class="approval-row"><span><b>{{ item.id }}</b><small>{{ item.source }}</small></span><span>{{ item.applicant }}</span><span><i class="approval-type" :class="item.type === '调课申请' || item.type === '教师调课' ? 'type-reschedule' : item.type === '换组申请' || item.type === '场地调整' ? 'type-change' : item.type === '补做申请' || item.type === '代课申请' ? 'type-makeup' : 'type-reschedule'">{{ item.type }}</i></span><span>{{ item.subject }}</span><span>{{ item.submitted }}</span><span><i class="approval-status" :class="{ pending: item.status === '待审批', approved: item.status === '已通过', rejected: item.status === '已驳回', cancelled: item.status === '已取消' }">{{ item.status }}</i></span><span><button @click="selectedApprovalId = item.id">{{ item.status === '待审批' ? '去审批' : '查看结果' }}</button></span></div>
             </div>
+          </section>
+          <section class="system-panel admin-issue-panel">
+            <div class="system-panel-title"><div><h3>资源异常审核</h3><p>统一处理单台仪器故障和教师报废申请，学生分流完整后才能执行报废。</p></div><span class="admin-issue-total">{{ adminIssueSummary.total }} 条记录</span></div>
+            <div class="admin-issue-summary"><article><small>全部工单</small><strong>{{ adminIssueSummary.total }}</strong></article><article class="pending"><small>待审批</small><strong>{{ adminIssueSummary.pending }}</strong></article><article class="relocation"><small>待学生分流</small><strong>{{ adminIssueSummary.relocation }}</strong></article><article class="processing"><small>处理中</small><strong>{{ adminIssueSummary.processing }}</strong></article></div>
+            <div class="admin-issue-toolbar"><div><button type="button" :class="{ active: adminIssueTypeFilter === 'ALL' }" @click="adminIssueTypeFilter = 'ALL'">全部类型</button><button type="button" :class="{ active: adminIssueTypeFilter === 'EQUIPMENT_FAILURE' }" @click="adminIssueTypeFilter = 'EQUIPMENT_FAILURE'">故障上报</button><button type="button" :class="{ active: adminIssueTypeFilter === 'EQUIPMENT_SCRAP' }" @click="adminIssueTypeFilter = 'EQUIPMENT_SCRAP'">报废申请</button></div><label><span>⌕</span><input v-model="adminIssueKeyword" placeholder="搜索工单、教师或仪器号" /></label><select v-model="adminIssueStatusFilter"><option value="ALL">全部状态</option><option value="PENDING_REVIEW">待审批</option><option value="PROCESSING">检修中</option><option value="RELOCATION_REQUIRED">待分流</option><option value="RESOLVED">已恢复</option><option value="SCRAPPED">已报废</option><option value="REJECTED">已驳回</option></select></div>
+            <div class="admin-issue-list">
+              <article v-for="item in filteredAdminResourceIssues" :key="item.id" class="admin-issue-card" :class="{ scrap: item.issue_type === 'EQUIPMENT_SCRAP' }">
+                <header><div><i>{{ item.issue_type === 'EQUIPMENT_SCRAP' ? '报废' : '故障' }}</i><span><b>{{ item.report_no }}</b><small>{{ (item.created_at || '').slice(0, 16).replace('T', ' ') }} · {{ item.severity }}</small></span></div><em :class="item.status.toLowerCase()">{{ resourceStatusName(item.status) }}</em></header>
+                <div class="admin-issue-body"><section><small>仪器设备</small><strong>{{ item.asset?.instrument_no || '历史汇总工单' }}</strong><span>{{ item.asset?.equipment_name || '—' }} · {{ item.asset?.laboratory_name || labs.find(l => l.id === item.laboratory_id)?.name || '—' }}</span></section><section><small>上报教师</small><strong>{{ item.reporter?.name || '—' }}</strong><span>{{ item.reporter?.employee_no || '教师信息未加载' }}</span></section><section><small>教学影响</small><strong>{{ item.impact_course_count }} 门课程 · {{ item.impact_session_count }} 个场次</strong><span :class="{ warning: item.impact?.shortage }">{{ item.impact_student_count }} 名学生需分流</span></section><section><small>处置要求</small><strong>{{ item.impact?.shortage ? '必须先完成学生分流' : '当前容量满足要求' }}</strong><span v-if="item.source_issue">来源故障 {{ item.source_issue.report_no }}</span><span v-else>无关联来源工单</span></section></div>
+                <div v-if="item.issue_type === 'EQUIPMENT_FAILURE'" class="admin-repair-timeline">
+                  <section><small>检修开始</small><strong>{{ formatResourceTime(item.impact_start) }}</strong></section><i>→</i>
+                  <section><small>当前预计完成</small><strong>{{ formatResourceTime(item.impact_end) }}</strong></section>
+                  <template v-if="pendingExtensionForIssue(item.id)"><i>→</i><section class="extension"><small>申请延期至</small><strong>{{ formatResourceTime(pendingExtensionForIssue(item.id).proposed_end_time) }}</strong><em>待管理员确认</em></section></template>
+                  <template v-else-if="item.resolved_at"><i>→</i><section class="resolved"><small>实际检修完成</small><strong>{{ formatResourceTime(item.resolved_at) }}</strong></section></template>
+                </div>
+                <p>{{ item.description }}</p>
+                <footer><span v-if="item.impact?.shortage" class="relocation-warning">! 分流未完成前禁止最终报废</span><span v-else class="capacity-safe">✓ 无容量缺口</span><div><template v-if="item.status === 'PENDING_REVIEW'"><button type="button" class="danger" @click="reviewResourceIssue(item, false)">驳回</button><button type="button" class="primary" @click="reviewResourceIssue(item, true)">{{ item.issue_type === 'EQUIPMENT_SCRAP' ? '审核报废' : '批准检修' }}</button></template><button v-else-if="item.status === 'RELOCATION_REQUIRED' || (item.status === 'PROCESSING' && item.impact?.shortage)" type="button" class="primary" @click="generateRelocationPlans(item.id)">生成分流方案</button><small v-else>流程已处理</small></div></footer>
+              </article>
+              <div v-if="!filteredAdminResourceIssues.length" class="admin-issue-empty"><span>✓</span><strong>暂无符合条件的资源异常</strong><p>新的故障上报或报废申请会显示在这里。</p></div>
+            </div>
+            <section v-if="adminRepairUpdates.some(item => item.approval_status === 'PENDING')" class="repair-review-section"><header><div><h4>待确认检修进展</h4><p>教师提交的完成或延期申请</p></div><span>{{ adminRepairUpdates.filter(item => item.approval_status === 'PENDING').length }} 项</span></header><article v-for="item in adminRepairUpdates.filter(item => item.approval_status === 'PENDING')" :key="item.id"><span>↻</span><p><b>{{ item.update_type === 'COMPLETE_RESTORE' ? '单台仪器检修完成' : '申请延期检修' }}</b><small v-if="item.update_type === 'EXTEND_REPAIR'">申请延期至 {{ formatResourceTime(item.proposed_end_time) }}</small><small>{{ item.note || '教师提交了检修进展' }}</small></p><button type="button" @click="reviewRepairUpdate(item, false)">驳回</button><button type="button" class="primary" @click="reviewRepairUpdate(item, true)">确认并更新台账</button></article></section>
           </section>
         </template>
       </main>
+    </div>
+
+    <!-- 资源异常学生分流弹窗 -->
+    <div v-if="relocationModalOpen" class="system-dialog-backdrop" @click.self="relocationModalOpen = false">
+      <div class="relocation-modal" style="width:min(680px,95vw);max-height:85vh;overflow-y:auto;padding:24px;border-radius:12px;background:#fff;box-shadow:0 24px 60px rgba(7,32,48,.22)">
+        <header style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px">
+          <div><span style="display:grid;place-items:center;width:36px;height:36px;border-radius:8px;color:#e67e22;background:#fef5ec;font-size:18px">⇄</span></div>
+          <div style="flex:1;margin-left:10px"><h2 style="margin:0;font-size:15px">资源异常学生迁移方案</h2><p style="margin:2px 0 0;color:#84929e;font-size:8px">延期检修导致新场次受影响，以下为系统生成的迁移建议</p></div>
+          <button @click="relocationModalOpen = false" style="border:0;color:#80909b;background:transparent;font-size:20px">×</button>
+        </header>
+        <div v-if="relocationLoading" style="text-align:center;padding:30px;color:#84929e">生成分流方案中…</div>
+        <template v-else>
+          <article v-for="plan in relocationPlans" :key="plan.id" style="margin-bottom:14px;border:1px solid #dce4e8;border-radius:8px;padding:14px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+              <div>
+                <strong style="font-size:11px;color:#3c5261">方案 {{ plan.plan_no }}</strong>
+                <span style="margin-left:10px;font-size:8px;color:#657885">
+                  {{ fmtRelocationTarget(plan.source) }} · 需迁移 {{ plan.required_relocation_count }} 人
+                </span>
+              </div>
+              <span style="font-size:8px">
+                已安排 <b style="color:#287e81">{{ plan.planned_relocation_count }}</b> 人
+                <template v-if="plan.remaining_unresolved_count">
+                  · <b style="color:#e67e22">{{ plan.remaining_unresolved_count }}</b> 人暂无可行场次
+                </template>
+              </span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px">
+              <div v-for="item in plan.items" :key="item.student_id" style="display:flex;align-items:center;justify-content:space-between;padding:6px 10px;border:1px solid #e8edef;border-radius:5px;font-size:9px" :style="{ borderColor: item.status !== 'VALIDATED' ? '#f0dcc8' : '#e8edef', background: item.status !== 'VALIDATED' ? '#fffbf5' : '#fff' }">
+                <span><b style="color:#3c5261">{{ item.student_name }}</b><small style="color:#98a4ad;margin-left:6px">{{ item.student_no }}</small></span>
+                <span v-if="item.target_session_id" style="color:#607480;font-size:8px">{{ fmtRelocationTarget(item.target) }}</span>
+                <span v-else style="display:inline-block;padding:2px 6px;border-radius:3px;color:#a16c2e;background:#fbf1e1;font-size:7px">暂无可行场次</span>
+              </div>
+            </div>
+            <label v-if="adminResourceIssues.find(item => item.id === relocationIssueId)?.issue_type === 'EQUIPMENT_SCRAP'" style="display:flex;align-items:center;gap:6px;margin:8px 0;font-size:10px;color:#405864">
+              <input v-model="selectedRelocationPlanIds[plan.source_session_id]" type="radio" :name="`relocation-${plan.source_session_id}`" :value="plan.id" :disabled="plan.remaining_unresolved_count > 0"> 选择此场次方案
+            </label>
+            <div v-if="plan.status !== 'EXECUTED'" style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+              <button @click="relocationModalOpen = false" style="padding:7px 14px;border:1px solid #dce4e8;border-radius:5px;color:#657885;background:#fff;font-size:8px;cursor:pointer">关闭</button>
+              <button v-if="adminResourceIssues.find(item => item.id === relocationIssueId)?.issue_type !== 'EQUIPMENT_SCRAP'" :disabled="plan.remaining_unresolved_count > 0" @click="executeResourceRelocationPlan(plan.id)" style="padding:7px 14px;border:0;border-radius:5px;color:#fff;background:#27ae60;font-size:8px;cursor:pointer">执行迁移方案</button>
+            </div>
+            <div v-else style="text-align:right;margin-top:8px;color:#27ae60;font-size:9px">✓ 已执行</div>
+          </article>
+          <footer v-if="relocationPlans.length && adminResourceIssues.find(item => item.id === relocationIssueId)?.issue_type === 'EQUIPMENT_SCRAP'" style="display:flex;justify-content:flex-end;margin-top:12px">
+            <button @click="executeResourceRelocationPlan()" style="padding:9px 16px;border:0;border-radius:6px;color:#fff;background:#167a7d;cursor:pointer">执行全部分流并批准报废</button>
+          </footer>
+        </template>
+      </div>
     </div>
 
     <div v-if="planEditorOpen" class="system-dialog-backdrop" @click.self="planEditorOpen = false">
@@ -1525,13 +1988,76 @@ const selectedCandidate = computed(() => {
     </div>
 
     <div v-if="selectedApproval" class="system-dialog-backdrop" @click.self="selectedApprovalId = null">
-      <aside class="approval-detail">
+      <aside class="approval-detail" style="max-height:85vh;overflow-y:auto">
         <header><div><span>✓</span><div><h2>审批详情</h2><p>{{ selectedApproval.id }}</p></div></div><button @click="selectedApprovalId = null">×</button></header>
-        <dl><div><dt>申请人</dt><dd>{{ selectedApproval.applicant }}</dd></div><div><dt>申请类型</dt><dd><i class="approval-type" :class="selectedApproval.type === '调课申请' ? 'type-reschedule' : selectedApproval.type === '换组申请' ? 'type-change' : 'type-makeup'">{{ selectedApproval.type }}</i></dd></div><div><dt>原项目</dt><dd>{{ formatAdjustSession(selectedApproval.source_info?.session) || selectedApproval.source_info?.project_name || selectedApproval.subject }}</dd></div><div><dt>新项目</dt><dd>{{ formatAdjustSession(selectedApproval.target_info) || selectedApproval.subject }}</dd></div><div><dt>申请原因</dt><dd>{{ selectedApproval.reason_text || '—' }}</dd></div><div><dt>当前状态</dt><dd><i class="approval-status" :class="{ pending: selectedApproval.status === '待审批', approved: selectedApproval.status === '已通过', rejected: selectedApproval.status === '已驳回', cancelled: selectedApproval.status === '已取消' }">{{ selectedApproval.status }}</i></dd></div></dl>
+        <dl><div><dt>申请人</dt><dd>{{ selectedApproval.applicant }}</dd></div><div><dt>申请类型</dt><dd><i class="approval-type" :class="selectedApproval.type === '调课申请' || selectedApproval.type === '教师调课' ? 'type-reschedule' : selectedApproval.type === '换组申请' ? 'type-change' : 'type-makeup'">{{ selectedApproval.type }}</i></dd></div><div><dt>原项目/场次</dt><dd>{{ isTeacherType ? formatAdjustSession(selectedApproval.source_info) : (formatAdjustSession(selectedApproval.source_info?.session) || selectedApproval.source_info?.project_name || selectedApproval.subject) }}</dd></div><div><dt>目标安排</dt><dd>{{ selectedApproval.type === '代课申请' ? (selectedApproval.target_info?.teacher_name || '—') : (isTeacherType ? formatAdjustSession(selectedApproval.target_info) : (formatAdjustSession(selectedApproval.target_info) || selectedApproval.subject)) }}</dd></div><div><dt>申请原因</dt><dd>{{ selectedApproval.reason_text || '—' }}</dd></div><div><dt>当前状态</dt><dd><i class="approval-status" :class="{ pending: selectedApproval.status === '待审批', approved: selectedApproval.status === '已通过', rejected: selectedApproval.status === '已驳回', cancelled: selectedApproval.status === '已取消' }">{{ selectedApproval.status }}</i></dd></div></dl>
+        <section v-if="selectedApproval.validation_result?.affected_students?.length" class="rejection"><span>受影响学生（{{ selectedApproval.validation_result.affected_students.length }}人）</span><p v-for="student in selectedApproval.validation_result.affected_students" :key="student.student_id"><b>{{ student.name }} {{ student.student_no }}</b>：{{ student.reasons.join('、') }}</p><small>存在冲突时必须先选择覆盖全部学生的安置方案，批准时会在同一事务中完成学生换场次。</small><button type="button" class="remediation-generate" :disabled="remediationLoading" @click="generateRemediationPlans">{{ remediationLoading ? '正在生成…' : '生成学生安置方案' }}</button></section>
+        <section v-if="remediationPlans.length" class="remediation-plans"><span>请选择安置方案</span><label v-for="plan in remediationPlans" :key="plan.id" :class="{ active: selectedRemediationPlanId === plan.id }"><input v-model="selectedRemediationPlanId" type="radio" :value="plan.id"><div><b>方案 {{ plan.plan_no }} · {{ plan.summary?.description }}</b><p v-for="entry in plan.items" :key="entry.student_id">{{ entry.student_name }}：{{ entry.project_name }} · 第{{ entry.week_no }}周 {{ ['','周日','周一','周二','周三','周四','周五','周六'][entry.day_of_week] }} 第{{ entry.start_slot }}—{{ entry.end_slot }}节 · {{ entry.laboratory_name }}</p></div></label></section>
         <section v-if="selectedApproval.status === '已驳回'" class="rejection"><span>驳回理由</span><p>{{ selectedApproval.result }}</p></section>
         <footer v-if="selectedApproval.status === '待审批'"><button @click="openReject(selectedApproval.rawId)">驳回</button><button @click="approveApplication(selectedApproval.rawId)">通过</button></footer><footer v-else><button @click="selectedApprovalId = null">关闭</button></footer>
       </aside>
     </div>
+
+    <!-- 批量登记仪器 -->
+    <Teleport to="body">
+      <div v-if="registrationDialog" class="system-dialog-backdrop" @click.self="registrationDialog = null">
+        <form class="approval-detail equipment-registration-dialog" @submit.prevent="submitEquipmentRegistration">
+          <header><div><span>＋</span><div><h2>批量登记仪器</h2><p>系统将按现有编号规则连续生成唯一仪器号</p></div></div><button type="button" aria-label="关闭" @click="registrationDialog = null">×</button></header>
+          <section class="registration-target">
+            <div><small>实验室</small><strong>{{ registrationDialog.lab.name }}</strong></div>
+            <div><small>设备类型</small><strong>{{ registrationDialog.equipment.equipment_name }}</strong><span>{{ registrationDialog.equipment.model || '未填写型号' }}</span></div>
+            <div><small>当前台账</small><strong>{{ registrationDialog.equipment.total_quantity }}</strong><span>台 / 套</span></div>
+          </section>
+          <label class="registration-quantity"><span>本次登记数量</span><input v-model.number="registrationDialog.quantity" type="number" min="1" max="500" step="1" required /><small>新登记仪器默认设为可用，编号生成后不可修改。</small></label>
+          <div class="registration-preview"><span>登记完成后台账数量</span><strong>{{ registrationDialog.equipment.total_quantity + (Number(registrationDialog.quantity) || 0) }} 台 / 套</strong></div>
+          <footer><button type="button" @click="registrationDialog = null">取消</button><button type="submit" :disabled="registrationBusy">{{ registrationBusy ? '登记中…' : '确认登记' }}</button></footer>
+        </form>
+      </div>
+    </Teleport>
+
+    <!-- 单台仪器号与履历 -->
+    <Teleport to="body">
+      <div v-if="assetDialogOpen" class="system-dialog-backdrop" @click.self="assetDialogOpen = false">
+        <div class="approval-detail asset-ledger-dialog">
+          <header class="asset-ledger-header"><div><span>◇</span><div><h2>单台仪器台账</h2><p>{{ assetDialogTitle }}</p></div></div><button type="button" aria-label="关闭" @click="assetDialogOpen = false">×</button></header>
+          <section class="asset-ledger-summary">
+            <div><small>登记总数</small><strong>{{ labAssets.length }}</strong><span>台 / 套</span></div>
+            <div class="available"><small>当前可用</small><strong>{{ assetStatusSummary.available }}</strong><span>台 / 套</span></div>
+            <div class="attention"><small>异常 / 停用</small><strong>{{ assetStatusSummary.attention }}</strong><span>台 / 套</span></div>
+            <div><small>已报废</small><strong>{{ assetStatusSummary.scrapped }}</strong><span>永久留档</span></div>
+          </section>
+          <div class="asset-ledger-tools">
+            <label class="asset-ledger-search"><span>⌕</span><input v-model="assetSearch" placeholder="搜索仪器号" /></label>
+            <select v-model="assetStatusFilter"><option value="ALL">全部状态</option><option value="AVAILABLE">可用</option><option value="QUARANTINED">已隔离</option><option value="UNDER_REPAIR">检修中</option><option value="DISABLED">停用</option><option value="LOST">遗失</option><option value="SCRAPPED">已报废</option></select>
+            <span>显示 {{ filteredLabAssets.length }} / {{ labAssets.length }} 台</span>
+          </div>
+          <div class="asset-ledger-body">
+            <section class="asset-list-panel">
+              <div class="asset-list-head"><span>仪器号</span><span>状态</span><span>活动工单</span><span></span></div>
+              <div class="asset-list-scroll">
+                <button v-for="asset in filteredLabAssets" :key="asset.id" type="button" :class="{ active: selectedAsset?.id === asset.id }" @click="openAssetEvents(asset)">
+                  <b :title="asset.instrument_no">{{ asset.instrument_no }}</b><i :class="asset.status.toLowerCase()">{{ assetStatusName(asset.status) }}</i><span>{{ asset.active_issue?.report_no || '—' }}</span><em>›</em>
+                </button>
+                <p v-if="!filteredLabAssets.length" class="asset-list-empty">没有符合条件的仪器</p>
+              </div>
+            </section>
+            <section class="asset-detail-panel">
+              <template v-if="selectedAsset">
+                <div class="asset-detail-heading"><div><small>仪器号</small><h3>{{ selectedAsset.instrument_no }}</h3></div><i :class="selectedAsset.status.toLowerCase()">{{ assetStatusName(selectedAsset.status) }}</i></div>
+                <dl><div><dt>当前实验室</dt><dd>{{ selectedAsset.laboratory_name }}</dd></div><div><dt>活动工单</dt><dd>{{ selectedAsset.active_issue?.report_no || '无' }}</dd></div></dl>
+                <div class="asset-history-title"><strong>资产履历</strong><span>{{ assetEvents.length }} 条记录</span></div>
+                <div class="asset-history-list">
+                  <article v-for="event in assetEvents" :key="event.id"><i></i><div><b>{{ assetEventName(event.event_type) }}</b><p>{{ event.from_status ? `${assetStatusName(event.from_status)} → ` : '' }}{{ assetStatusName(event.to_status) }}</p><small>{{ (event.created_at || '').slice(0, 16).replace('T', ' ') }}</small></div></article>
+                  <p v-if="!assetEvents.length" class="asset-history-empty">暂无履历</p>
+                </div>
+              </template>
+              <div v-else class="asset-detail-placeholder"><span>◇</span><strong>选择一台仪器</strong><p>可查看资产状态、活动工单和完整履历</p></div>
+            </section>
+          </div>
+          <footer><button type="button" @click="assetDialogOpen = false">关闭</button></footer>
+        </div>
+      </div>
+    </Teleport>
 
     <!-- 添加实验室弹窗 -->
     <Teleport to="body">
@@ -1598,7 +2124,7 @@ const selectedCandidate = computed(() => {
     <!-- 添加实验课程弹窗 -->
     <Teleport to="body">
       <div v-if="addCourseDialogOpen" class="system-dialog-backdrop" @click.self="addCourseDialogOpen = false">
-        <form class="approval-detail" style="width:440px" @submit.prevent="addTeachingTask">
+        <form class="approval-detail course-dialog-form" style="width:440px" @submit.prevent="addTeachingTask">
           <header><div><span>＋</span><div><h2>添加实验课程</h2><p>从课程库中选择并创建教学任务</p></div></div><button type="button" @click="addCourseDialogOpen = false">×</button></header>
           <label style="display:block;margin-bottom:1rem">实验课程<select v-model="selectedCourseId" style="width:100%"><option value="" disabled>请选择课程</option><option v-for="c in availableCourses" :key="c.id" :value="c.id">{{ c.course_code }} {{ c.course_name }}</option></select></label>
           <div style="display:flex;gap:1rem;margin-bottom:1rem">
@@ -1628,18 +2154,19 @@ const selectedCandidate = computed(() => {
     <!-- 添加项目弹窗 -->
     <Teleport to="body">
       <div v-if="addProjectDialog" class="system-dialog-backdrop" @click.self="addProjectDialog = null">
-        <form class="approval-detail" style="width:500px;max-height:85vh;overflow-y:auto" @submit.prevent="saveAddProject">
+        <form class="approval-detail project-dialog-form" @submit.prevent="saveAddProject">
           <header><div><span>＋</span><div><h2>创建实验项目</h2><p>课程：{{ addProjectDialog.course.code }}</p></div></div><button type="button" @click="addProjectDialog = null">×</button></header>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
-            <label>项目编号 *<input v-model="addProjectDialog.project_code" placeholder="例：PROJ-001" style="width:100%" /></label>
             <label>项目名称 *<input v-model="addProjectDialog.project_name" placeholder="例：用单摆测量重力加速度" style="width:100%" /></label>
+            <div class="auto-code-note"><span>编号</span><strong>系统自动生成</strong><small>将按课程编号顺序生成并保证唯一</small></div>
             <label>类别<select v-model="addProjectDialog.category" style="width:100%"><option>BASIC</option><option>MECHANICS</option><option>ELECTRICITY</option><option>OPTICS</option><option>MODERN</option><option>OTHER</option></select></label>
             <label>所需学时<input v-model.number="addProjectDialog.required_slots" type="number" min="1" max="24" style="width:100%" /></label>
             <label>实验形式<select v-model="addProjectDialog.group_mode" @change="addProjectDialog.group_mode === 'GROUP' && Number(addProjectDialog.default_group_size) < 2 ? addProjectDialog.default_group_size = 2 : null" style="width:100%"><option value="INDIVIDUAL">单人实验</option><option value="GROUP">多人分组实验</option></select></label>
             <label v-if="addProjectDialog.group_mode === 'GROUP'">每组人数<input v-model.number="addProjectDialog.default_group_size" type="number" min="2" max="100" style="width:100%" /></label>
             <label>往届选择比<input v-model.number="addProjectDialog.historical_selection_ratio" type="number" min="0" max="1" step="0.01" style="width:100%" /></label>
+            <label>负责老师<div class="resource-picker"><div class="resource-chips"><span v-for="id in addProjectDialog.teacherIds" :key="id">{{ resourceOptionById(projectResourceOptions.teachers, id)?.name || id }}<button type="button" aria-label="移除老师" @click="removeResourceId(addProjectDialog.teacherIds, id)">×</button></span><small v-if="!addProjectDialog.teacherIds.length">暂未选择负责老师</small></div><select v-model="addProjectDialog.teacherChoice" @change="addResourceId(addProjectDialog.teacherIds, addProjectDialog.teacherChoice); addProjectDialog.teacherChoice = ''"><option value="">＋ 添加负责老师</option><option v-for="item in availableResourceOptions(projectResourceOptions.teachers, addProjectDialog.teacherIds)" :key="item.id" :value="item.id">{{ item.name }}</option></select></div></label>
+            <label>所需实验器材<div class="resource-picker"><div class="resource-chips"><span v-for="id in addProjectDialog.equipmentIds" :key="id">{{ resourceOptionById(projectResourceOptions.equipment, id)?.name || id }}<button type="button" aria-label="移除器材" @click="removeResourceId(addProjectDialog.equipmentIds, id)">×</button></span><small v-if="!addProjectDialog.equipmentIds.length">暂未选择实验器材</small></div><select v-model="addProjectDialog.equipmentChoice" @change="addResourceId(addProjectDialog.equipmentIds, addProjectDialog.equipmentChoice); addProjectDialog.equipmentChoice = ''"><option value="">＋ 添加实验器材</option><option v-for="item in availableResourceOptions(projectResourceOptions.equipment, addProjectDialog.equipmentIds)" :key="item.id" :value="item.id">{{ item.name }}{{ item.model ? ` · ${item.model}` : '' }}</option></select></div></label>
           </div>
-          <div style="margin:.75rem 0"><label><input v-model="addProjectDialog.reqType" value="REQUIRED" type="radio" /> 必做</label><label style="margin-left:1rem"><input v-model="addProjectDialog.reqType" value="OPTIONAL" type="radio" /> 选做</label></div>
           <footer><button type="button" @click="addProjectDialog = null">取消</button><button type="submit">创建并添加</button></footer>
         </form>
       </div>
@@ -1648,11 +2175,9 @@ const selectedCandidate = computed(() => {
     <!-- 编辑项目需求弹窗 -->
     <Teleport to="body">
       <div v-if="editProjectDialog" class="system-dialog-backdrop" @click.self="editProjectDialog = null">
-        <form class="approval-detail" style="width:400px" @submit.prevent="saveProjectDemand">
+        <form class="approval-detail project-dialog-form" @submit.prevent="saveProjectDemand">
           <header><div><span>✎</span><div><h2>编辑实验项目</h2><p>{{ editProjectDialog.name }}</p></div></div><button type="button" @click="editProjectDialog = null">×</button></header>
-          <label style="display:block;margin-bottom:1rem">预计容量（人次）<input v-model.number="editProjectDialog.capacity" type="number" min="1" style="width:100%" /></label>
-          <label style="display:block;margin-bottom:1rem">实验形式<select v-model="editProjectDialog.groupMode" @change="editProjectDialog.groupMode === 'GROUP' && editProjectDialog.groupSize < 2 ? editProjectDialog.groupSize = 2 : null" style="width:100%"><option value="INDIVIDUAL">单人实验</option><option value="GROUP">多人分组实验</option></select></label>
-          <label v-if="editProjectDialog.groupMode === 'GROUP'" style="display:block;margin-bottom:1rem">每组人数<input v-model.number="editProjectDialog.groupSize" type="number" min="2" max="100" style="width:100%" /></label>
+          <div class="project-dialog-grid"><label>预计容量（人次）<input v-model.number="editProjectDialog.capacity" type="number" min="1" /></label><label>实验形式<select v-model="editProjectDialog.groupMode" @change="editProjectDialog.groupMode === 'GROUP' && editProjectDialog.groupSize < 2 ? editProjectDialog.groupSize = 2 : null"><option value="INDIVIDUAL">单人实验</option><option value="GROUP">多人分组实验</option></select></label><label v-if="editProjectDialog.groupMode === 'GROUP'">每组人数<input v-model.number="editProjectDialog.groupSize" type="number" min="2" max="100" /></label><label>负责老师<div class="resource-picker"><div class="resource-chips"><span v-for="id in editProjectDialog.teacherIds" :key="id">{{ resourceOptionById(projectResourceOptions.teachers, id)?.name || id }}<button type="button" aria-label="移除老师" @click="removeResourceId(editProjectDialog.teacherIds, id)">×</button></span><small v-if="!editProjectDialog.teacherIds.length">暂未选择负责老师</small></div><select v-model="editProjectDialog.teacherChoice" @change="addResourceId(editProjectDialog.teacherIds, editProjectDialog.teacherChoice); editProjectDialog.teacherChoice = ''"><option value="">＋ 添加负责老师</option><option v-for="item in availableResourceOptions(projectResourceOptions.teachers, editProjectDialog.teacherIds)" :key="item.id" :value="item.id">{{ item.name }}</option></select></div></label><label>所需实验器材<div class="resource-picker"><div class="resource-chips"><span v-for="id in editProjectDialog.equipmentIds" :key="id">{{ resourceOptionById(projectResourceOptions.equipment, id)?.name || id }}<button type="button" aria-label="移除器材" @click="removeResourceId(editProjectDialog.equipmentIds, id)">×</button></span><small v-if="!editProjectDialog.equipmentIds.length">暂未选择实验器材</small></div><select v-model="editProjectDialog.equipmentChoice" @change="addResourceId(editProjectDialog.equipmentIds, editProjectDialog.equipmentChoice); editProjectDialog.equipmentChoice = ''"><option value="">＋ 添加实验器材</option><option v-for="item in availableResourceOptions(projectResourceOptions.equipment, editProjectDialog.equipmentIds)" :key="item.id" :value="item.id">{{ item.name }}{{ item.model ? ` · ${item.model}` : '' }}</option></select></div></label></div>
           <footer><button type="button" @click="editProjectDialog = null">取消</button><button type="submit">保存</button></footer>
         </form>
       </div>

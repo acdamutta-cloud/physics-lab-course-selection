@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
 import type { UserProfile } from '../api/auth'
 import { api } from '../api/client'
+import NotificationBell from './NotificationBell.vue'
 import { marked } from 'marked'
 import html2canvas from 'html2canvas'
 import jsPDF from 'jspdf'
@@ -23,7 +24,7 @@ type AdjustmentSession = {
 }
 type AdjustmentSource = { record_id: string; status: string; session: AdjustmentSession; available_for: AdjustmentRequestType[] }
 type AdjustmentCandidate = {
-  decision: 'ALLOW' | 'BLOCK' | 'REVIEW'; approval_route: 'AUTO' | 'ADMIN' | 'TEACHER'
+  decision: 'ALLOW' | 'BLOCK' | 'REVIEW'; approval_route: 'AUTO' | 'ADMIN' | 'TEACHER' | 'TEACHER_THEN_ADMIN'
   target: AdjustmentSession | null; violations: Array<{ code: string; message: string }>
 }
 type AdjustmentApplication = {
@@ -32,14 +33,45 @@ type AdjustmentApplication = {
   submitted_at?: string; created_at: string
 }
 type AiCard = { type: string; title: string; summary: string; data: Record<string, any> }
+type SelectionPlanItem = {
+  project_id: string
+  selected: Record<string, any>
+  alternatives: Array<Record<string, any>>
+  original_project_id?: string
+  original_project_name?: string
+  project_alternatives: Array<{
+    project_id: string; project_name: string; category: string
+    selected: Record<string, any>; alternatives: Array<Record<string, any>>
+    reasons: string[]; warnings: string[]
+  }>
+  adjusted: boolean
+  project_adjusted: boolean
+  status: 'PENDING' | 'SUCCEEDED' | 'FAILED'
+  result_message?: string
+}
+type SelectionPlanDraft = {
+  plan_id: string
+  name: string
+  coverage_status: 'COMPLETE' | 'PARTIAL'
+  items: SelectionPlanItem[]
+  retained_selections: Array<Record<string, any>>
+  reasons: string[]
+  warnings: string[]
+  version: number
+  status: 'EDITING' | 'READY' | 'EXECUTING' | 'PARTIAL' | 'COMPLETED' | 'EXPIRED'
+  confirmation_token?: string
+}
 type AiIntent =
   | 'GENERAL_CHAT'
   | 'OUT_OF_SCOPE'
-  | 'BUSINESS_RULE_QUERY'
+  | 'BASIC_INFO_QUERY'
   | 'CHECK_ELIGIBILITY'
   | 'EXPLAIN_CONFLICT'
-  | 'QUERY_TRAINING_PLAN'
+  | 'QUERY_CURRENT_SELECTION'
   | 'RECOMMEND_SELECTION'
+  | 'DESELECT_SELECTION'
+  | 'SYSTEM_GUIDE'
+  | 'START_ADJUSTMENT'
   | 'UNKNOWN'
 type AiMessageStatus = 'pending' | 'streaming' | 'completed' | 'error' | 'stopped'
 type AiMessage = {
@@ -62,6 +94,24 @@ type SelectionApiResponse = {
   } | null
   details?: Record<string, unknown>
 }
+type SelectedSession = {
+  session_id: string
+  project_id: string
+  course_id?: string
+  course_name: string
+  course_code: string
+  week_no: number
+  day_of_week: number
+  start_slot: number
+  end_slot: number
+  project_name: string
+  lab_name: string
+  teacher_name?: string
+}
+type PendingDeselection = {
+  sessions: SelectedSession[]
+  scopeLabel: string
+}
 
 const props = defineProps<{ user: UserProfile | null }>()
 const emit = defineEmits<{ logout: [] }>()
@@ -70,6 +120,8 @@ const sidebarOpen = ref(false)
 const toast = ref('')
 const selectingProjectId = ref<string | null>(null)
 const selectionFeedback = ref<Record<string, string>>({})
+const pendingDeselection = ref<PendingDeselection | null>(null)
+const deselectionBusy = ref(false)
 const courseFilter = ref('全部课程')
 const projectKeyword = ref('')
 const projectType = ref('全部')
@@ -94,21 +146,11 @@ const isStreaming = ref(false)
 const streamPhase = ref('')
 const activeController = shallowRef<AbortController | null>(null)
 const showJumpToLatest = ref(false)
-const studentNotifs = ref<Array<{ request_no: string; msg: string; time: string }>>([])
-const showStudentNotifs = ref(false)
-const studentUnread = computed(() => studentNotifs.value.length)
-
-async function fetchStudentNotifs() {
-  try {
-    const prev = studentNotifs.value.length
-    studentNotifs.value = await api.get<any[]>('/students/me/notifications')
-    // 有新通知（审批通过/驳回）自动刷新课表
-    if (studentNotifs.value.length > prev) await fetchDashboard()
-  } catch { studentNotifs.value = [] }
+// 提示铃：有新通知（审批通过/驳回）自动刷新课表
+async function handleNotifCountChange(count: number, previous: number) {
+  if (count > previous) await fetchDashboard()
 }
-async function readStudentNotif(idx: number, val: string) {
-  studentNotifs.value.splice(idx, 1)
-  await api.post('/students/me/notifications/read', { value: val }).catch(() => {})
+async function handleNotifRead() {
   await fetchDashboard() // 审批通过后刷新课表
 }
 
@@ -186,12 +228,24 @@ const messages = ref<AiMessage[]>([
     status: 'completed',
   },
 ])
+const latestRecommendationCards = ref<AiCard[]>([])
+const activeSelectionPlan = ref<SelectionPlanDraft | null>(null)
+const selectionPlanAnchorMessageId = ref('')
+const latestRecommendationMessageId = ref('')
+const selectionPlanBusy = ref(false)
+const selectionPlanPreview = ref<{ valid: boolean; new_count: number; adjusted_count: number; violations: string[] } | null>(null)
+const selectionConfirmationToken = ref('')
+const projectReplacementSessions = ref<Record<string, string>>({})
 
 const quickQuestions = [
-  '我的培养方案有哪些实验要求？',
-  '我还需要选择哪些项目？',
-  '为什么这个场次不能选？',
-  '帮我推荐三个选课方案。',
+  { icon: '📋', text: '我的培养方案有哪些实验要求？' },
+  { icon: '🎯', text: '我还需要选择哪些项目？' },
+  { icon: '❓', text: '为什么这个场次不能选？' },
+  { icon: '🧭', text: '帮我推荐选课方案。' },
+  { icon: '🔄', text: '我想调课，该怎么申请？' },
+  { icon: '✏️', text: '如何申请补做实验？' },
+  { icon: '⏰', text: '选课时间窗口是什么时候？' },
+  { icon: '↩️', text: '退选有什么限制？' },
 ]
 
 function createMessage(role: 'user' | 'assistant', text: string, status: AiMessageStatus): AiMessage {
@@ -244,7 +298,7 @@ function aiCardLines(card: AiCard): string[] {
   if (card.type === 'RECOMMENDATION') {
     const dayNames = ['日', '一', '二', '三', '四', '五', '六']
     const formatSession = (item: any) =>
-      `${item.project_name} · 第${item.week_no}周 周${dayNames[item.day_of_week - 1]} 第${item.start_slot}—${item.end_slot}节 · ${item.laboratory_name}`
+      `${item.project_name} · 第${item.week_no}周 周${dayNames[item.day_of_week - 1]} 第${item.start_slot}—${item.end_slot}节 · ${item.laboratory_name}${item.teacher_name ? ` · ${item.teacher_name}` : ''}`
     const lines: string[] = []
     if (card.data.coverage_status === 'PARTIAL') lines.push('当前为部分方案，尚有要求未覆盖')
     for (const item of (card.data.retained_selections || [])) {
@@ -269,6 +323,39 @@ function aiCardLines(card: AiCard): string[] {
     const warnings = card.data.warnings || []
     return [...violations, ...warnings].map((item: any) => item.message)
   }
+  if (card.type === 'DESELECTION') {
+    return (card.data.sessions || []).map((item: any) =>
+      `${item.course_name} · ${item.project_name} · 第${item.week_no}周${item.day_name} 第${item.start_slot}—${item.end_slot}节${item.teacher_name ? ` · ${item.teacher_name}` : ''}`
+    )
+  }
+  if (card.type === 'GUIDE') {
+    const guide = card.data.guide || {}
+    return [
+      ...(guide.steps || []).map((step: string, index: number) => `${index + 1}. ${step}`),
+      ...(guide.notices || []).map((notice: string) => `注意：${notice}`),
+    ]
+  }
+  if (card.type === 'APPLICATION_ENTRY') {
+    return (card.data.sources || []).map((source: AdjustmentSource) =>
+      adjustmentSessionText(source.session)
+    )
+  }
+  if (Array.isArray(card.data.course_progress)) {
+    const lines: string[] = []
+    for (const item of card.data.course_progress) {
+      if (!item.eligible) {
+        lines.push(`${item.course_name}：本学期暂不具备修读资格，不计入当前待选数量`)
+        continue
+      }
+      lines.push(
+        `${item.course_name}：必做已选择 ${item.required?.selected || 0}/${item.required?.total || 0}；` +
+        `选做已选择 ${item.optional?.selected || 0}/${item.optional?.minimum || 0}`
+      )
+    }
+    const remaining = card.data.summary?.total_remaining_to_select || 0
+    lines.push(`本学期还需新选择 ${remaining} 个实验项目`)
+    return lines
+  }
   if (Array.isArray(card.data.projects)) {
     return card.data.projects.slice(0, 8).map((item: any) =>
       `${item.project_name} · ${item.category_label || item.requirement_type || ''}`
@@ -280,6 +367,176 @@ function aiCardLines(card: AiCard): string[] {
     )
   }
   return []
+}
+
+function guideApplicationType(card: AiCard): ApplicationType | null {
+  if (card.type !== 'GUIDE') return null
+  const topic = String(card.data?.guide?.topic || card.data?.matches?.[0]?.topic || '')
+  if (topic === 'ADJUSTMENT_APPLICATION' || topic === 'RESCHEDULE_APPLICATION') return '调课申请'
+  if (topic === 'PROJECT_CHANGE_APPLICATION') return '换组申请'
+  if (topic === 'MAKEUP_APPLICATION') return '补做申请'
+  return null
+}
+
+async function openGuideApplication(card: AiCard) {
+  const type = guideApplicationType(card)
+  if (!type) return
+  navigate('applications')
+  await openApplication(type)
+  if (type === '调课申请') adjustmentMode.value = 'ai'
+}
+
+function hasAdjustmentPreferences(preferences: Record<string, any> | undefined) {
+  if (!preferences) return false
+  return Object.entries(preferences).some(([key, value]) => {
+    if (key === 'avoid_weekend' || key === 'avoid_evening') return value === true
+    if (Array.isArray(value)) return value.length > 0
+    return value !== null && value !== undefined && value !== '' && typeof value === 'object'
+  })
+}
+
+async function openAdjustmentEntry(card: AiCard, source: AdjustmentSource) {
+  const type = ({
+    RESCHEDULE: '调课申请',
+    PROJECT_CHANGE: '换组申请',
+    MAKEUP: '补做申请',
+  } as const)[card.data.request_type as AdjustmentRequestType]
+  if (!type) return
+  navigate('applications')
+  await openApplication(type)
+  if (!adjustmentSources.value.some(item => item.record_id === source.record_id)) {
+    showToast('该原实验当前已不符合申请条件，请重新选择')
+    return
+  }
+  adjustmentSourceId.value = source.record_id
+  if (hasAdjustmentPreferences(card.data.preferences)) {
+    adjustmentMode.value = 'ai'
+    adjustmentPreference.value = String(card.data.original_question || '')
+  }
+}
+
+function selectionSessionText(item: Record<string, any>): string {
+  return `${item.project_name} · 第${item.week_no}周${item.day_name || ''} 第${item.start_slot}—${item.end_slot}节 · ${item.laboratory_name}${item.teacher_name ? ` · ${item.teacher_name}` : ''}`
+}
+
+async function chooseSelectionPlan(card: AiCard, anchorMessageId = latestRecommendationMessageId.value) {
+  if (selectionPlanBusy.value) return
+  selectionPlanBusy.value = true
+  try {
+    activeSelectionPlan.value = await api.post<SelectionPlanDraft>('/students/me/selection-plans', {
+      plan: card.data,
+      preferences: card.data.preferences || {},
+    })
+    selectionPlanAnchorMessageId.value = anchorMessageId
+    selectionPlanPreview.value = null
+    selectionConfirmationToken.value = ''
+    showToast(`已选择${card.title}，可以逐项调整场次`)
+    await scrollToLatest(true)
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '方案已发生变化，请重新生成')
+  } finally {
+    selectionPlanBusy.value = false
+  }
+}
+
+async function changeSelectionPlanSession(projectId: string, sessionId: string) {
+  const plan = activeSelectionPlan.value
+  if (!plan || selectionPlanBusy.value) return
+  selectionPlanBusy.value = true
+  try {
+    activeSelectionPlan.value = await api.post<SelectionPlanDraft>(
+      `/students/me/selection-plans/${plan.plan_id}/items/${projectId}`,
+      { session_id: sessionId },
+    )
+    selectionPlanPreview.value = null
+    selectionConfirmationToken.value = ''
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '场次调整失败')
+  } finally {
+    selectionPlanBusy.value = false
+  }
+}
+
+async function loadOptionalProjectAlternatives(projectId: string) {
+  const plan = activeSelectionPlan.value
+  if (!plan || selectionPlanBusy.value) return
+  selectionPlanBusy.value = true
+  try {
+    const result = await api.post<{ plan: SelectionPlanDraft; alternatives: any[] }>(
+      `/students/me/selection-plans/${plan.plan_id}/items/${projectId}/project-alternatives`,
+      {},
+    )
+    activeSelectionPlan.value = result.plan
+    for (const alternative of result.alternatives) {
+      projectReplacementSessions.value[alternative.project_id] = alternative.selected.session_id
+    }
+    if (!result.alternatives.length) showToast('当前没有其他可行的选做项目')
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '选做项目推荐失败')
+  } finally {
+    selectionPlanBusy.value = false
+  }
+}
+
+async function replaceOptionalProject(sourceProjectId: string, targetProjectId: string) {
+  const plan = activeSelectionPlan.value
+  const sessionId = projectReplacementSessions.value[targetProjectId]
+  if (!plan || !sessionId || selectionPlanBusy.value) return
+  selectionPlanBusy.value = true
+  try {
+    activeSelectionPlan.value = await api.post<SelectionPlanDraft>(
+      `/students/me/selection-plans/${plan.plan_id}/items/${sourceProjectId}/replace-project`,
+      { target_project_id: targetProjectId, session_id: sessionId },
+    )
+    selectionPlanPreview.value = null
+    selectionConfirmationToken.value = ''
+    showToast('选做项目已替换，请重新校验方案')
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '选做项目替换失败')
+  } finally {
+    selectionPlanBusy.value = false
+  }
+}
+
+async function prepareSelectionPlan() {
+  const plan = activeSelectionPlan.value
+  if (!plan || selectionPlanBusy.value) return
+  selectionPlanBusy.value = true
+  try {
+    const result = await api.post<{ plan: SelectionPlanDraft; preview: any }>(
+      `/students/me/selection-plans/${plan.plan_id}/prepare`,
+      { version: plan.version },
+    )
+    activeSelectionPlan.value = result.plan
+    selectionPlanPreview.value = result.preview
+    selectionConfirmationToken.value = result.plan.confirmation_token || ''
+    showToast('方案校验通过，请确认执行')
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '方案校验未通过')
+  } finally {
+    selectionPlanBusy.value = false
+  }
+}
+
+async function executeSelectionPlan() {
+  const plan = activeSelectionPlan.value
+  if (!plan || !selectionConfirmationToken.value || selectionPlanBusy.value) return
+  selectionPlanBusy.value = true
+  try {
+    const result = await api.post<{ plan: SelectionPlanDraft; succeeded: number; failed: number }>(
+      `/students/me/selection-plans/${plan.plan_id}/execute`,
+      { confirmation_token: selectionConfirmationToken.value },
+    )
+    activeSelectionPlan.value = result.plan
+    selectionConfirmationToken.value = ''
+    selectionPlanPreview.value = null
+    await fetchDashboard()
+    showToast(`执行完成：${result.succeeded}个成功，${result.failed}个需要重新选择`)
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '方案执行失败')
+  } finally {
+    selectionPlanBusy.value = false
+  }
 }
 
 // ── 选课视图：从 API 数据展平项目，按周筛选场次 ──
@@ -395,10 +652,10 @@ const dashboard = ref<{
     prerequisites_passed: string[]; prerequisites_failed: string[]
     projects: Array<{ project_id: string; project_name: string; requirement_type: string; available_sessions: Array<{ id: string; week_no: number; day_of_week: number; start_slot: number; end_slot: number; lab_name: string; capacity: number; selected_count: number }> }>
   }>
-  selection: { selected_count: number; total_required: number; total_optional_pool: number; total_optional_min: number }
+  selection: { selected_count: number; total_required: number; total_optional_pool: number; total_optional_min: number; selection_window: { start_at: string; end_at: string; withdraw_end_at: string | null; status: string } | null }
   prerequisites: { passed: string[]; failed: string[] }
   next_lab: { week_no: number; day_of_week: number; start_slot: number; end_slot: number; project_name: string; lab_name: string } | null
-  selected_sessions: Array<{ session_id: string; week_no: number; day_of_week: number; start_slot: number; end_slot: number; project_name: string; lab_name: string; teacher_name?: string }>
+  selected_sessions: SelectedSession[]
 } | null>(null)
 
 async function fetchDashboard() {
@@ -407,6 +664,30 @@ async function fetchDashboard() {
     // 同步已选场次到本地状态
     selectedProjectIds.value = (dashboard.value?.selected_sessions || []).map((s: any) => s.session_id)
   } catch { /* API 不可用时保持 null */ }
+}
+
+async function fetchDashboardSummary() {
+  try {
+    dashboard.value = await api.get('/students/me/dashboard-summary')
+    selectedProjectIds.value = (dashboard.value?.selected_sessions || []).map((s: any) => s.session_id)
+  } catch { /* API 不可用时保持现有数据 */ }
+}
+
+async function fetchTimetable() {
+  try {
+    const timetable = await api.get<{
+      term: NonNullable<typeof dashboard.value>['term']
+      selected_sessions: SelectedSession[]
+    }>('/students/me/timetable')
+    if (dashboard.value) {
+      dashboard.value = {
+        ...dashboard.value,
+        term: timetable.term,
+        selected_sessions: timetable.selected_sessions || [],
+      }
+    }
+    selectedProjectIds.value = (timetable.selected_sessions || []).map((s: any) => s.session_id)
+  } catch { /* API 不可用时保留首页摘要中的课表数据 */ }
 }
 
 // 统一数据源：API 优先，mock 兜底
@@ -573,13 +854,13 @@ async function exportSchedule(format: 'png' | 'pdf') {
   exportBusy.value = false
 }
 
-const notifTimer = ref<ReturnType<typeof setInterval> | null>(null)
-onMounted(() => { fetchBitmap(); fetchDashboard(); fetchAdjustmentApplications(); fetchStudentNotifs(); notifTimer.value = setInterval(fetchStudentNotifs, 30000) })
-onBeforeUnmount(() => { if (notifTimer.value) clearInterval(notifTimer.value) })
+onMounted(() => { fetchBitmap(); fetchDashboardSummary(); fetchAdjustmentApplications() })
 
 function navigate(view: View) {
   activeView.value = view
   sidebarOpen.value = false
+  if (view === 'selection') fetchDashboard()
+  if (view === 'schedule') fetchTimetable()
   if (view === 'applications') fetchAdjustmentApplications()
 }
 
@@ -598,6 +879,27 @@ function selectionFailureMessage(resp: SelectionApiResponse, fallback: string) {
   return resp.message?.trim() || fallback
 }
 
+async function waitForSelectionResult(
+  initial: SelectionApiResponse,
+): Promise<SelectionApiResponse> {
+  if (initial.result !== 'processing') return initial
+  const requestId = initial.details?.request_id
+  if (typeof requestId !== 'string' || !requestId) {
+    throw new Error('选课请求编号缺失，请刷新后确认选课结果')
+  }
+  const deadline = Date.now() + 120_000
+  let waitMs = 500
+  while (Date.now() < deadline) {
+    await new Promise(resolve => window.setTimeout(resolve, waitMs))
+    const result = await api.get<SelectionApiResponse>(
+      `/students/me/selection-requests/${requestId}`,
+    )
+    if (result.result !== 'processing') return result
+    waitMs = Math.min(2000, waitMs + 250)
+  }
+  throw new Error('选课仍在后台处理中，请稍后刷新页面查看结果')
+}
+
 function showProjectFailure(id: string | number, message: string) {
   selectionFeedback.value = {
     ...selectionFeedback.value,
@@ -614,13 +916,103 @@ function clearProjectFailure(id: string | number) {
   selectionFeedback.value = next
 }
 
+// ── 选课时间窗口 ──
+const selectionWindow = computed(() => dashboard.value?.selection?.selection_window ?? null)
+const selectionWindowOpen = computed(() => {
+  const w = selectionWindow.value
+  if (!w || w.status !== 'OPEN') return false
+  const now = Date.now()
+  return now >= new Date(w.start_at).getTime() && now <= new Date(w.end_at).getTime()
+})
+const selectionWithdrawOpen = computed(() => {
+  const w = selectionWindow.value
+  if (!w || w.status !== 'OPEN') return false
+  const now = Date.now()
+  const deadline = w.withdraw_end_at
+    ? new Date(w.withdraw_end_at).getTime()
+    : new Date(w.end_at).getTime()
+  return now >= new Date(w.start_at).getTime() && now <= deadline
+})
+function formatWindowTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+// 窗口状态：unconfigured(未配置) / closed(管理员关闭) / pending(未开始) / open(开放中) / ended(已结束)
+const windowStatus = computed<'unconfigured' | 'closed' | 'pending' | 'open' | 'ended'>(() => {
+  const w = selectionWindow.value
+  if (!w) return 'unconfigured'
+  if (w.status !== 'OPEN') return 'closed'
+  const now = Date.now()
+  const start = new Date(w.start_at).getTime()
+  const end = new Date(w.end_at).getTime()
+  if (now < start) return 'pending'
+  if (now > end) return 'ended'
+  return 'open'
+})
+function windowCountdown(targetMs: number): string {
+  const diff = targetMs - Date.now()
+  if (diff <= 0) return ''
+  const days = Math.floor(diff / 86400000)
+  const hours = Math.floor((diff % 86400000) / 3600000)
+  const mins = Math.floor((diff % 3600000) / 60000)
+  if (days > 0) return `${days} 天 ${hours} 小时后`
+  if (hours > 0) return `${hours} 小时 ${mins} 分后`
+  return `${mins} 分钟后`
+}
+// 状态徽章与引导文案（提示与当前状态匹配，避免生硬的「已结束」）
+const windowStatusMeta = computed(() => {
+  const status = windowStatus.value
+  const w = selectionWindow.value
+  switch (status) {
+    case 'unconfigured':
+      return { label: '未配置', icon: '🕓', hint: '请等待管理员配置选课时间后选课' }
+    case 'closed':
+      return { label: '已关闭', icon: '🚫', hint: '选课窗口已被管理员关闭，如有疑问请联系老师' }
+    case 'pending':
+      return {
+        label: '未开始',
+        icon: '⏳',
+        hint: `距选课开始还有 ${windowCountdown(new Date(w!.start_at).getTime())}，可先浏览实验项目做好准备`,
+      }
+    case 'open':
+      return { label: '开放中', icon: '✅', hint: '当前可正常选课，名额有限请尽快确认' }
+    case 'ended': {
+      const deadline = w!.withdraw_end_at
+        ? new Date(w!.withdraw_end_at).getTime()
+        : new Date(w!.end_at).getTime()
+      const canWithdraw = Date.now() <= deadline
+      return {
+        label: '已结束',
+        icon: canWithdraw ? '✏️' : '🔒',
+        hint: canWithdraw
+          ? `选课已结束，已选课程如需调整，仍可在 ${formatWindowTime(w!.withdraw_end_at ?? w!.end_at)} 前退选`
+          : '选课与退选均已截止，如有特殊情况请联系老师处理',
+      }
+    }
+  }
+})
+function selectionWindowNoticeText(): string {
+  const w = selectionWindow.value
+  if (!w || w.status !== 'OPEN') return '选课暂未开放，请等待管理员配置选课时间。'
+  const now = Date.now()
+  if (now < new Date(w.start_at).getTime()) return '选课尚未开始。'
+  if (now > new Date(w.end_at).getTime()) return '选课已结束。'
+  return '当前不在选课时间范围内。'
+}
+
 async function toggleProject(id: string | number) {
   const project = displayProjects.value.find((item) => item.id === id)
   if (!project) return
   if (selectingProjectId.value === String(id)) return
   clearProjectFailure(id)
   if (selectedProjectIds.value.includes(id)) {
-    // 退选
+    // 退选（受退选截止时间限制）
+    if (!selectionWithdrawOpen.value) {
+      showProjectFailure(id, '当前不在可退选时间范围内。')
+      return
+    }
     try {
       const resp = await api.post<SelectionApiResponse>('/students/me/deselect-session', { session_id: id })
       if (resp.result === 'ok') {
@@ -640,12 +1032,21 @@ async function toggleProject(id: string | number) {
     showProjectFailure(id, '该场次名额已满，当前不能选择。')
     return
   }
+  if (!selectionWindowOpen.value) {
+    showProjectFailure(id, selectionWindowNoticeText())
+    return
+  }
   // 选课
   selectingProjectId.value = String(id)
   try {
-    const resp = await api.post<SelectionApiResponse>('/students/me/select-session', { session_id: id })
+    const admitted = await api.post<SelectionApiResponse>('/students/me/select-session', { session_id: id })
+    if (admitted.result === 'processing') {
+      showToast(admitted.message || '正在选课，请稍候……')
+    }
+    const resp = await waitForSelectionResult(admitted)
     if (resp.result === 'ok') {
       selectedProjectIds.value = [...selectedProjectIds.value, id]
+      clearProjectFailure(id)
       fetchDashboard() // 刷新数据
       showToast(`已选择”${project.name}”`)
     } else {
@@ -773,6 +1174,44 @@ function useAdjustmentRecommendation(card: any) {
   adjustmentStep.value = 3
 }
 
+async function executePendingDeselection(): Promise<string> {
+  const pending = pendingDeselection.value
+  if (!pending || deselectionBusy.value) return '当前没有等待确认的取消选课操作。'
+  deselectionBusy.value = true
+  const results: Array<{ session: SelectedSession; ok: boolean; message: string }> = []
+  try {
+    for (const target of pending.sessions) {
+      try {
+        const response = await api.post<SelectionApiResponse>(
+          '/students/me/deselect-session',
+          { session_id: target.session_id },
+        )
+        results.push({
+          session: target,
+          ok: response.result === 'ok',
+          message: response.message || (response.result === 'ok' ? '退选成功' : '退选失败'),
+        })
+      } catch (error) {
+        results.push({
+          session: target,
+          ok: false,
+          message: error instanceof Error ? error.message : '退选请求失败',
+        })
+      }
+    }
+    pendingDeselection.value = null
+    await fetchDashboard()
+    const succeeded = results.filter(item => item.ok)
+    const failed = results.filter(item => !item.ok)
+    const detailLines = results.map(item =>
+      `${item.ok ? '✓' : '✗'} ${item.session.course_name} · ${item.session.project_name}：${item.message}`
+    )
+    return `取消选课执行完成：${succeeded.length} 个成功，${failed.length} 个失败。\n\n${detailLines.join('\n')}`
+  } finally {
+    deselectionBusy.value = false
+  }
+}
+
 async function submitApplication() {
   if (!applicationReason.value.trim() || applicationReason.value.trim().length < 2) return showToast('请填写申请原因')
   if (!adjustmentPreview.value || adjustmentPreview.value.decision === 'BLOCK') return showToast('当前目标场次未通过校验')
@@ -810,6 +1249,51 @@ async function askAi(preset?: string) {
   if (isStreaming.value) return
   const question = (preset ?? aiInput.value).trim()
   if (!question) return
+  if (/^(确认取消|确认退选|确认全部取消)$/.test(question)) {
+    messages.value.push(createMessage('user', question, 'completed'))
+    aiInput.value = ''
+    const resultText = await executePendingDeselection()
+    messages.value.push(createMessage('assistant', resultText, 'completed'))
+    return
+  }
+  if (/^(保留选课|放弃取消|取消操作|暂不取消)$/.test(question) && pendingDeselection.value) {
+    messages.value.push(createMessage('user', question, 'completed'))
+    aiInput.value = ''
+    pendingDeselection.value = null
+    messages.value.push(createMessage('assistant', '已放弃本次取消操作，原有选课保持不变。', 'completed'))
+    return
+  }
+  const planChoice = question.match(/^选(?:择)?方案\s*([1-3])$/)
+  if (planChoice && latestRecommendationCards.value.length) {
+    const card = latestRecommendationCards.value[Number(planChoice[1]) - 1]
+    if (card) {
+      messages.value.push(createMessage('user', question, 'completed'))
+      aiInput.value = ''
+      await chooseSelectionPlan(card, latestRecommendationMessageId.value)
+      messages.value.push(createMessage('assistant', `已打开${card.title}的明细。你可以逐项更换场次，调整完成后请点击“校验并准备确认”。`, 'completed'))
+      return
+    }
+  }
+  if (/^(确认|确认执行)$/.test(question) && selectionConfirmationToken.value) {
+    messages.value.push(createMessage('user', question, 'completed'))
+    aiInput.value = ''
+    await executeSelectionPlan()
+    return
+  }
+  if (/(换.*选做项目|选做项目.*换|换.*项目)/.test(question) && activeSelectionPlan.value && activeSelectionPlan.value.status !== 'COMPLETED') {
+    const optionalItems = activeSelectionPlan.value.items.filter(item => item.selected.requirement_type === 'OPTIONAL')
+    const matched = optionalItems.find(item => question.includes(item.selected.project_name))
+      || (optionalItems.length === 1 ? optionalItems[0] : null)
+    messages.value.push(createMessage('user', question, 'completed'))
+    aiInput.value = ''
+    if (matched) {
+      await loadOptionalProjectAlternatives(matched.project_id)
+      messages.value.push(createMessage('assistant', `已为“${matched.selected.project_name}”查找同课程的其他选做项目，请在方案卡片中选择项目和场次。`, 'completed'))
+    } else {
+      messages.value.push(createMessage('assistant', '当前方案有多个选做项目，请说明要替换的项目名称，或点击对应卡片的“换选做项目”。', 'completed'))
+    }
+    return
+  }
   const userMessage = createMessage('user', question, 'completed')
   messages.value.push(userMessage)
   aiInput.value = ''
@@ -841,6 +1325,19 @@ async function askAi(preset?: string) {
           await appendCharacters(assistantMessage, String(data.text || ''), Boolean(data.replace))
         } else if (event === 'final') {
           pendingCards = Array.isArray(data.cards) ? data.cards : []
+          const recommendations = pendingCards.filter(card => card.type === 'RECOMMENDATION')
+          if (recommendations.length) {
+            latestRecommendationCards.value = recommendations
+            latestRecommendationMessageId.value = assistantMessage.id
+          }
+          const deselectionCard = pendingCards.find(card => card.type === 'DESELECTION')
+          const deselectionSessions = deselectionCard?.data?.sessions
+          if (Array.isArray(deselectionSessions) && deselectionSessions.length) {
+            pendingDeselection.value = {
+              sessions: deselectionSessions as SelectedSession[],
+              scopeLabel: deselectionCard?.data?.scope === 'ALL' ? '本学期全部选课' : 'AI匹配的选课',
+            }
+          }
           assistantMessage.intent = data.intent as AiIntent
         } else if (event === 'error') {
           throw new Error(String(data.message || '智能咨询服务暂时不可用'))
@@ -879,7 +1376,18 @@ function stopGeneration() {
 
 function clearConversation() {
   stopGeneration()
-  messages.value = messages.value.slice(0, 1)
+  const welcome = messages.value[0]
+  if (activeSelectionPlan.value && activeSelectionPlan.value.status !== 'COMPLETED') {
+    const anchor = createMessage('assistant', '当前未完成的选课方案已保留，可以继续调整和确认。', 'completed')
+    messages.value = [welcome, anchor]
+    selectionPlanAnchorMessageId.value = anchor.id
+  } else {
+    messages.value = [welcome]
+    activeSelectionPlan.value = null
+    selectionPlanAnchorMessageId.value = ''
+  }
+  latestRecommendationCards.value = []
+  latestRecommendationMessageId.value = ''
   showJumpToLatest.value = false
 }
 
@@ -909,7 +1417,7 @@ onBeforeUnmount(stopGeneration)
         <div><strong>需要帮助？</strong><small>AI 助手随时在线</small></div>
         <button type="button" @click="navigate('ai')">咨询</button>
       </div>
-      <button class="logout-button" type="button" @click="emit('logout')"><span>↪</span> 退出演示</button>
+      <button class="logout-button" type="button" @click="emit('logout')"><span>↪</span> 退出登录</button>
     </aside>
     <button v-if="sidebarOpen" class="sidebar-mask" aria-label="关闭导航" @click="sidebarOpen = false"></button>
 
@@ -918,7 +1426,7 @@ onBeforeUnmount(stopGeneration)
         <button class="menu-button" type="button" aria-label="打开导航" @click="sidebarOpen = true">☰</button>
         <div class="breadcrumb"><span>学生端</span><b>/</b>{{ activeView === 'home' ? '首页' : viewMeta[activeView].title }}</div>
         <div class="top-actions">
-          <div style="position:relative"><button class="notice-button" type="button" @click="showStudentNotifs=!showStudentNotifs">♢<i v-if="studentUnread">{{ studentUnread }}</i></button><div v-if="showStudentNotifs && studentUnread" style="position:absolute;right:0;top:36px;z-index:20;width:280px;max-height:300px;overflow-y:auto;background:#fff;border:1px solid #dce4e8;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:0"><div style="padding:8px 12px;border-bottom:1px solid #eee;font-size:9px;color:#657885">审批通知 · {{ studentUnread }} 条</div><div v-for="(n,i) in studentNotifs" :key="n.request_no" style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid #f5f5f5;font-size:8px;gap:8px"><div style="flex:1;min-width:0"><div style="color:#405562">{{ n.msg }}</div><div style="color:#919da7;margin-top:2px">{{ n.time }}</div></div><button @click="readStudentNotif(i, JSON.stringify(n))" style="flex-shrink:0;padding:2px 6px;border:1px solid #dce4e8;border-radius:3px;background:#fff;color:#277e82;font-size:7px;cursor:pointer">已读</button></div></div></div>
+          <NotificationBell fetch-path="/students/me/notifications" read-path="/students/me/notifications/read" :on-count-change="handleNotifCountChange" :on-read="handleNotifRead" />
           <div class="student-profile"><span>{{ userInitial }}</span><div><strong>{{ studentName }}</strong><small>{{ studentNo }}</small></div></div>
         </div>
       </header>
@@ -1080,6 +1588,25 @@ onBeforeUnmount(stopGeneration)
         </template>
 
         <template v-else-if="activeView === 'selection'">
+          <!-- 选课时间窗口提示 -->
+          <section class="schedule-notice window-notice" :class="`window-${windowStatus}`" style="margin-bottom:16px">
+            <span class="window-icon">{{ windowStatusMeta.icon }}</span>
+            <div class="window-body">
+              <template v-if="selectionWindow">
+                <div class="window-head">
+                  <strong>选课时间：{{ formatWindowTime(selectionWindow.start_at) }} — {{ formatWindowTime(selectionWindow.end_at) }}</strong>
+                  <em class="window-status">{{ windowStatusMeta.label }}</em>
+                </div>
+                <p v-if="selectionWindow.withdraw_end_at">选课结束后仍可退选至 {{ formatWindowTime(selectionWindow.withdraw_end_at) }}</p>
+                <p v-else>选课结束后不可退选</p>
+                <p class="window-hint">{{ windowStatusMeta.hint }}</p>
+              </template>
+              <template v-else>
+                <strong>选课暂未开放</strong>
+                <p class="window-hint">{{ windowStatusMeta.hint }}</p>
+              </template>
+            </div>
+          </section>
           <!-- 个人课表概览 -->
           <section class="panel-card" style="margin-bottom:16px;padding:16px">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -1151,8 +1678,8 @@ onBeforeUnmount(stopGeneration)
               <h3>{{ project.name }}</h3>
               <ul><li><span>▣</span>{{ project.week }} · {{ project.time }}</li><li><span>⌖</span>{{ project.room }}</li><li v-if="project.teacher"><span>◎</span>{{ project.teacher }}</li></ul>
               <div class="capacity"><span>名额</span><div><i :style="{ width: project.capacity ? `${((project.capacity - project.remaining) / project.capacity) * 100}%` : '0%' }"></i></div><b :class="{ danger: project.remaining <= 2 }">{{ project.remaining ? `余 ${project.remaining}` : '已满' }}</b></div>
-              <button type="button" :class="{ remove: selectedProjectIds.includes(project.id as any) }" :disabled="(project.remaining === 0 && !selectedProjectIds.includes(project.id as any)) || selectingProjectId === String(project.id)" @click="toggleProject(project.id)">
-                {{ selectingProjectId === String(project.id) ? '正在核验资格…' : selectedProjectIds.includes(project.id as any) ? '已选 · 点击退选' : project.remaining === 0 ? '名额已满' : '选择该项目' }}
+              <button type="button" :class="{ remove: selectedProjectIds.includes(project.id as any) }" :disabled="(project.remaining === 0 && !selectedProjectIds.includes(project.id as any)) || selectingProjectId === String(project.id) || (!selectionWindowOpen && !selectedProjectIds.includes(project.id as any))" @click="toggleProject(project.id)">
+                {{ selectingProjectId === String(project.id) ? '正在选课…' : selectedProjectIds.includes(project.id as any) ? '已选 · 点击退选' : project.remaining === 0 ? '名额已满' : '选择该项目' }}
               </button>
               <p v-if="selectionFeedback[String(project.id)]" class="selection-card-feedback" role="alert"><span>!</span>{{ selectionFeedback[String(project.id)] }}</p>
             </article>
@@ -1174,7 +1701,7 @@ onBeforeUnmount(stopGeneration)
               </div>
             </div>
           </section>
-          <section class="application-tip"><span>!</span><p>换时间在实时校验通过后自动执行；换项目由管理员审批；补做由原场次任课教师审批。所有提交都会再次核验时间冲突、项目顺序和目标名额。</p></section>
+          <section class="application-tip"><span>!</span><p>换时间在实时校验通过后自动执行；换项目由管理员审批；补做先由原场次任课教师审核，再由管理员复核。所有提交都会再次核验时间冲突、项目顺序和目标名额。</p></section>
         </template>
 
         <template v-else>
@@ -1182,7 +1709,9 @@ onBeforeUnmount(stopGeneration)
             <aside class="ai-guide">
               <div class="ai-intro"><span>✦</span><h3>实验智能助手</h3><p>基于课程规则与实验安排提供咨询</p></div>
               <div class="quick-question"><span>你可以这样问</span>
-                <button v-for="question in quickQuestions" :key="question" :disabled="isStreaming" @click="askAi(question)">{{ question }} <i>→</i></button>
+                <div class="quick-cards">
+                  <button v-for="question in quickQuestions" :key="question.text" type="button" :disabled="isStreaming" @click="askAi(question.text)"><i>{{ question.icon }}</i><b>{{ question.text }}</b></button>
+                </div>
               </div>
               <p class="ai-notice">回答依据当前培养方案、课表和选课规则；正式操作请在在线选课页面确认。</p>
             </aside>
@@ -1197,11 +1726,67 @@ onBeforeUnmount(stopGeneration)
                       <article v-for="(card, cardIndex) in item.cards" :key="cardIndex" :class="card.type.toLowerCase()">
                         <strong>{{ card.title }}</strong><small>{{ card.summary }}</small>
                         <ul><li v-for="line in aiCardLines(card)" :key="line">{{ line }}</li></ul>
+                        <button v-if="card.type === 'RECOMMENDATION'" type="button" class="ai-plan-use" :disabled="selectionPlanBusy" @click="chooseSelectionPlan(card, item.id)">选择此方案 →</button>
+                        <button v-if="guideApplicationType(card)" type="button" class="ai-plan-use" @click="openGuideApplication(card)">打开{{ guideApplicationType(card) }} →</button>
+                        <div v-if="card.type === 'APPLICATION_ENTRY' && card.data.sources?.length" class="ai-application-entry-actions">
+                          <button v-for="source in card.data.sources" :key="source.record_id" type="button" class="ai-plan-use" @click="openAdjustmentEntry(card, source)">以“{{ source.session.project_name }}”开始{{ card.data.request_type === 'RESCHEDULE' ? '调课' : card.data.request_type === 'PROJECT_CHANGE' ? '换组' : '补做' }} →</button>
+                        </div>
                       </article>
                     </div>
-                    <small>{{ item.role === 'assistant' ? (item.errorMessage || 'AI 助手') : '刚刚' }} <button v-if="item.status === 'error'" type="button" @click="retryMessage(index)">重新发送</button></small>
+                    <div v-if="item.id === selectionPlanAnchorMessageId" :id="`selection-plan-anchor-${item.id}`" class="ai-selection-plan-anchor"></div>
+                    <small>{{ item.role === 'assistant' ? (item.status === 'error' ? '发送失败' : (item.errorMessage || 'AI 助手')) : '刚刚' }} <button v-if="item.status === 'error'" type="button" @click="retryMessage(index)">重新发送</button></small>
                   </div>
                 </div>
+                <Teleport v-if="activeSelectionPlan && selectionPlanAnchorMessageId" :to="`#selection-plan-anchor-${selectionPlanAnchorMessageId}`">
+                <section class="ai-selection-plan">
+                  <header>
+                    <div><strong>{{ activeSelectionPlan.name }}</strong><small>{{ activeSelectionPlan.items.length }}个实验场次 · {{ activeSelectionPlan.coverage_status === 'COMPLETE' ? '完整方案' : '部分方案' }}</small></div>
+                    <i :class="activeSelectionPlan.status.toLowerCase()">{{ activeSelectionPlan.status === 'COMPLETED' ? '已完成' : activeSelectionPlan.status === 'PARTIAL' ? '部分完成' : activeSelectionPlan.status === 'READY' ? '待确认' : '可调整' }}</i>
+                  </header>
+                  <article v-for="planItem in activeSelectionPlan.items" :key="planItem.project_id" class="ai-selection-item" :class="planItem.status.toLowerCase()">
+                    <div class="ai-selection-item-main">
+                      <strong>{{ planItem.selected.project_name }}</strong>
+                      <small>{{ planItem.selected.course_name }} · {{ planItem.selected.requirement_type === 'REQUIRED' ? '必做' : '选做' }}</small>
+                      <span>{{ selectionSessionText(planItem.selected) }}</span>
+                      <em v-if="planItem.selected.reasons?.length">{{ planItem.selected.reasons.join('；') }}</em>
+                      <small v-if="planItem.project_adjusted" class="ai-project-adjusted">已从“{{ planItem.original_project_name }}”替换为当前选做项目</small>
+                      <div v-if="planItem.project_alternatives?.length" class="ai-project-alternatives">
+                        <article v-for="candidate in planItem.project_alternatives" :key="candidate.project_id">
+                          <div><strong>{{ candidate.project_name }}</strong><small>{{ candidate.selected.teacher_name || '教师待定' }} · {{ candidate.selected.display_time }} · 余{{ candidate.selected.remaining }}</small><em>{{ candidate.reasons.join('；') }}</em></div>
+                          <select v-model="projectReplacementSessions[candidate.project_id]">
+                            <option :value="candidate.selected.session_id">推荐：{{ candidate.selected.display_time }} · {{ candidate.selected.teacher_name }}</option>
+                            <option v-for="alternative in candidate.alternatives" :key="alternative.session_id" :value="alternative.session_id">备选：{{ alternative.display_time }} · {{ alternative.teacher_name }} · 余{{ alternative.remaining }}</option>
+                          </select>
+                          <button type="button" :disabled="selectionPlanBusy" @click="replaceOptionalProject(planItem.project_id, candidate.project_id)">采用此项目</button>
+                        </article>
+                      </div>
+                    </div>
+                    <div class="ai-selection-item-action">
+                      <select
+                        :value="planItem.selected.session_id"
+                        :disabled="selectionPlanBusy || planItem.status === 'SUCCEEDED' || activeSelectionPlan.status === 'READY'"
+                        @change="changeSelectionPlanSession(planItem.project_id, ($event.target as HTMLSelectElement).value)"
+                      >
+                        <option :value="planItem.selected.session_id">当前：{{ planItem.selected.display_time || selectionSessionText(planItem.selected) }}</option>
+                        <option v-for="alternative in planItem.alternatives" :key="alternative.session_id" :value="alternative.session_id">推荐：{{ alternative.display_time }} · 余{{ alternative.remaining }}</option>
+                      </select>
+                      <b v-if="planItem.status === 'SUCCEEDED'">✓ {{ planItem.result_message || '选课成功' }}</b>
+                      <b v-else-if="planItem.status === 'FAILED'" class="failed">✗ {{ planItem.result_message || '需要重新选择' }}</b>
+                      <small v-else-if="planItem.adjusted">已由你调整</small>
+                      <button v-if="planItem.selected.requirement_type === 'OPTIONAL' && planItem.status !== 'SUCCEEDED'" type="button" class="ai-project-change" :disabled="selectionPlanBusy || activeSelectionPlan.status === 'READY'" @click="loadOptionalProjectAlternatives(planItem.project_id)">换选做项目</button>
+                    </div>
+                  </article>
+                  <div v-if="selectionPlanPreview" class="ai-selection-confirm">
+                    <strong>即将新增{{ selectionPlanPreview.new_count }}个实验场次</strong>
+                    <span>其中{{ selectionPlanPreview.adjusted_count }}个场次已调整，当前校验通过。</span>
+                    <button type="button" :disabled="selectionPlanBusy" @click="executeSelectionPlan">确认执行</button>
+                  </div>
+                  <div v-else-if="activeSelectionPlan.status !== 'COMPLETED'" class="ai-selection-actions">
+                    <span>确认前不会占用名额或写入选课记录。</span>
+                    <button type="button" :disabled="selectionPlanBusy" @click="prepareSelectionPlan">{{ selectionPlanBusy ? '正在校验…' : '校验并准备确认' }}</button>
+                  </div>
+                </section>
+                </Teleport>
                 <button v-if="showJumpToLatest" type="button" class="jump-latest" @click="scrollToLatest(true)">回到最新消息 ↓</button>
               </div>
               <form class="ai-input" @submit.prevent="askAi()">
@@ -1240,7 +1825,7 @@ onBeforeUnmount(stopGeneration)
             <p v-if="!adjustmentCandidates.length" class="adjustment-empty">当前没有现有目标场次，需要管理员另行安排。</p>
           </template>
           <template v-else>
-            <label>告诉AI你的偏好<textarea v-model="adjustmentPreference" rows="3" placeholder="例如：第8周以后，最好周三下午，不要晚上"></textarea></label>
+            <label>告诉AI你的偏好<textarea v-model="adjustmentPreference" rows="3" placeholder="例如：第8周以后，最好周三下午，不要晚上，喜欢张老师"></textarea></label>
             <button type="button" class="adjustment-ai-button" :disabled="adjustmentLoading" @click="recommendAdjustment">{{ adjustmentLoading ? '正在核验场次…' : '生成推荐' }}</button>
             <p v-if="adjustmentAiText" class="adjustment-ai-answer">{{ adjustmentAiText }}</p>
             <button v-for="card in adjustmentAiCards" :key="card.data.target.session_id" type="button" class="adjustment-recommendation" @click="useAdjustmentRecommendation(card)"><strong>{{ adjustmentSessionText(card.data.target) }}</strong><small>{{ card.data.reasons?.join('；') || card.summary }}</small><i>采用此场次 →</i></button>
@@ -1249,7 +1834,7 @@ onBeforeUnmount(stopGeneration)
         </section>
 
         <section v-else-if="adjustmentStep === 3" class="adjustment-pane">
-          <div v-if="adjustmentPreview" class="adjustment-result" :class="adjustmentPreview.decision.toLowerCase()"><strong>{{ adjustmentPreview.decision === 'BLOCK' ? '当前不能提交' : '资格校验通过' }}</strong><p v-if="adjustmentPreview.target">{{ adjustmentSessionText(adjustmentPreview.target) }}</p><ul v-if="adjustmentPreview.violations.length"><li v-for="item in adjustmentPreview.violations" :key="item.code">{{ item.message }}</li></ul><small>审批方式：{{ adjustmentPreview.approval_route === 'AUTO' ? '系统自动审批' : adjustmentPreview.approval_route === 'TEACHER' ? '原场次任课教师审批' : '管理员审批' }}</small></div>
+          <div v-if="adjustmentPreview" class="adjustment-result" :class="adjustmentPreview.decision.toLowerCase()"><strong>{{ adjustmentPreview.decision === 'BLOCK' ? '当前不能提交' : '资格校验通过' }}</strong><p v-if="adjustmentPreview.target">{{ adjustmentSessionText(adjustmentPreview.target) }}</p><ul v-if="adjustmentPreview.violations.length"><li v-for="item in adjustmentPreview.violations" :key="item.code">{{ item.message }}</li></ul><small>审批方式：{{ adjustmentPreview.approval_route === 'AUTO' ? '系统自动审批' : adjustmentPreview.approval_route === 'TEACHER_THEN_ADMIN' ? '原场次任课教师初审 → 管理员复审' : adjustmentPreview.approval_route === 'TEACHER' ? '原场次任课教师审批' : '管理员审批' }}</small></div>
           <div class="dialog-actions"><button type="button" @click="adjustmentStep = 2">上一步</button><button type="button" :disabled="adjustmentPreview?.decision === 'BLOCK'" @click="adjustmentStep = 4">填写原因</button></div>
         </section>
 

@@ -1,7 +1,7 @@
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
 WEEKDAY_NAMES = ("周日", "周一", "周二", "周三", "周四", "周五", "周六")
 WeekdayName = Literal["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
@@ -33,11 +33,14 @@ def weekday_number(day_name: WeekdayName) -> int:
 ConsultationIntent = Literal[
     "GENERAL_CHAT",
     "OUT_OF_SCOPE",
-    "BUSINESS_RULE_QUERY",
+    "BASIC_INFO_QUERY",
     "CHECK_ELIGIBILITY",
     "EXPLAIN_CONFLICT",
-    "QUERY_TRAINING_PLAN",
+    "QUERY_CURRENT_SELECTION",
     "RECOMMEND_SELECTION",
+    "DESELECT_SELECTION",
+    "SYSTEM_GUIDE",
+    "START_ADJUSTMENT",
     "UNKNOWN",
 ]
 
@@ -66,6 +69,9 @@ StudentToolName = Literal[
     "check_selection_eligibility",
     "explain_selection_conflicts",
     "recommend_selection_plans",
+    "preview_deselection",
+    "lookup_operation_guide",
+    "prepare_adjustment_entry",
 ]
 
 StudentRuleTopic = Literal[
@@ -78,14 +84,15 @@ StudentRuleTopic = Literal[
     "TIME_CONFLICT",
     "APPLICATION_OCCUPANCY",
     "PROJECT_ORDER",
-    "TRAINING_PLAN",
     "OTHER",
 ]
 
 
 class EntityReference(BaseModel):
     course_name: str | None = None
+    course_names: list[str] = Field(default_factory=list, max_length=8)
     project_name: str | None = None
+    project_names: list[str] = Field(default_factory=list, max_length=16)
     teacher_name: str | None = None
     session_id: UUID | None = None
     week_no: int | None = Field(default=None, ge=1, le=18)
@@ -108,6 +115,13 @@ class RecommendationScope(BaseModel):
 
 class StudentAgentPlan(BaseModel):
     intent: ConsultationIntent
+    request_mode: Literal[
+        "ASK_CAPABILITY", "ASK_STEPS", "EXECUTE", "QUERY", "SAFETY_REFUSAL"
+    ] = "QUERY"
+    operation_stage: Literal["PLAN_DRAFT", "ENROLLED", "UNSPECIFIED"] = (
+        "UNSPECIFIED"
+    )
+    requested_application_type: Literal["RESCHEDULE", "PROJECT_CHANGE", "MAKEUP"] | None = None
     entity_reference: EntityReference | None = None
     preferences: "SelectionPreferences" = Field(
         default_factory=lambda: SelectionPreferences()
@@ -117,6 +131,7 @@ class StudentAgentPlan(BaseModel):
     recommendation_scope: RecommendationScope = Field(
         default_factory=RecommendationScope
     )
+    deselection_scope: Literal["TARGETED", "ALL"] = "TARGETED"
     needs_clarification: bool = False
     clarification_question: str | None = None
     direct_answer_allowed: bool = False
@@ -145,7 +160,15 @@ class SelectionEligibilityResult(BaseModel):
 
 
 class ConsultationCard(BaseModel):
-    type: Literal["ELIGIBILITY", "CONFLICT", "TRAINING_PLAN", "RECOMMENDATION"]
+    type: Literal[
+        "ELIGIBILITY",
+        "CONFLICT",
+        "TRAINING_PLAN",
+        "RECOMMENDATION",
+        "DESELECTION",
+        "GUIDE",
+        "APPLICATION_ENTRY",
+    ]
     title: str
     summary: str
     data: dict[str, object] = Field(default_factory=dict)
@@ -188,6 +211,19 @@ class SelectionPreferences(BaseModel):
     preferred_categories: list[
         Literal["BASIC", "MECHANICS", "ELECTRICITY", "OPTICS", "MODERN"]
     ] = Field(default_factory=list)
+    preferred_teacher_names: list[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("preferred_teacher_names")
+    @classmethod
+    def normalize_teacher_names(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            name = value.strip()
+            if name.endswith("老师"):
+                name = name[:-2].strip()
+            if name and name not in normalized:
+                normalized.append(name)
+        return normalized
 
     @model_validator(mode="after")
     def validate_consistent_preferences(self) -> Self:
@@ -214,7 +250,10 @@ class RecommendationSession(BaseModel):
     end_slot: int
     laboratory_name: str
     campus_name: str
+    teacher_id: UUID | None = None
+    teacher_name: str = ""
     remaining: int
+    preference_score: int = 0
     reasons: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 

@@ -20,7 +20,8 @@ class ApplicationRequest(AuditMixin, BaseModel):
     __table_args__ = (
         CheckConstraint(
             "request_type IN ('RESCHEDULE', 'MAKEUP', 'PROJECT_CHANGE', "
-            "'TEACHER_ADJUSTMENT', 'LAB_CHANGE', 'RESOURCE_ADJUSTMENT')",
+            "'TEACHER_ADJUSTMENT', 'LAB_CHANGE', 'RESOURCE_ADJUSTMENT', "
+            "'TEACHER_SUBSTITUTION')",
             name="request_type_allowed",
         ),
         CheckConstraint(

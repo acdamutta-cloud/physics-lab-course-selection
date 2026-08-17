@@ -6,12 +6,14 @@ from uuid import UUID
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload, selectinload
 
 from app.models.application import ApplicationRequest
 from app.models.curriculum import (
     AcademicTerm,
     CoursePrerequisite,
+    ExperimentCourse,
+    ExperimentProject,
     TrainingPlan,
     TrainingPlanCourse,
     TrainingPlanProject,
@@ -128,61 +130,66 @@ async def _load_context(
     session_id: UUID,
     lock_target: bool = False,
 ) -> _EligibilityContext | None:
-    student = await session.get(Student, student_id)
     target_stmt = (
-        select(ExperimentSession)
+        select(ExperimentSession, ScheduleVersion, AcademicTerm)
+        .join(
+            ScheduleVersion,
+            ScheduleVersion.id == ExperimentSession.schedule_version_id,
+        )
+        .join(AcademicTerm, AcademicTerm.id == ScheduleVersion.term_id)
         .options(
-            selectinload(ExperimentSession.project),
-            selectinload(ExperimentSession.laboratory),
+            joinedload(ExperimentSession.project),
+            joinedload(ExperimentSession.laboratory),
         )
         .where(ExperimentSession.id == session_id)
     )
     if lock_target:
-        target_stmt = target_stmt.with_for_update()
-    target = (await session.execute(target_stmt)).scalar_one_or_none()
-    if student is None or target is None:
+        target_stmt = target_stmt.with_for_update(of=ExperimentSession)
+    core = (await session.execute(target_stmt)).one_or_none()
+    if core is None:
         return None
+    target, schedule, term = core
 
-    schedule = await session.get(ScheduleVersion, target.schedule_version_id)
-    if schedule is None:
-        return None
-    term = await session.get(AcademicTerm, schedule.term_id)
-    if term is None:
-        return None
-
-    plan = (
+    student_plan = (
         await session.execute(
-            select(TrainingPlan)
-            .where(
-                TrainingPlan.major_id == student.major_id,
-                TrainingPlan.enrollment_year == student.enrollment_year,
-                TrainingPlan.status == "PUBLISHED",
+            select(Student, TrainingPlan)
+            .outerjoin(
+                TrainingPlan,
+                and_(
+                    TrainingPlan.major_id == Student.major_id,
+                    TrainingPlan.enrollment_year == Student.enrollment_year,
+                    TrainingPlan.status == "PUBLISHED",
+                ),
             )
+            .where(Student.id == student_id)
             .order_by(TrainingPlan.version_no.desc())
             .limit(1)
         )
-    ).scalar_one_or_none()
+    ).first()
+    if student_plan is None:
+        return None
+    student, plan = student_plan
     plan_course = None
     if plan is not None and target.project is not None:
         plan_course = (
-            await session.execute(
-                select(TrainingPlanCourse)
-                .options(
-                    selectinload(TrainingPlanCourse.course),
-                    selectinload(TrainingPlanCourse.projects).selectinload(
-                        TrainingPlanProject.project
-                    ),
-                    selectinload(TrainingPlanCourse.prerequisites).selectinload(
-                        CoursePrerequisite.prerequisite_course
-                    ),
-                    selectinload(TrainingPlanCourse.order_constraints),
-                )
-                .where(
-                    TrainingPlanCourse.plan_id == plan.id,
-                    TrainingPlanCourse.course_id == target.project.course_id,
+            (
+                await session.execute(
+                    select(TrainingPlanCourse)
+                    .options(
+                        joinedload(TrainingPlanCourse.prerequisites).joinedload(
+                            CoursePrerequisite.prerequisite_course
+                        ),
+                        joinedload(TrainingPlanCourse.order_constraints),
+                    )
+                    .where(
+                        TrainingPlanCourse.plan_id == plan.id,
+                        TrainingPlanCourse.course_id == target.project.course_id,
+                    )
                 )
             )
-        ).scalar_one_or_none()
+            .unique()
+            .scalar_one_or_none()
+        )
 
     bitmap = (
         await session.execute(
@@ -199,7 +206,7 @@ async def _load_context(
         (
             await session.execute(
                 select(StudentProjectRecord)
-                .options(selectinload(StudentProjectRecord.session))
+                .options(joinedload(StudentProjectRecord.session))
                 .where(
                     StudentProjectRecord.student_id == student.id,
                     StudentProjectRecord.term_id == term.id,
@@ -624,6 +631,7 @@ async def get_training_plan_context(
             {
                 "course_id": str(plan_course.course_id),
                 "course_name": plan_course.course.course_name,
+                "course_nature": plan_course.course_nature,
                 "study_year": plan_course.study_year,
                 "semester_no": plan_course.semester_no,
                 "completion_status": completion_status,
@@ -696,6 +704,7 @@ async def get_remaining_projects(
         sessions_by_project.setdefault(candidate.project_id, []).append(candidate)
 
     remaining: list[dict[str, object]] = []
+    course_progress: list[dict[str, object]] = []
     current_period = (
         int(context.get("current_study_year", 0)),
         int(context.get("current_semester", 0)),
@@ -703,23 +712,78 @@ async def get_remaining_projects(
     for course in context.get("courses", []):
         assert isinstance(course, dict)
         course_status = course.get("completion_status")
+        eligibility = course.get("eligibility", {})
+        eligibility_decision = (
+            eligibility.get("decision") if isinstance(eligibility, dict) else None
+        )
         course_eligible = (
-            course_status != "PASSED"
-            and current_period
-            >= (int(course.get("study_year", 0)), int(course.get("semester_no", 0)))
-            and all(
-                item.get("requirement_type") != "MUST_COMPLETE"
-                or item.get("status") == "PASSED"
-                for item in course.get("prerequisites", [])
+            eligibility_decision == "ALLOW"
+            if eligibility_decision is not None
+            else (
+                course_status != "PASSED"
+                and current_period
+                >= (
+                    int(course.get("study_year", 0)),
+                    int(course.get("semester_no", 0)),
+                )
+                and all(
+                    item.get("requirement_type") != "MUST_COMPLETE"
+                    or item.get("status") == "PASSED"
+                    for item in course.get("prerequisites", [])
+                )
             )
         )
-        for project in course.get("projects", []):
+        projects = [
+            item for item in course.get("projects", []) if isinstance(item, dict)
+        ]
+        required_projects = [
+            item for item in projects if item.get("requirement_type") == "REQUIRED"
+        ]
+        optional_projects = [
+            item for item in projects if item.get("requirement_type") == "OPTIONAL"
+        ]
+
+        def _progress(items: list[dict[str, object]]) -> tuple[int, int, int]:
+            completed = sum(
+                1 for item in items if item.get("student_status") == "COMPLETED"
+            )
+            arranged = sum(
+                1
+                for item in items
+                if item.get("student_status") in ACTIVE_PROJECT_STATUSES
+                and item.get("student_status") != "COMPLETED"
+            )
+            return completed, arranged, completed + arranged
+
+        required_completed, required_arranged, required_satisfied = _progress(
+            required_projects
+        )
+        optional_completed, optional_arranged, optional_satisfied = _progress(
+            optional_projects
+        )
+        optional_min = int(course.get("optional_project_min_count", 0) or 0)
+        required_remaining = (
+            max(0, len(required_projects) - required_satisfied)
+            if course_eligible
+            else 0
+        )
+        optional_remaining = (
+            max(0, optional_min - optional_satisfied) if course_eligible else 0
+        )
+        course_items: list[dict[str, object]] = []
+
+        for project in projects:
             if project.get("student_status") in ACTIVE_PROJECT_STATUSES:
                 category = (
                     "已完成"
                     if project.get("student_status") == "COMPLETED"
                     else "已选未完成"
                 )
+            elif (
+                project.get("requirement_type") == "OPTIONAL"
+                and optional_satisfied >= optional_min > 0
+            ):
+                category = "选做已达要求"
             elif not course_eligible:
                 category = "尚缺但课程层面无资格"
             else:
@@ -743,14 +807,94 @@ async def get_remaining_projects(
                     category = "尚缺但违反顺序"
                 else:
                     category = "尚缺但当前不可选"
-            remaining.append(
-                {
-                    **project,
-                    "course_name": course.get("course_name"),
-                    "category_label": category,
-                }
-            )
-    return {"projects": remaining}
+            item = {
+                **project,
+                "course_name": course.get("course_name"),
+                "category_label": category,
+            }
+            remaining.append(item)
+            course_items.append(item)
+
+        required_candidates = [
+            item
+            for item in course_items
+            if item.get("requirement_type") == "REQUIRED"
+            and item.get("category_label") == "尚缺且当前可选"
+        ]
+        optional_candidates = [
+            item
+            for item in course_items
+            if item.get("requirement_type") == "OPTIONAL"
+            and item.get("category_label") == "尚缺且当前可选"
+        ]
+        violations = (
+            eligibility.get("violations", []) if isinstance(eligibility, dict) else []
+        )
+        course_progress.append(
+            {
+                "course_id": course.get("course_id"),
+                "course_name": course.get("course_name"),
+                "eligible": course_eligible,
+                "eligibility_violations": violations,
+                "required": {
+                    "total": len(required_projects),
+                    "selected": required_satisfied,
+                    "completed": required_completed,
+                    "arranged_not_completed": required_arranged,
+                    "remaining_to_select": required_remaining,
+                    "candidates": required_candidates,
+                },
+                "optional": {
+                    "pool_total": len(optional_projects),
+                    "minimum": optional_min,
+                    "selected": optional_satisfied,
+                    "completed": optional_completed,
+                    "arranged_not_completed": optional_arranged,
+                    "remaining_to_select": optional_remaining,
+                    "candidates": optional_candidates,
+                },
+                "remaining_to_select": required_remaining + optional_remaining,
+            }
+        )
+
+    eligible_progress = [item for item in course_progress if item.get("eligible")]
+    summary = {
+        "required_total": sum(
+            int(item["required"]["total"]) for item in eligible_progress
+        ),
+        "required_completed": sum(
+            int(item["required"]["completed"]) for item in eligible_progress
+        ),
+        "required_arranged_not_completed": sum(
+            int(item["required"]["arranged_not_completed"])
+            for item in eligible_progress
+        ),
+        "required_remaining_to_select": sum(
+            int(item["required"]["remaining_to_select"]) for item in eligible_progress
+        ),
+        "optional_minimum": sum(
+            int(item["optional"]["minimum"]) for item in eligible_progress
+        ),
+        "optional_completed": sum(
+            int(item["optional"]["completed"]) for item in eligible_progress
+        ),
+        "optional_arranged_not_completed": sum(
+            int(item["optional"]["arranged_not_completed"])
+            for item in eligible_progress
+        ),
+        "optional_remaining_to_select": sum(
+            int(item["optional"]["remaining_to_select"]) for item in eligible_progress
+        ),
+    }
+    summary["total_remaining_to_select"] = (
+        summary["required_remaining_to_select"]
+        + summary["optional_remaining_to_select"]
+    )
+    return {
+        "summary": summary,
+        "course_progress": course_progress,
+        "projects": remaining,
+    }
 
 
 _PERIOD_BOUNDS: dict[TimePeriod, tuple[int, int]] = {
@@ -816,6 +960,11 @@ def _normalized_avoided_periods(
     return periods
 
 
+def _normalized_teacher_name(value: str) -> str:
+    name = value.strip()
+    return name[:-2].strip() if name.endswith("老师") else name
+
+
 def _preference_score(
     item: RecommendationSession,
     preferences: SelectionPreferences,
@@ -831,6 +980,15 @@ def _preference_score(
     if item.category in preferences.preferred_categories:
         score += 60
         reasons.append("符合项目模块偏好")
+    preferred_teachers = {
+        _normalized_teacher_name(name) for name in preferences.preferred_teacher_names
+    }
+    if (
+        preferred_teachers
+        and _normalized_teacher_name(item.teacher_name) in preferred_teachers
+    ):
+        score += 50
+        reasons.append(f"符合{item.teacher_name}教师偏好")
     preferred_day_numbers = {
         weekday_number(day_name) for day_name in preferences.preferred_days
     }
@@ -906,6 +1064,21 @@ def _preference_explanations(
             if item not in matched:
                 warnings.append(f"{item.project_name}未能安排在偏好的{labels}")
 
+    preferred_teachers = list(dict.fromkeys(preferences.preferred_teacher_names))
+    if preferred_teachers:
+        preferred_set = {_normalized_teacher_name(name) for name in preferred_teachers}
+        matched = [
+            item
+            for item in sessions
+            if _normalized_teacher_name(item.teacher_name) in preferred_set
+        ]
+        labels = "、".join(f"{name}老师" for name in preferred_teachers)
+        if matched:
+            reasons.append(f"{len(matched)}个新增场次符合{labels}偏好")
+        for item in sessions:
+            if item not in matched:
+                warnings.append(f"{item.project_name}未能安排给偏好的{labels}")
+
     avoided_periods = [
         period
         for period in _PERIOD_ORDER
@@ -978,6 +1151,145 @@ def _fixed_selection_preference_warnings(
     return warnings
 
 
+async def recommend_project_session_alternatives(
+    session: AsyncSession,
+    *,
+    student_id: UUID,
+    term: AcademicTerm,
+    project_id: UUID,
+    preferences: SelectionPreferences,
+    excluded_session_ids: set[UUID] | None = None,
+    plan_session_ids: set[UUID] | None = None,
+    limit: int = 3,
+) -> list[RecommendationSession]:
+    """Rank alternative sessions with the existing eligibility and preference rules."""
+
+    excluded_session_ids = excluded_session_ids or set()
+    plan_session_ids = plan_session_ids or set()
+    project = await session.get(ExperimentProject, project_id)
+    if project is None:
+        return []
+    course = await session.get(ExperimentCourse, project.course_id)
+    student = await session.get(Student, student_id)
+    if student is None:
+        return []
+    campus = await session.get(Campus, student.campus_id)
+    student_campus = campus.name if campus else ""
+    plan_sessions = (
+        [
+            value
+            for value in (
+                await session.execute(
+                    select(ExperimentSession).where(
+                        ExperimentSession.id.in_(plan_session_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        ]
+        if plan_session_ids
+        else []
+    )
+    candidates = list(
+        (
+            await session.execute(
+                select(ExperimentSession)
+                .options(
+                    selectinload(ExperimentSession.laboratory),
+                    selectinload(ExperimentSession.teacher),
+                )
+                .join(
+                    ScheduleVersion,
+                    ScheduleVersion.id == ExperimentSession.schedule_version_id,
+                )
+                .where(
+                    ScheduleVersion.term_id == term.id,
+                    ScheduleVersion.status == "PUBLISHED",
+                    ExperimentSession.project_id == project_id,
+                    ExperimentSession.status.in_({"DRAFT", "OPEN"}),
+                    ExperimentSession.selected_count < ExperimentSession.capacity,
+                    ExperimentSession.id.notin_(excluded_session_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    ranked: list[tuple[int, RecommendationSession]] = []
+    for candidate in candidates:
+        if any(sessions_overlap(candidate, selected) for selected in plan_sessions):
+            continue
+        eligibility = await check_selection_eligibility(
+            session, student_id=student_id, session_id=candidate.id
+        )
+        if not eligibility.eligible:
+            continue
+        laboratory = candidate.laboratory
+        candidate_campus = (
+            await session.get(Campus, laboratory.campus_id) if laboratory else None
+        )
+        item = RecommendationSession(
+            session_id=candidate.id,
+            project_id=project_id,
+            project_name=project.project_name,
+            course_name=course.course_name if course else "",
+            requirement_type=await _requirement_type_for_recommendation(
+                session, student_id=student_id, project_id=project_id
+            ),
+            category=project.category,
+            week_no=candidate.week_no,
+            day_of_week=candidate.day_of_week,
+            start_slot=candidate.start_slot,
+            end_slot=candidate.end_slot,
+            laboratory_name=laboratory.name if laboratory else "",
+            campus_name=candidate_campus.name if candidate_campus else "",
+            teacher_id=candidate.teacher_id,
+            teacher_name=candidate.teacher.name if candidate.teacher else "",
+            remaining=candidate.capacity - candidate.selected_count,
+        )
+        score, reasons, warnings = _preference_score(
+            item, preferences, student_campus=student_campus
+        )
+        item.preference_score = score
+        item.reasons = reasons
+        item.warnings = warnings
+        ranked.append((score + min(item.remaining, 10), item))
+    ranked.sort(
+        key=lambda pair: (
+            -pair[0],
+            pair[1].week_no,
+            pair[1].day_of_week,
+            pair[1].start_slot,
+        )
+    )
+    return [item for _, item in ranked[: max(1, limit)]]
+
+
+async def _requirement_type_for_recommendation(
+    session: AsyncSession, *, student_id: UUID, project_id: UUID
+) -> str:
+    student = await session.get(Student, student_id)
+    if student is None:
+        return "OPTIONAL"
+    value = await session.scalar(
+        select(TrainingPlanProject.requirement_type)
+        .join(
+            TrainingPlanCourse,
+            TrainingPlanCourse.id == TrainingPlanProject.plan_course_id,
+        )
+        .join(TrainingPlan, TrainingPlan.id == TrainingPlanCourse.plan_id)
+        .where(
+            TrainingPlan.major_id == student.major_id,
+            TrainingPlan.enrollment_year == student.enrollment_year,
+            TrainingPlan.status == "PUBLISHED",
+            TrainingPlanProject.project_id == project_id,
+        )
+        .limit(1)
+    )
+    return value or "OPTIONAL"
+
+
 async def recommend_selection_plans(
     session: AsyncSession,
     *,
@@ -1005,6 +1317,7 @@ async def recommend_selection_plans(
                 .options(
                     selectinload(ExperimentSession.project),
                     selectinload(ExperimentSession.laboratory),
+                    selectinload(ExperimentSession.teacher),
                 )
                 .join(
                     ScheduleVersion,
@@ -1026,6 +1339,16 @@ async def recommend_selection_plans(
         .scalars()
         .all()
     )
+    available_teacher_names = {
+        _normalized_teacher_name(item.teacher.name)
+        for item in sessions
+        if item.teacher is not None
+    }
+    unmatched_teacher_preferences = [
+        name
+        for name in preferences.preferred_teacher_names
+        if _normalized_teacher_name(name) not in available_teacher_names
+    ]
     # Project/course/plan metadata is loaded separately to avoid coupling the
     # recommendation path to dashboard serialization.
     plan_context = await get_training_plan_context(
@@ -1045,6 +1368,9 @@ async def recommend_selection_plans(
                     ),
                     selectinload(StudentProjectRecord.session).selectinload(
                         ExperimentSession.laboratory
+                    ),
+                    selectinload(StudentProjectRecord.session).selectinload(
+                        ExperimentSession.teacher
                     ),
                 )
                 .where(
@@ -1066,6 +1392,24 @@ async def recommend_selection_plans(
     satisfied_project_ids = {
         item.project_id for item in records if item.status in {"SELECTED", "COMPLETED"}
     }
+    # 选做项目若已达最低数量要求，其余未选项目也视为已满足
+    for course in plan_context.get("courses", []):
+        if not isinstance(course, dict):
+            continue
+        optional_min = course.get("optional_project_min_count", 0) or 0
+        if optional_min <= 0:
+            continue
+        optional_selected = sum(
+            1
+            for p in course.get("projects", [])
+            if isinstance(p, dict)
+            and p.get("requirement_type") == "OPTIONAL"
+            and UUID(str(p["project_id"])) in satisfied_project_ids
+        )
+        if optional_selected >= optional_min:
+            for p in course.get("projects", []):
+                if isinstance(p, dict) and p.get("requirement_type") == "OPTIONAL":
+                    satisfied_project_ids.add(UUID(str(p["project_id"])))
     locked_unsatisfied_ids = active_project_ids - satisfied_project_ids
 
     project_meta: dict[UUID, dict[str, object]] = {}
@@ -1211,11 +1555,14 @@ async def recommend_selection_plans(
             end_slot=candidate.end_slot,
             laboratory_name=laboratory.name if laboratory else "",
             campus_name=candidate_campus.name if candidate_campus else "",
+            teacher_id=candidate.teacher_id,
+            teacher_name=candidate.teacher.name if candidate.teacher else "",
             remaining=candidate.capacity - candidate.selected_count,
         )
         score, reasons, warnings = _preference_score(
             item, preferences, student_campus=student_campus
         )
+        item.preference_score = score
         item.reasons = reasons
         item.warnings = warnings
         raw_session_by_id[candidate.id] = candidate
@@ -1266,6 +1613,8 @@ async def recommend_selection_plans(
                 end_slot=raw.end_slot,
                 laboratory_name=laboratory.name if laboratory else "",
                 campus_name=candidate_campus.name if candidate_campus else "",
+                teacher_id=raw.teacher_id,
+                teacher_name=raw.teacher.name if raw.teacher else "",
                 remaining=max(raw.capacity - raw.selected_count, 0),
                 reasons=["该项目已经选择，作为方案中的固定安排"],
             )
@@ -1538,6 +1887,11 @@ async def recommend_selection_plans(
                 )
                 if warning not in warnings
             )
+            if unmatched_teacher_preferences:
+                warnings.append(
+                    "当前学期可用场次中未找到偏好教师："
+                    + "、".join(f"{name}老师" for name in unmatched_teacher_preferences)
+                )
             complete = not unmet and bool(scoped_courses)
             plan = RecommendationPlan(
                 name="",

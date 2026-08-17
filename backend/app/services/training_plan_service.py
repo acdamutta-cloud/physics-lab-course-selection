@@ -1,6 +1,7 @@
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crud import training_plans as tp_crud
@@ -532,6 +533,17 @@ async def create_course_project(
     if course_id not in courses:
         raise TrainingPlanError("课程不存在或已停用", 404)
     try:
+        if not data.project_code:
+            from app.models.curriculum import ExperimentCourse, ExperimentProject
+            course = await session.scalar(
+                select(ExperimentCourse).where(ExperimentCourse.id == course_id).with_for_update()
+            )
+            existing_codes = (await session.execute(
+                select(ExperimentProject.project_code).where(ExperimentProject.course_id == course_id)
+            )).scalars().all()
+            prefix = f"{course.course_code}-P"
+            numbers = [int(code[len(prefix):]) for code in existing_codes if code.startswith(prefix) and code[len(prefix):].isdigit()]
+            data.project_code = f"{prefix}{max(numbers, default=0) + 1:02d}"
         project = await tp_crud.create_course_project(
             session,
             course_id=course_id,

@@ -1,13 +1,14 @@
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_current_user
 from app.api.routers.training_plans import require_admin
 from app.db.session import get_db_session
 from app.schemas.auth import UserProfile
+from app.schemas.selection_window import SelectionWindowConfigRequest
 from app.schemas.teaching_task import (
     CreateTeachingTaskRequest,
     ProjectDemandOut,
@@ -24,6 +25,7 @@ from app.schemas.training_plan import (
 )
 from app.services import semester_course_service as sc_svc
 from app.services import training_plan_service as tp_svc
+from app.services import equipment_asset_service as asset_svc
 
 router = APIRouter(prefix="/admin", tags=["管理"])
 
@@ -117,6 +119,62 @@ async def update_active_term(
 ):
     require_admin(current_user)
     return await sc_svc.update_active_term(session, body)
+
+
+@router.get("/selection-window")
+async def get_selection_window(
+    session: AsyncSession = Depends(get_db_session),
+    current_user: UserProfile = Depends(get_current_user),
+):
+    """获取当前学期的选课时间窗口（未配置时返回 null）。"""
+
+    require_admin(current_user)
+    from app.services import selection_window_service as window_svc
+
+    term = await sc_svc.get_active_term(session)
+    window = await window_svc.get_term_window(session, term.id)
+    if window is None:
+        return None
+    return {
+        "id": str(window.id),
+        "term_id": str(window.term_id),
+        "start_at": window.start_at,
+        "end_at": window.end_at,
+        "withdraw_end_at": window.withdraw_end_at,
+        "status": window.status,
+    }
+
+
+@router.put("/selection-window")
+async def update_selection_window(
+    body: SelectionWindowConfigRequest,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: UserProfile = Depends(get_current_user),
+):
+    """配置当前学期的选课时间窗口，保存后立即生效（Redis 缓存同步失效）。"""
+
+    require_admin(current_user)
+    from app.services import selection_window_service as window_svc
+
+    term = await sc_svc.get_active_term(session)
+    try:
+        window = await window_svc.configure_term_window(
+            session,
+            term_id=term.id,
+            start_at=body.start_at,
+            end_at=body.end_at,
+            withdraw_end_at=body.withdraw_end_at,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        "id": str(window.id),
+        "term_id": str(window.term_id),
+        "start_at": window.start_at,
+        "end_at": window.end_at,
+        "withdraw_end_at": window.withdraw_end_at,
+        "status": window.status,
+    }
 
 
 @router.get("/teaching-tasks", response_model=TeachingTaskListResponse)
@@ -259,12 +317,17 @@ async def list_labs(
             eq_name = getattr(eq, "name", "")
             equip_list.append({
                 "id": str(inv.id),
+                "equipment_type_id": str(inv.equipment_type_id),
                 "equipment_name": eq_name,
                 "model": getattr(eq, "model", "") or "",
                 "total_quantity": inv.total_quantity,
                 "usable_quantity": inv.usable_quantity,
                 "disabled_quantity": inv.disabled_quantity,
-                "note": _get_equipment_note(inv.total_quantity, lab.safety_capacity),
+                "note": inv.usage_note or _get_equipment_note(inv.total_quantity, lab.safety_capacity),
+                "usage_note": inv.usage_note or "",
+                "students_per_unit": inv.students_per_unit,
+                "sharing_rule_status": inv.sharing_rule_status,
+                "sharing_rule_evidence": inv.sharing_rule_evidence,
             })
         result.append({
             "id": str(lab.id),
@@ -323,6 +386,7 @@ async def batch_create_lab_with_equipment(
     require_admin(current_user)
     from app.models.identity import Campus
     from app.models.resources import EquipmentType, LabEquipmentInventory, Laboratory
+    from app.services.equipment_usage_note_service import interpret_equipment_usage_note
     campus = (await session.execute(select(Campus).limit(1))).scalar_one()
     lab = Laboratory(
         lab_code=body.get("lab_code", body["name"][:8]),
@@ -353,13 +417,30 @@ async def batch_create_lab_with_equipment(
             session.add(existing_eq)
             await session.flush()
 
-        session.add(LabEquipmentInventory(
+        rule = interpret_equipment_usage_note(
+            eq_data.get("usage_note", eq_data.get("note"))
+        )
+        inventory = LabEquipmentInventory(
             laboratory_id=lab.id,
             equipment_type_id=existing_eq.id,
-            total_quantity=eq_data.get("total_quantity", 1),
-            usable_quantity=eq_data.get("usable_quantity", 1),
-            disabled_quantity=eq_data.get("total_quantity", 1) - eq_data.get("usable_quantity", 1),
-        ))
+            total_quantity=0,
+            usable_quantity=0,
+            disabled_quantity=0,
+            usage_note=rule.usage_note or None,
+            students_per_unit=rule.students_per_unit,
+            sharing_rule_status=rule.sharing_rule_status,
+            sharing_rule_source="SEMANTIC_PARSER" if rule.usage_note else None,
+            sharing_rule_evidence=rule.evidence,
+        )
+        session.add(inventory)
+        await session.flush()
+        total_quantity = int(eq_data.get("total_quantity", 1))
+        usable_quantity = int(eq_data.get("usable_quantity", total_quantity))
+        await asset_svc.batch_create_assets(
+            session, lab_id=lab.id, equipment_type_id=existing_eq.id,
+            quantity=total_quantity, available_quantity=usable_quantity,
+            actor_id=current_user.id, commit=False,
+        )
         equip_created += 1
 
     await session.commit()
@@ -373,7 +454,10 @@ async def add_lab_equipment(
     current_user: UserProfile = Depends(get_current_user),
 ):
     require_admin(current_user)
-    return await res_crud.add_equipment_to_lab(session, lab_id, body)
+    raise HTTPException(
+        status_code=410,
+        detail="汇总库存已改为只读，请使用批量登记单台仪器接口。",
+    )
 
 
 @router.put("/labs/{lab_id}/equipment/{inv_id}")
@@ -383,6 +467,11 @@ async def update_lab_equipment(
     current_user: UserProfile = Depends(get_current_user),
 ):
     require_admin(current_user)
+    if {"total_quantity", "usable_quantity", "disabled_quantity"} & body.keys():
+        raise HTTPException(
+            status_code=409,
+            detail="汇总数量由单台仪器状态自动计算，禁止直接修改。",
+        )
     inv = await res_crud.update_equipment_inventory(session, inv_id, body)
     if inv is None:
         raise HTTPException(status_code=404, detail="设备记录不存在")
@@ -391,6 +480,32 @@ async def update_lab_equipment(
         "total_quantity": inv.total_quantity,
         "usable_quantity": inv.usable_quantity,
         "disabled_quantity": inv.disabled_quantity,
+        "usage_note": inv.usage_note or "",
+        "students_per_unit": inv.students_per_unit,
+        "sharing_rule_status": inv.sharing_rule_status,
+        "sharing_rule_evidence": inv.sharing_rule_evidence,
+    }
+
+
+@router.post("/labs/{lab_id}/equipment/{inv_id}/interpret-usage-note")
+async def interpret_lab_equipment_usage_note(
+    lab_id: UUID, inv_id: UUID, body: dict,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    from app.models.resources import LabEquipmentInventory
+    from app.services.equipment_usage_note_service import interpret_equipment_usage_note
+
+    inv = await session.get(LabEquipmentInventory, inv_id)
+    if inv is None or inv.laboratory_id != lab_id:
+        raise HTTPException(status_code=404, detail="设备台账不存在。")
+    rule = interpret_equipment_usage_note(body.get("usage_note", body.get("note")))
+    return {
+        "usage_note": rule.usage_note,
+        "students_per_unit": rule.students_per_unit,
+        "sharing_rule_status": rule.sharing_rule_status,
+        "evidence": rule.evidence,
     }
 
 
@@ -401,6 +516,18 @@ async def delete_lab_equipment(
     current_user: UserProfile = Depends(get_current_user),
 ):
     require_admin(current_user)
+    from app.models.resources import EquipmentAsset
+
+    asset_count = await session.scalar(
+        select(func.count(EquipmentAsset.id)).where(
+            EquipmentAsset.current_inventory_id == inv_id
+        )
+    )
+    if asset_count:
+        raise HTTPException(
+            status_code=409,
+            detail="单台仪器资产不允许硬删除；报废请由教师发起并在资源异常中审批。",
+        )
     ok = await res_crud.delete_equipment_inventory(session, inv_id)
     if not ok:
         raise HTTPException(status_code=404, detail="设备记录不存在")
@@ -414,6 +541,90 @@ async def list_equipment_types(
     require_admin(current_user)
     items = await res_crud.get_active_equipment_types(session)
     return [{"id": str(e.id), "name": e.name, "model": e.model or "", "equipment_code": e.equipment_code} for e in items]
+
+
+@router.get("/labs/{lab_id}/equipment-assets")
+async def list_equipment_assets(
+    lab_id: UUID, equipment_type_id: UUID | None = None, status: str | None = None,
+    q: str = "", page: int = 1, page_size: int = 50,
+    session: AsyncSession = Depends(get_db_session), current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    return await asset_svc.list_lab_assets(
+        session, lab_id, equipment_type_id=equipment_type_id, status=status,
+        query=q, page=max(1, page), page_size=min(200, max(1, page_size)),
+    )
+
+
+@router.post("/labs/{lab_id}/equipment-assets/batch", status_code=201)
+async def create_equipment_assets(
+    lab_id: UUID, body: dict,
+    session: AsyncSession = Depends(get_db_session), current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    quantity = int(body.get("quantity", 0))
+    if quantity < 1 or quantity > 500:
+        raise HTTPException(status_code=422, detail="登记数量必须在 1 到 500 之间")
+    try:
+        assets = await asset_svc.batch_create_assets(session, lab_id=lab_id, equipment_type_id=UUID(body["equipment_type_id"]), quantity=quantity, actor_id=current_user.id)
+        return [{"id": str(item.id), "instrument_no": item.instrument_no, "status": item.status} for item in assets]
+    except (KeyError, ValueError, LookupError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/equipment-assets/{asset_id}/transfer")
+async def transfer_equipment_asset(
+    asset_id: UUID, body: dict,
+    session: AsyncSession = Depends(get_db_session), current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    try:
+        item = await asset_svc.transfer_asset(session, asset_id=asset_id, target_lab_id=UUID(body["target_laboratory_id"]), actor_id=current_user.id)
+        return {"id": str(item.id), "instrument_no": item.instrument_no, "status": item.status}
+    except (KeyError, ValueError, LookupError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.get("/equipment-assets/{asset_id}/events")
+async def list_equipment_asset_events(
+    asset_id: UUID, session: AsyncSession = Depends(get_db_session), current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    return await asset_svc.asset_events(session, asset_id)
+
+
+@router.get("/project-resource-options")
+async def list_project_resource_options(
+    session: AsyncSession = Depends(get_db_session),
+    current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    from app.models.identity import Teacher
+    from app.models.resources import EquipmentType
+    teachers = (await session.execute(select(Teacher).where(Teacher.status == "ACTIVE").order_by(Teacher.name))).scalars().all()
+    equipment = (await session.execute(select(EquipmentType).where(EquipmentType.status == "ACTIVE").order_by(EquipmentType.name))).scalars().all()
+    return {
+        "teachers": [{"id": str(item.id), "name": item.name} for item in teachers],
+        "equipment": [{"id": str(item.id), "name": item.name, "model": item.model or ""} for item in equipment],
+    }
+
+
+@router.put("/projects/{project_id}/resources")
+async def update_project_resources(
+    project_id: UUID, body: dict,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    try:
+        teacher_ids = [UUID(value) for value in body.get("teacher_ids", [])]
+        equipment_ids = [UUID(value) for value in body.get("equipment_ids", [])]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="教师或器材 ID 格式不正确")
+    ok = await sc_svc.update_project_resources(session, project_id, teacher_ids, equipment_ids)
+    if not ok:
+        raise HTTPException(status_code=404, detail="实验项目不存在")
+    return {"success": True}
 
 
 @router.get("/teachers/{teacher_id}/busy-bitmap")

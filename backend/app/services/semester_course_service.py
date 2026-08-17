@@ -104,8 +104,10 @@ async def _enrich_task_out(task, session: AsyncSession) -> TeachingTaskOut:
                 buffer_ratio=d.buffer_ratio,
                 required_capacity=d.required_capacity,
                 required_session_count=d.required_session_count,
-                teachers=teachers_map.get(d.project_id, []),
-                equipment=equipment_map.get(d.project_id, []),
+                teachers=[item[1] for item in teachers_map.get(d.project_id, [])],
+                equipment=[item[1] for item in equipment_map.get(d.project_id, [])],
+                teacher_ids=[item[0] for item in teachers_map.get(d.project_id, [])],
+                equipment_ids=[item[0] for item in equipment_map.get(d.project_id, [])],
             )
             for d in (task.demands or [])
         ],
@@ -386,6 +388,27 @@ async def update_project_demand(
         required_capacity=demand.required_capacity,
         required_session_count=demand.required_session_count,
     )
+
+
+async def update_project_resources(
+    session: AsyncSession, project_id: UUID, teacher_ids: list[UUID], equipment_ids: list[UUID]
+) -> bool:
+    """Replace the teachers and equipment configured for an experiment project."""
+    from sqlalchemy import delete, select
+    from app.models.curriculum import ExperimentProject
+    from app.models.identity import Teacher
+    from app.models.resources import EquipmentType, ProjectEquipmentRequirement, TeacherProjectQualification
+
+    if await session.get(ExperimentProject, project_id) is None:
+        return False
+    teachers = (await session.execute(select(Teacher).where(Teacher.id.in_(teacher_ids), Teacher.status == "ACTIVE"))).scalars().all() if teacher_ids else []
+    equipment = (await session.execute(select(EquipmentType).where(EquipmentType.id.in_(equipment_ids), EquipmentType.status == "ACTIVE"))).scalars().all() if equipment_ids else []
+    await session.execute(delete(TeacherProjectQualification).where(TeacherProjectQualification.project_id == project_id))
+    await session.execute(delete(ProjectEquipmentRequirement).where(ProjectEquipmentRequirement.project_id == project_id))
+    session.add_all([TeacherProjectQualification(project_id=project_id, teacher_id=item.id, status="ACTIVE") for item in teachers])
+    session.add_all([ProjectEquipmentRequirement(project_id=project_id, equipment_type_id=item.id, units_per_group=1, required=True) for item in equipment])
+    await session.commit()
+    return True
 
 
 async def sync_all_teaching_tasks(
