@@ -108,7 +108,7 @@ class Settings(BaseSettings):
     jwt_access_token_expire_minutes: int = Field(default=30, ge=1)
     jwt_refresh_token_expire_days: int = Field(default=7, ge=1)
 
-    model_provider: Literal["mock", "deepseek", "huggingface", "dashscope"] = "mock"
+    model_provider: Literal["deepseek", "huggingface", "dashscope"] = "dashscope"
     deepseek_api_key: SecretStr | None = None
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-v4-pro"

@@ -1,13 +1,13 @@
 from sqlalchemy import CheckConstraint, UniqueConstraint
 
-from app.models import Base
-from scripts.seed_demo_data import (
+from app.data.scheduling_rule_defaults import (
     NEW_SCHEDULING_SOFT_CONDITIONS,
     NEW_SCHEDULING_SOFT_RULES,
     RULE_SET_SPECS,
     RULE_SPECS,
     SCHEDULING_SOFT_RULE_INITIALS,
 )
+from app.models import Base
 
 
 def _constraint_sql(table_name: str) -> set[str]:

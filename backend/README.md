@@ -1,7 +1,7 @@
 # 物理实验智能排课系统后端
 
 当前目录为 FastAPI + PostgreSQL + Redis + LangGraph + OR-Tools 的后端框架。
-现阶段已包含初始数据库模型与模拟数据脚本，尚未实现具体业务接口。
+现阶段已包含初始数据库模型与业务接口实现。
 
 ## 1. 环境要求
 
@@ -148,20 +148,7 @@ docker compose down -v
 python -m scripts.init_database
 alembic revision --autogenerate -m "initial schema"
 alembic upgrade head
-python -m scripts.seed_demo_data
-python -m scripts.verify_demo_data
 ```
-
-模拟数据使用固定 UUID，可重复执行：
-
-- 10 个明确标注为模拟数据的工科专业；
-- 每个专业 5 个班，每班 40 人；
-- 每个专业 200 人，共 2000 名模拟学生；
-- 同步生成演示所需的课程、实验项目、教师、实验室、设备、规则和草稿排课数据。
-
-如果数据库中只存在一部分模拟数据，脚本会中止并提示人工检查，不会自动
-覆盖或删除已有记录。演示账号初始密码可通过 `DEMO_ACCOUNT_PASSWORD`
-注入，不应写入版本库。
 
 ## 7. 配置文件位置
 

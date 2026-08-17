@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -39,14 +38,6 @@ def test_dashscope_provider_requires_api_key() -> None:
 
     with pytest.raises(ValueError, match="DASHSCOPE_API_KEY"):
         settings.validate_runtime_secrets()
-
-
-def test_mock_provider_still_returns_no_chat_model() -> None:
-    with patch(
-        "app.agents.model_provider.get_settings",
-        return_value=SimpleNamespace(model_provider="mock"),
-    ):
-        assert get_chat_model() is None
 
 
 def test_huggingface_provider_builds_openai_compatible_chat_model() -> None:

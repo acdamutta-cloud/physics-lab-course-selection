@@ -20,8 +20,6 @@ docker compose up -d postgres redis
 # 初始化数据库（首次运行）
 python -m scripts.init_database
 alembic upgrade head
-python -m scripts.seed_demo_data
-python -m scripts.verify_demo_data
 
 # 启动后端（开发中，main.py 尚未实现路由）
 uvicorn app.main:app --reload --port 8000

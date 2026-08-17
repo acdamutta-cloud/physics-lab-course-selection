@@ -2,14 +2,13 @@ from datetime import date
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.curriculum import (
     AcademicTerm,
     ExperimentCourse,
-    ExperimentProject,
     TrainingPlan,
     TrainingPlanCourse,
     TrainingPlanProject,
@@ -19,7 +18,7 @@ from app.models.scheduling import ProjectDemand, TeachingTask, TeachingTaskCohor
 
 async def get_or_create_active_term(session: AsyncSession) -> AcademicTerm:
     """获取活跃学期。优先返回有教学任务数据的学期，否则创建当前学期。"""
-    # 1. 查找有教学任务的学期（含演示数据）
+    # 1. 查找有教学任务的学期
     task_term_stmt = (
         select(AcademicTerm)
         .join(TeachingTask, TeachingTask.term_id == AcademicTerm.id)

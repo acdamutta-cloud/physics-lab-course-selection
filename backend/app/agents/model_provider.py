@@ -21,12 +21,10 @@ def provider_failure_message(error: Exception) -> str | None:
     return None
 
 
-def get_chat_model() -> ChatOpenAI | None:
-    """Return the configured chat model; mock mode stays deterministic."""
+def get_chat_model() -> ChatOpenAI:
+    """Return the configured chat model."""
 
     settings = get_settings()
-    if settings.model_provider == "mock":
-        return None
     settings.validate_runtime_secrets()
     extra_body = None
     if settings.model_provider == "huggingface":

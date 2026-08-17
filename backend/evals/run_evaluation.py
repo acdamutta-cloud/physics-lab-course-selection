@@ -32,7 +32,7 @@ from evals.target import student_consultation_target
 
 
 def _configured_model_name() -> str:
-    provider = os.getenv("MODEL_PROVIDER", "mock").lower()
+    provider = os.getenv("MODEL_PROVIDER", "dashscope").lower()
     variables = {
         "dashscope": "DASHSCOPE_MODEL",
         "huggingface": "HUGGINGFACE_MODEL",
@@ -206,7 +206,7 @@ async def _run_experiment(
         client=client,
         metadata={
             "models": [_configured_model_name()],
-            "model_provider": os.getenv("MODEL_PROVIDER", "mock"),
+            "model_provider": os.getenv("MODEL_PROVIDER", "dashscope"),
             "prompts": ["student-planner-v2", "student-composer-v2"],
             "tools": ["student-consultation-readonly-tools"],
             "suite": suite,

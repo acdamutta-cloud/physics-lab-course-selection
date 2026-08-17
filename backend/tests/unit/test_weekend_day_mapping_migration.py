@@ -1,7 +1,7 @@
 from pathlib import Path
 from runpy import run_path
 
-from scripts.seed_demo_data import NEW_SCHEDULING_SOFT_CONDITIONS
+from app.data.scheduling_rule_defaults import NEW_SCHEDULING_SOFT_CONDITIONS
 
 MIGRATION_PATH = (
     Path(__file__).parents[2]
