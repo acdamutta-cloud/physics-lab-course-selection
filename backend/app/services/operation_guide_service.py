@@ -110,12 +110,19 @@ _DOCUMENT_FREQUENCY = Counter(
     for tokens in _DOCUMENT_TOKENS.values()
     for token in set(tokens)
 )
+_NORMALIZED_QUESTIONS_BY_GUIDE_ID = {
+    guide["guide_id"]: {
+        _normalize_question(question) for question in guide["questions"]
+    }
+    for guide in STUDENT_OPERATION_GUIDES
+}
 
 
 def bm25_search(query: str, *, limit: int = 10) -> list[tuple[str, float]]:
     query_tokens = tokenize_guide_text(query)
     if not query_tokens:
         return []
+    normalized_query = _normalize_question(query)
     total_documents = len(_DOCUMENT_TOKENS)
     scores: list[tuple[str, float]] = []
     k1 = 1.5
@@ -139,7 +146,14 @@ def bm25_search(query: str, *, limit: int = 10) -> list[tuple[str, float]]:
             score += inverse_document_frequency * frequency * (k1 + 1) / denominator
         if score > 0:
             scores.append((guide_id, score))
-    return sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
+    return sorted(
+        scores,
+        key=lambda item: (
+            normalized_query in _NORMALIZED_QUESTIONS_BY_GUIDE_ID[item[0]],
+            item[1],
+        ),
+        reverse=True,
+    )[:limit]
 
 
 async def create_embeddings(texts: Iterable[str]) -> list[list[float]]:

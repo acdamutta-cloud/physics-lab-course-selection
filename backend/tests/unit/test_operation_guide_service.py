@@ -1,6 +1,7 @@
 import asyncio
 
 import pytest
+
 from app.agents.nodes.student_advisor import build_cards, validate_plan
 from app.schemas.student_consultation import StudentAgentPlan, StudentToolRequest
 from app.services.operation_guide_service import bm25_search, search_operation_guides
@@ -116,6 +117,7 @@ def test_plan_draft_clarification_removes_tool_and_plan_label_entity() -> None:
     ("question", "guide_id"),
     [
         ("如何进行选课", "STUDENT-SELECTION-000"),
+        ("如何进行选课？", "STUDENT-SELECTION-000"),
         ("如何手动进行选课", "STUDENT-SELECTION-001"),
         ("个人操作选课", "STUDENT-SELECTION-001"),
     ],
