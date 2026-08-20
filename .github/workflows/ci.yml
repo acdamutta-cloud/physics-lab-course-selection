@@ -72,8 +72,14 @@ jobs:
             if curl --fail --silent http://127.0.0.1:8000/api/health >/dev/null; then
               exit 0
             fi
+            restart_count=$(docker inspect --format '{{.RestartCount}}' physics-lab-app 2>/dev/null || echo 0)
+            if [ "$restart_count" -ge 3 ]; then
+              docker compose logs --no-color --tail 80 app
+              exit 1
+            fi
             sleep 5
           done
+          docker compose logs --no-color --tail 80 app
           docker compose ps
           exit 1
       - name: Create an isolated administrator
