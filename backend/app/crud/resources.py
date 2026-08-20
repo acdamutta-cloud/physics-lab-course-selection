@@ -95,7 +95,7 @@ async def add_equipment_to_lab(
         usage_note=rule.usage_note or None,
         students_per_unit=rule.students_per_unit,
         sharing_rule_status=rule.sharing_rule_status,
-        sharing_rule_source="SEMANTIC_PARSER" if rule.usage_note else None,
+        sharing_rule_source=rule.source,
         sharing_rule_evidence=rule.evidence,
     )
     session.add(inv)
@@ -131,7 +131,7 @@ async def update_equipment_inventory(
         inv.usage_note = rule.usage_note or None
         inv.students_per_unit = rule.students_per_unit
         inv.sharing_rule_status = rule.sharing_rule_status
-        inv.sharing_rule_source = "SEMANTIC_PARSER" if rule.usage_note else None
+        inv.sharing_rule_source = rule.source
         inv.sharing_rule_evidence = rule.evidence
 
     await session.flush()

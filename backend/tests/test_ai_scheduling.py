@@ -433,6 +433,48 @@ def test_solver_enforces_teacher_and_lab_time_conflicts() -> None:
     assert len(occupied) == 8
 
 
+def test_solver_respects_two_slot_project_duration() -> None:
+    teacher = SolverTeacherOption(
+        UUID("00000000-0000-0000-0000-000000000101"),
+        "两节项目教师",
+    )
+    laboratory = SolverLabOption(
+        UUID("00000000-0000-0000-0000-000000000102"),
+        "LAB-2S",
+        "两节项目实验室",
+        20,
+    )
+    demand = SolverDemand(
+        task_id=UUID("00000000-0000-0000-0000-000000000103"),
+        course_id=UUID("00000000-0000-0000-0000-000000000104"),
+        course_name="两节实验课程",
+        project_id=UUID("00000000-0000-0000-0000-000000000105"),
+        project_name="两节连堂项目",
+        week_start=1,
+        week_end=1,
+        required_slots=2,
+        required_capacity=20,
+        occurrence_count=1,
+        teachers=(teacher,),
+        laboratories=(laboratory,),
+    )
+
+    result = solve_candidate(
+        demands=[demand],
+        days_per_week=1,
+        slots_per_day=8,
+        solver_weights={},
+        availability={},
+        target_teacher_ids=set(),
+        variation_seed=0,
+    )
+
+    assert result.hard_constraint_passed
+    assert len(result.sessions) == 1
+    session = result.sessions[0]
+    assert session.end_slot - session.start_slot + 1 == 2
+
+
 def test_solver_scores_target_course_sessions_after_preferred_week() -> None:
     teacher = SolverTeacherOption(
         UUID("00000000-0000-0000-0000-000000000011"),

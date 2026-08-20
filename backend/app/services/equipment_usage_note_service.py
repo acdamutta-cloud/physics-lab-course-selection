@@ -10,6 +10,7 @@ class EquipmentUsageRule:
     students_per_unit: int | None
     sharing_rule_status: str
     evidence: str | None = None
+    source: str = "SEMANTIC_PARSER"
 
 
 _CN_DIGITS = {
@@ -55,7 +56,13 @@ def interpret_equipment_usage_note(note: str | None) -> EquipmentUsageRule:
 
     raw = (note or "").strip()
     if not raw:
-        return EquipmentUsageRule("", None, "UNPARSED")
+        return EquipmentUsageRule(
+            usage_note="",
+            students_per_unit=1,
+            sharing_rule_status="CONFIRMED",
+            evidence="系统默认：一人一台",
+            source="SYSTEM_DEFAULT",
+        )
 
     compact = re.sub(r"[\s，,。；;：:]", "", raw)
     number = r"([0-9]+|[零一二两三四五六七八九十]{1,3})"

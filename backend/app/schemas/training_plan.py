@@ -27,6 +27,13 @@ class CourseInfo(BaseModel):
     course_type: Literal["EXPERIMENT", "THEORY"] = "EXPERIMENT"
 
 
+class CreateCourseRequest(BaseModel):
+    course_name: str = Field(min_length=1, max_length=100)
+    credits: Decimal = Field(ge=0, le=99, max_digits=4, decimal_places=1)
+    default_slots: int = Field(ge=1, le=24)
+    description: str | None = Field(default=None, max_length=2000)
+
+
 class ProjectInfo(BaseModel):
     id: UUID
     project_code: str
@@ -42,7 +49,7 @@ class CreateProjectRequest(BaseModel):
     project_code: str | None = Field(default=None, min_length=1, max_length=32)
     project_name: str = Field(min_length=1, max_length=150)
     category: ProjectCategory
-    required_slots: int = Field(ge=1, le=24)
+    required_slots: Literal[2, 4]
     group_mode: ProjectGroupMode | None = None
     default_group_size: int = Field(ge=1, le=100)
     historical_selection_ratio: Decimal = Field(ge=0, le=1, max_digits=6, decimal_places=4)

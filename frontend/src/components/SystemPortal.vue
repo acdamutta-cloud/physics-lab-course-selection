@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import '../asset-ledger.css'
 import '../resource-issue.css'
 import { api } from '../api/client'
@@ -143,8 +143,6 @@ const planMajor = ref('物理学（师范）')
 const planYear = ref('2024')
 const activePlanCourseId = ref(1)
 const planCourseSeed = ref(3)
-const customRequiredProject = ref('')
-const customOptionalProject = ref('')
 const selectedRequiredProject = ref('')
 const selectedOptionalProject = ref('')
 const planCourses = ref<PlanCourseRequirement[]>([])
@@ -154,20 +152,18 @@ const projectCatalog = ref<Record<string, ProjectInfo[]>>({})
 const plans = ref<PlanCard[]>([])
 const planDetails = ref<Record<string, PlanCourseRequirement[]>>({})
 const currentPlanId = ref<string | null>(null)
+const publishedPlanSourceId = ref<string | null>(null)
 const planKeyword = ref('')
 const planYearFilter = ref('全部年份')
 const plansLoading = ref(false)
 const savingPlan = ref(false)
-const projectEditorOpen = ref(false)
-const pendingProjectKind = ref<'required' | 'optional'>('required')
-const newProject = ref({
-  project_code: '',
-  project_name: '',
-  category: '',
-  required_slots: '',
-  group_mode: 'INDIVIDUAL' as ProjectGroupMode,
-  default_group_size: '',
-  historical_selection_ratio: '',
+const courseEditorOpen = ref(false)
+const creatingCourse = ref(false)
+const newCourse = ref({
+  course_name: '',
+  credits: '1.0',
+  default_slots: '4',
+  description: '',
 })
 const scheduleWeek = ref(1)
 
@@ -239,6 +235,7 @@ const semesterCourses = ref<Array<{
     _demandId: string
     _projectId: string
     name: string
+    requiredSlots: number
     groupMode: ProjectGroupMode
     groupSize: number
     expected: number
@@ -246,6 +243,7 @@ const semesterCourses = ref<Array<{
     equipment: string[]
   }>
 }>>([])
+const deletingProjectDemandId = ref<string | null>(null)
 
 const termInfo = ref<{ id: string; academic_year: string; semester_no: number; start_date: string; end_date: string; total_weeks: number; current_week: number } | null>(null)
 
@@ -412,6 +410,7 @@ async function fetchSemesterCourses(syncAll = false) {
           _demandId: d.id,
           _projectId: d.project.id,
           name: d.project.project_name,
+          requiredSlots: d.project.required_slots,
           groupMode: d.project.group_mode || 'INDIVIDUAL',
           groupSize: d.project.default_group_size || 1,
           expected: d.required_capacity,
@@ -542,12 +541,27 @@ async function saveProjectDemand() {
 }
 
 async function deleteProjectDemand(project: any, course: any) {
+  const projectId = String(project._projectId || '')
+  if (!projectId || deletingProjectDemandId.value === projectId) return
   if (!confirm(`确定删除项目"${project.name}"吗？`)) return
+  deletingProjectDemandId.value = projectId
   try {
-    await api.delete(`/admin/teaching-tasks/${course._taskId}/demands/${project._demandId}`)
+    await api.delete(`/admin/courses/${course._courseId}/projects/${projectId}`)
     showToast('项目已删除')
-    await fetchSemesterCourses()
-  } catch (err) { showToast(err instanceof Error ? err.message : '删除失败') }
+    await Promise.all([
+      fetchSemesterCourses(),
+      refreshCourseProjectCatalog(course._courseId),
+    ])
+  } catch (err) {
+    await Promise.allSettled([
+      fetchSemesterCourses(),
+      refreshCourseProjectCatalog(course._courseId),
+    ])
+    const message = err instanceof Error ? err.message : '删除失败'
+    showToast(message.includes('不存在') ? '项目已不存在，列表已刷新' : message)
+  } finally {
+    deletingProjectDemandId.value = null
+  }
 }
 
 const addProjectDialog = ref<{
@@ -589,13 +603,21 @@ async function saveAddProject() {
     await api.put(`/admin/projects/${project.id}/resources`, { teacher_ids: d.teacherIds, equipment_ids: d.equipmentIds })
     await api.post(`/admin/teaching-tasks/${d.course._taskId}/demands`, { project_id: project.id, requirement_type: 'REQUIRED' })
     addProjectDialog.value = null
+    try {
+      await Promise.all([
+        fetchSemesterCourses(),
+        refreshCourseProjectCatalog(courseOpt.id),
+      ])
+    } catch {
+      showToast('项目已创建，但列表刷新失败，请刷新页面')
+      return
+    }
     showToast('项目已创建并添加')
-    await fetchSemesterCourses()
   } catch (err) { showToast(err instanceof Error ? err.message : '添加失败') }
 }
 
 const labs = ref<Array<{
-  id: string; name: string; room_type: string; safety_capacity: number; status: string
+  id: string; lab_code: string; name: string; room_type: string; safety_capacity: number; status: string
   equipment: Array<{ id: string; equipment_type_id: string; equipment_name: string; model: string; total_quantity: number; usable_quantity: number; note?: string }>
 }>>([])
 const labAssets = ref<any[]>([])
@@ -607,6 +629,12 @@ const assetSearch = ref('')
 const assetStatusFilter = ref('ALL')
 const registrationDialog = ref<{ lab: any; equipment: any; quantity: number } | null>(null)
 const registrationBusy = ref(false)
+const deletingEquipmentInventoryId = ref<string | null>(null)
+const newLabEquipmentDialog = ref<{
+  lab: any; name: string; model: string; quantity: number
+  availableQuantity: number; usageNote: string
+} | null>(null)
+const addingLabEquipment = ref(false)
 
 const filteredLabAssets = computed(() => {
   const keyword = assetSearch.value.trim().toLowerCase()
@@ -664,16 +692,20 @@ async function fetchLabs() {
       scheduleLab.value = labs.value[0].name
       activeLab.value = labs.value[0].name
     }
-  } catch { /* keep empty */ }
+    return true
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '实验室列表刷新失败')
+    return false
+  }
 }
 
 // ── 添加实验室 ──
 const addLabDialogOpen = ref(false)
-const newLab = ref({ name: '', safety_capacity: 24 })
+const newLab = ref({ lab_code: '', name: '', safety_capacity: 24 })
 const newLabEquip = ref<Array<{ name: string; model: string; total: number; usable: number; note: string }>>([])
 
 function openAddLabDialog() {
-  newLab.value = { name: '', safety_capacity: 24 }
+  newLab.value = { lab_code: '', name: '', safety_capacity: 24 }
   newLabEquip.value = []
   addLabDialogOpen.value = true
 }
@@ -734,21 +766,100 @@ async function submitEquipmentRegistration() {
   finally { registrationBusy.value = false }
 }
 
-async function saveNewLab() {
-  if (!newLab.value.name) { showToast('请填写实验室名称'); return }
+async function deleteLabEquipment(lab: any, equipment: any) {
+  if (!window.confirm(
+    `确认删除“${equipment.equipment_name}”的设备台账吗？\n\n`+
+    '只有未关联任何单台仪器资产的空台账可以删除；已有永久仪器号的资产不会被删除。',
+  )) return
+  deletingEquipmentInventoryId.value = equipment.id
   try {
-    await api.post('/admin/labs/batch-create', {
+    await api.delete(`/admin/labs/${lab.id}/equipment/${equipment.id}`)
+    showToast(`设备台账“${equipment.equipment_name}”已删除`)
+    await fetchLabs()
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '设备台账删除失败')
+  } finally {
+    deletingEquipmentInventoryId.value = null
+  }
+}
+
+function openNewLabEquipment(lab: any) {
+  newLabEquipmentDialog.value = {
+    lab,
+    name: '',
+    model: '',
+    quantity: 1,
+    availableQuantity: 1,
+    usageNote: '',
+  }
+}
+
+async function submitNewLabEquipment() {
+  const dialog = newLabEquipmentDialog.value
+  if (!dialog?.name.trim()) { showToast('请填写器材名称'); return }
+  if (!Number.isInteger(dialog.quantity) || dialog.quantity < 1 || dialog.quantity > 500) {
+    showToast('账面数量必须是 1 到 500 之间的整数')
+    return
+  }
+  if (!Number.isInteger(dialog.availableQuantity) || dialog.availableQuantity < 0 || dialog.availableQuantity > dialog.quantity) {
+    showToast('可用数量不能超过账面数量')
+    return
+  }
+  addingLabEquipment.value = true
+  try {
+    const result = await api.post<{ instrument_numbers: string[] }>(`/admin/labs/${dialog.lab.id}/equipment`, {
+      name: dialog.name.trim(),
+      model: dialog.model.trim(),
+      quantity: dialog.quantity,
+      available_quantity: dialog.availableQuantity,
+      usage_note: dialog.usageNote.trim() || null,
+    })
+    newLabEquipmentDialog.value = null
+    showToast(`实验器材已新增，并生成 ${result.instrument_numbers.length} 个唯一编号`)
+    await fetchLabs()
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '新增实验器材失败')
+  } finally {
+    addingLabEquipment.value = false
+  }
+}
+
+async function saveNewLab() {
+  const codePattern = /^[A-Za-z0-9][A-Za-z0-9_-]{1,15}$/
+  if (!newLab.value.name || !codePattern.test(newLab.value.lab_code)) {
+    showToast('请填写实验室名称和有效编号')
+    return
+  }
+  const invalidEquipment = newLabEquip.value.find(e =>
+    !e.name || e.total < 1 || e.usable < 0 || e.usable > e.total,
+  )
+  if (invalidEquipment) { showToast('请完善器材名称和数量'); return }
+  try {
+    const createdLab = await api.post<{ id: string; name: string }>('/admin/labs/batch-create', {
+      lab_code: newLab.value.lab_code.trim().toUpperCase(),
       name: newLab.value.name,
       safety_capacity: newLab.value.safety_capacity,
       equipment: newLabEquip.value.map(e => ({
-        name: e.name, model: e.model,
+        name: e.name, model: e.model, usage_note: e.note,
         total_quantity: e.total, usable_quantity: e.usable,
       })),
     })
     addLabDialogOpen.value = false
-    showToast('实验室已创建')
-    await fetchLabs()
+    if (await fetchLabs()) {
+      activeLab.value = createdLab.name
+      scheduleLab.value = createdLab.name
+      await nextTick()
+      document.querySelector('.equipment-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      showToast(`实验室 ${createdLab.name} 已创建并显示`)
+    }
   } catch (err) { showToast(err instanceof Error ? err.message : '创建失败') }
+}
+
+function equipmentNumberPreview(equipment: { total: number }) {
+  const labCode = newLab.value.lab_code.trim().toUpperCase() || 'LAB'
+  const prefix = `${labCode}-EQ-XXXXXXXX`
+  const total = Math.max(1, Number(equipment.total) || 1)
+  return total === 1 ? `${prefix}-001` : `${prefix}-001 ～ ${prefix}-${String(total).padStart(3, '0')}`
 }
 
 // 提示铃：点击通知跳转到审批视图
@@ -1152,9 +1263,19 @@ async function loadLookups() {
   if (!planMajor.value || !majorItems.some((item) => item.name === planMajor.value)) {
     planMajor.value = majorItems[0]?.name ?? ''
   }
-  await Promise.all(courseCatalog.value.map(async (course) => {
-    projectCatalog.value[course.id] = await api.get<ProjectInfo[]>(`/admin/courses/${course.id}/projects`)
-  }))
+  const projectEntries = await Promise.all(courseCatalog.value.map(async (course) => [
+    course.id,
+    await api.get<ProjectInfo[]>(`/admin/courses/${course.id}/projects`),
+  ] as const))
+  projectCatalog.value = Object.fromEntries(projectEntries)
+}
+
+async function refreshCourseProjectCatalog(courseId: string) {
+  const projects = await api.get<ProjectInfo[]>(`/admin/courses/${courseId}/projects`)
+  projectCatalog.value = {
+    ...projectCatalog.value,
+    [courseId]: projects,
+  }
 }
 
 async function loadPlans() {
@@ -1257,6 +1378,7 @@ async function loadPlanDetail(planId: string) {
 
 function openNewPlan() {
   currentPlanId.value = null
+  publishedPlanSourceId.value = null
   planYear.value = String(new Date().getFullYear())
   planCourses.value = [blankPlanCourse()]
   activePlanCourseId.value = planCourses.value[0].id
@@ -1265,14 +1387,9 @@ function openNewPlan() {
 
 async function editPlan(plan: PlanCard) {
   try {
-    let detail: PlanDetail
-    if (plan.rawStatus === 'DRAFT') {
-      detail = (await loadPlanDetail(plan.id)).detail
-    } else {
-      detail = await api.post<PlanDetail>(`/training-plans/${plan.id}/draft-copy`, {})
-      await loadPlans()
-    }
-    currentPlanId.value = detail.id
+    const detail = (await loadPlanDetail(plan.id)).detail
+    currentPlanId.value = plan.rawStatus === 'DRAFT' ? detail.id : null
+    publishedPlanSourceId.value = plan.rawStatus === 'PUBLISHED' ? detail.id : null
     planMajor.value = detail.major.name
     planYear.value = String(detail.enrollment_year)
     planCourses.value = mapDetailCourses(detail)
@@ -1281,6 +1398,12 @@ async function editPlan(plan: PlanCard) {
   } catch (error) {
     showToast(error instanceof Error ? error.message : '培养方案编辑失败')
   }
+}
+
+function closePlanEditor() {
+  planEditorOpen.value = false
+  currentPlanId.value = null
+  publishedPlanSourceId.value = null
 }
 
 function toggleListItem(which: 'required' | 'optional', item: string) {
@@ -1296,38 +1419,6 @@ function toggleListItem(which: 'required' | 'optional', item: string) {
     course.optionalProjects = next
     if (!isRemoving) course.requiredProjects = course.requiredProjects.filter((value) => value !== item)
   }
-}
-
-function addCustomProject(which: 'required' | 'optional') {
-  const input = which === 'required' ? customRequiredProject : customOptionalProject
-  const name = input.value.trim()
-  if (!name) {
-    showToast('请先输入实验项目名称')
-    return
-  }
-  const course = activePlanCourse.value
-  if (!course) return
-  if (!course.courseId) {
-    showToast('请先选择实验课程')
-    return
-  }
-  const existing = (projectCatalog.value[course.courseId] ?? []).find((item) => item.project_name === name)
-  if (existing) {
-    toggleListItem(which, existing.project_name)
-    input.value = ''
-    return
-  }
-  pendingProjectKind.value = which
-  newProject.value = {
-    project_code: '',
-    project_name: name,
-    category: '',
-    required_slots: '',
-    group_mode: 'INDIVIDUAL' as ProjectGroupMode,
-    default_group_size: '',
-    historical_selection_ratio: '',
-  }
-  projectEditorOpen.value = true
 }
 
 function addPlanCourse() {
@@ -1352,6 +1443,51 @@ function syncCourseSelection(course: PlanCourseRequirement) {
   course.optionalProjects = []
   selectedRequiredProject.value = ''
   selectedOptionalProject.value = ''
+}
+
+function openCourseEditor() {
+  newCourse.value = {
+    course_name: '',
+    credits: '1.0',
+    default_slots: '4',
+    description: '',
+  }
+  addCourseDialogOpen.value = false
+  courseEditorOpen.value = true
+}
+
+function closeCourseEditor() {
+  courseEditorOpen.value = false
+  addCourseDialogOpen.value = true
+}
+
+async function submitNewCourse() {
+  const item = newCourse.value
+  const credits = Number(item.credits)
+  const defaultSlots = Number(item.default_slots)
+  if (!item.course_name || !Number.isFinite(credits) || !Number.isInteger(defaultSlots)) {
+    showToast('请完整填写实验课程资料')
+    return
+  }
+  creatingCourse.value = true
+  try {
+    const created = await api.post<CourseInfo>('/admin/courses', {
+      course_name: item.course_name,
+      credits,
+      default_slots: defaultSlots,
+      description: item.description || null,
+    })
+    courseCatalog.value = [...courseCatalog.value, created]
+      .sort((left, right) => left.course_name.localeCompare(right.course_name, 'zh-CN'))
+    projectCatalog.value = { ...projectCatalog.value, [created.id]: [] }
+    selectedCourseId.value = created.id
+    closeCourseEditor()
+    showToast('实验课程已创建，请设置开课周次')
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '实验课程创建失败')
+  } finally {
+    creatingCourse.value = false
+  }
 }
 
 function experimentCourseOptions(course: PlanCourseRequirement) {
@@ -1464,50 +1600,27 @@ async function savePlanDraft() {
     if (payload.courses.some((course) => !course.course_id || course.projects.some((item) => !item.project_id) || course.prerequisite_course_ids.some((item) => !item))) {
       throw new Error('课程、项目或先修课程必须从后台基础资料中选择')
     }
-    const saved = currentPlanId.value
-      ? await api.put<PlanDetail>(`/training-plans/${currentPlanId.value}`, payload)
-      : await api.post<PlanDetail>('/training-plans', payload)
+    let saved: PlanDetail
+    if (currentPlanId.value) {
+      saved = await api.put<PlanDetail>(`/training-plans/${currentPlanId.value}`, payload)
+    } else if (publishedPlanSourceId.value) {
+      const draft = await api.post<PlanDetail>(`/training-plans/${publishedPlanSourceId.value}/draft-copy`, {})
+      saved = await api.put<PlanDetail>(`/training-plans/${draft.id}`, payload)
+    } else {
+      saved = await api.post<PlanDetail>('/training-plans', payload)
+    }
     currentPlanId.value = saved.id
     // 保存后立即发布:培养方案必须保持已发布状态,学生端选课才能读取。
     // 发布会自动归档同专业同入学年份的其他已发布版本;内容不完整时
     // 发布会拒绝,方案保持草稿可继续编辑。
     await api.post(`/training-plans/${saved.id}/publish`, {})
-    planEditorOpen.value = false
+    closePlanEditor()
     await loadPlans()
     showToast('培养方案已保存并发布')
   } catch (error) {
     showToast(error instanceof Error ? error.message : '培养方案保存失败')
   } finally {
     savingPlan.value = false
-  }
-}
-
-async function submitNewProject() {
-  const course = activePlanCourse.value
-  if (!course?.courseId) return
-  const item = newProject.value
-  if (!item.project_code || !item.project_name || !item.category || !item.required_slots || (item.group_mode === 'GROUP' && !item.default_group_size) || item.historical_selection_ratio === '') {
-    showToast('请完整填写实验项目资料')
-    return
-  }
-  try {
-    const created = await api.post<ProjectInfo>(`/admin/courses/${course.courseId}/projects`, {
-      project_code: item.project_code,
-      project_name: item.project_name,
-      category: item.category,
-      required_slots: Number(item.required_slots),
-      group_mode: item.group_mode,
-      default_group_size: item.group_mode === 'INDIVIDUAL' ? 1 : Number(item.default_group_size),
-      historical_selection_ratio: Number(item.historical_selection_ratio),
-    })
-    projectCatalog.value[course.courseId] = [...(projectCatalog.value[course.courseId] ?? []), created]
-    toggleListItem(pendingProjectKind.value, created.project_name)
-    customRequiredProject.value = ''
-    customOptionalProject.value = ''
-    projectEditorOpen.value = false
-    showToast('实验项目已创建并加入当前培养方案')
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : '实验项目创建失败')
   }
 }
 
@@ -1567,7 +1680,7 @@ onMounted(async () => {
     await loadLookups()
     selectedPlan.value = '全部专业'
     await loadPlans()
-    await fetchSemesterCourses(true)
+    await fetchSemesterCourses()
     await fetchLabs()
     await loadPublishedSchedule()
     await fetchApprovals()
@@ -1723,7 +1836,7 @@ const selectedCandidate = computed(() => {
             <header><span class="course-config-icon">{{ course.name.slice(0, 1) }}</span><div><small>{{ course.code }}</small><h3>{{ course.name }}</h3><p>面向：{{ course.target }}　·　开设周次：{{ course.weeks }}</p></div><i>本学期开设</i><button @click="openEditTaskDialog(course)">编辑课程</button><button @click="deleteTeachingTask(course)" style="color:red;margin-left:.25rem">删除</button><button @click="openAddProjectDialog(course)" style="margin-left:.25rem">＋ 添加项目</button></header>
             <div class="course-project-table">
               <div class="course-project-row course-project-head"><span>实验项目</span><span>预计人数</span><span>负责教师</span><span>所需实验器材</span><span>配置状态</span><span>操作</span></div>
-              <div v-for="project in course.projects" :key="project.name" class="course-project-row"><span><b>{{ project.name }}</b><small>四节连堂 · {{ project.groupMode === 'INDIVIDUAL' ? '单人实验' : `${project.groupSize} 人/组` }}</small></span><span><strong>{{ project.expected }}</strong> 人次</span><span class="tag-cell"><i v-for="teacher in project.teachers" :key="teacher">{{ teacher }}</i></span><span class="tag-cell"><i v-for="item in project.equipment" :key="item">{{ item }}</i></span><span><em>已配置</em></span><span><button @click="openEditProjectDialog(project, course)">编辑</button><button @click="deleteProjectDemand(project, course)" style="color:red;margin-left:.25rem">删除</button></span></div>
+              <div v-for="project in course.projects" :key="project._demandId" class="course-project-row"><span><b>{{ project.name }}</b><small>{{ project.requiredSlots }} 节连堂 · {{ project.groupMode === 'INDIVIDUAL' ? '单人实验' : `${project.groupSize} 人/组` }}</small></span><span><strong>{{ project.expected }}</strong> 人次</span><span class="tag-cell"><i v-for="teacher in project.teachers" :key="teacher">{{ teacher }}</i></span><span class="tag-cell"><i v-for="item in project.equipment" :key="item">{{ item }}</i></span><span><em>已配置</em></span><span><button @click="openEditProjectDialog(project, course)">编辑</button><button :disabled="deletingProjectDemandId === project._projectId" @click="deleteProjectDemand(project, course)" style="color:red;margin-left:.25rem">{{ deletingProjectDemandId === project._projectId ? '删除中…' : '删除' }}</button></span></div>
             </div>
           </section>
         </template>
@@ -1737,10 +1850,10 @@ const selectedCandidate = computed(() => {
             <button v-for="lab in labs" :key="lab.name" :class="{ active: activeLab === lab.name }" @click="activeLab = lab.name"><span class="lab-card-icon">⌂</span><div><small>{{ lab.room_type || '实验室' }}</small><strong>{{ lab.name }}</strong></div><i>{{ lab.status }}</i><em><b>{{ lab.safety_capacity }}</b> 人 / 次</em><input type="checkbox" :checked="selectedLabIds.has(lab.id)" @click.stop="toggleLabSelect(lab.id)" style="position:absolute;bottom:8px;right:8px" /></button>
           </section>
           <section v-if="currentLab" class="system-panel equipment-panel">
-            <div class="system-panel-title"><div><h3>{{ currentLab.name }} · 设备台账</h3><p>实验室单次最多容纳 {{ currentLab.safety_capacity }} 人开展实验</p></div><div><label class="system-search">⌕<input v-model="equipKeyword" placeholder="搜索器材名称或型号" /></label></div></div>
+            <div class="system-panel-title"><div><h3>{{ currentLab.name }} · 设备台账</h3><p>实验室单次最多容纳 {{ currentLab.safety_capacity }} 人开展实验</p></div><div><button type="button" @click="openNewLabEquipment(currentLab)">＋ 新增实验器材</button><label class="system-search">⌕<input v-model="equipKeyword" placeholder="搜索器材名称或型号" /></label></div></div>
             <div class="equipment-table">
               <div class="equipment-row equipment-head"><span>器材名称</span><span>型号 / 规格</span><span>账面数量</span><span>可用数量</span><span>备注</span><span>操作</span></div>
-              <div v-for="item in filteredEquipment" :key="item.id" class="equipment-row"><span><i>◇</i><b>{{ item.equipment_name }}</b></span><span>{{ item.model }}</span><span>{{ item.total_quantity }} 台 / 套</span><span><strong>{{ item.usable_quantity }}</strong> 台 / 套</span><span>{{ item.note }}</span><span class="equipment-actions"><button type="button" @click="openAssetList(currentLab, item)">查看编号</button><button type="button" class="register" @click="openEquipmentRegistration(currentLab, item)">登记仪器</button></span></div>
+              <div v-for="item in filteredEquipment" :key="item.id" class="equipment-row"><span class="equipment-name"><i>◇</i><b>{{ item.equipment_name }}</b></span><span class="equipment-model">{{ item.model || '—' }}</span><span class="equipment-quantity"><strong>{{ item.total_quantity }}</strong><small>台 / 套</small></span><span class="equipment-quantity available"><strong>{{ item.usable_quantity }}</strong><small>台 / 套</small></span><span class="equipment-note" :title="item.note">{{ item.note || '—' }}</span><span class="equipment-actions"><button type="button" class="view" @click="openAssetList(currentLab, item)">查看编号</button><button type="button" class="register" @click="openEquipmentRegistration(currentLab, item)">登记仪器</button><button type="button" class="danger" :disabled="deletingEquipmentInventoryId === item.id" @click="deleteLabEquipment(currentLab, item)">{{ deletingEquipmentInventoryId === item.id ? '删除中…' : '删除' }}</button></span></div>
             </div>
           </section>
           <section class="lab-capacity-note"><span>i</span><p>实验室容量应取场地安全容量、实验台位数及关键器材可用套数中的最小值。</p></section>
@@ -1936,9 +2049,9 @@ const selectedCandidate = computed(() => {
       </div>
     </div>
 
-    <div v-if="planEditorOpen" class="system-dialog-backdrop" @click.self="planEditorOpen = false">
+    <div v-if="planEditorOpen" class="system-dialog-backdrop" @click.self="closePlanEditor">
       <form class="plan-editor" @submit.prevent="savePlanDraft">
-        <header><div><span>▤</span><div><h2>编辑培养方案要求</h2><p>手动维护专业、年份与实验课程修读规则</p></div></div><button type="button" @click="planEditorOpen = false">×</button></header>
+        <header><div><span>▤</span><div><h2>{{ currentPlanId || publishedPlanSourceId ? '编辑培养方案要求' : '新增培养方案要求' }}</h2><p>手动维护专业、年份与实验课程修读规则</p></div></div><button type="button" @click="closePlanEditor">×</button></header>
         <section>
           <h3>01　培养方案基础信息</h3>
           <div class="plan-form-grid">
@@ -1973,8 +2086,8 @@ const selectedCandidate = computed(() => {
         <section v-if="activePlanCourse">
           <div class="plan-section-heading"><div><h3>03　实验项目要求</h3><p>当前配置：{{ activePlanCourse.name || '未命名课程' }} · {{ activePlanCourse.studyYear }} {{ activePlanCourse.semester }}</p></div><select v-model="activePlanCourseId"><option v-for="course in planCourses" :key="course.id" :value="course.id">{{ course.name || '未命名课程' }} · {{ course.studyYear }} {{ course.semester }}</option></select></div>
           <div class="requirement-columns">
-            <div><label>本课程必选项目数量<input v-model.number="activePlanCourse.requiredCount" type="number" min="0" /></label><p>从"{{ activePlanCourse.name || '当前课程' }}"项目库选择必选项目</p><div class="project-select-row"><select v-model="selectedRequiredProject" :disabled="!activePlanCourse.courseId"><option value="">请选择本课程项目</option><option v-for="item in availableProjectOptions('required')" :key="item" :value="item">{{ item }}</option></select><button type="button" :disabled="!selectedRequiredProject" @click="addSelectedProject('required')">加入必选</button></div><div class="selected-project-list"><button v-for="item in activePlanCourse.requiredProjects" :key="item" type="button" class="selected" @click="toggleListItem('required',item)"><i>✓</i>{{ item }}<b>×</b></button></div><div class="custom-project-row"><input v-model="customRequiredProject" type="text" placeholder="项目库中没有？输入名称补充资料" @keyup.enter.prevent="addCustomProject('required')" /><button type="button" @click="addCustomProject('required')">新增项目</button></div></div>
-            <div><label>本课程选做项目最低数量<input v-model.number="activePlanCourse.optionalCount" type="number" min="0" /></label><p>从"{{ activePlanCourse.name || '当前课程' }}"项目库选择选做项目</p><div class="project-select-row"><select v-model="selectedOptionalProject" :disabled="!activePlanCourse.courseId"><option value="">请选择本课程项目</option><option v-for="item in availableProjectOptions('optional')" :key="item" :value="item">{{ item }}</option></select><button type="button" :disabled="!selectedOptionalProject" @click="addSelectedProject('optional')">加入选做</button></div><div class="selected-project-list"><button v-for="item in activePlanCourse.optionalProjects" :key="item" type="button" class="selected" @click="toggleListItem('optional',item)"><i>✓</i>{{ item }}<b>×</b></button></div><div class="custom-project-row"><input v-model="customOptionalProject" type="text" placeholder="项目库中没有？输入名称补充资料" @keyup.enter.prevent="addCustomProject('optional')" /><button type="button" @click="addCustomProject('optional')">新增项目</button></div></div>
+            <div><label>本课程必选项目数量<input v-model.number="activePlanCourse.requiredCount" type="number" min="0" /></label><p>从"{{ activePlanCourse.name || '当前课程' }}"项目库选择必选项目</p><div class="project-select-row"><select v-model="selectedRequiredProject" :disabled="!activePlanCourse.courseId"><option value="">请选择本课程项目</option><option v-for="item in availableProjectOptions('required')" :key="item" :value="item">{{ item }}</option></select><button type="button" :disabled="!selectedRequiredProject" @click="addSelectedProject('required')">加入必选</button></div><div class="selected-project-list"><button v-for="item in activePlanCourse.requiredProjects" :key="item" type="button" class="selected" @click="toggleListItem('required',item)"><i>✓</i>{{ item }}<b>×</b></button></div></div>
+            <div><label>本课程选做项目最低数量<input v-model.number="activePlanCourse.optionalCount" type="number" min="0" /></label><p>从"{{ activePlanCourse.name || '当前课程' }}"项目库选择选做项目</p><div class="project-select-row"><select v-model="selectedOptionalProject" :disabled="!activePlanCourse.courseId"><option value="">请选择本课程项目</option><option v-for="item in availableProjectOptions('optional')" :key="item" :value="item">{{ item }}</option></select><button type="button" :disabled="!selectedOptionalProject" @click="addSelectedProject('optional')">加入选做</button></div><div class="selected-project-list"><button v-for="item in activePlanCourse.optionalProjects" :key="item" type="button" class="selected" @click="toggleListItem('optional',item)"><i>✓</i>{{ item }}<b>×</b></button></div></div>
           </div>
         </section>
         <section v-if="activePlanCourse">
@@ -1982,25 +2095,23 @@ const selectedCandidate = computed(() => {
           <label class="full-field">实验项目顺序要求<textarea v-model="activePlanCourse.orderRule" rows="3" placeholder="例如：必须先完成基础测量项目，再选择近代物理项目"></textarea></label>
           <div class="rule-options"><label><input type="checkbox" checked disabled />未完成先修课程时禁止选课</label><label><input type="checkbox" checked disabled />必做项目优先于选做项目</label><label><input v-model="activePlanCourse.allowOrderOverride" type="checkbox" />允许特殊情况跳过项目顺序</label></div>
         </section>
-        <footer><p>保存后立即发布生效，同专业同入学年份的旧版本将被新版本替换；内容不完整时无法发布。</p><button type="button" @click="planEditorOpen = false">取消</button><button type="submit" :disabled="savingPlan">{{ savingPlan ? '保存中...' : '保存并发布' }}</button></footer>
+        <footer><p>保存后立即发布生效，同专业同入学年份的旧版本将被新版本替换；取消编辑不会产生草稿。</p><button type="button" @click="closePlanEditor">取消</button><button type="submit" :disabled="savingPlan">{{ savingPlan ? '保存中...' : '保存并发布' }}</button></footer>
       </form>
     </div>
 
-    <div v-if="projectEditorOpen" class="system-dialog-backdrop" @click.self="projectEditorOpen = false">
-      <form class="plan-editor" @submit.prevent="submitNewProject">
-        <header><div><span>✦</span><div><h2>补充实验项目资料</h2><p>项目创建后将加入当前课程项目库</p></div></div><button type="button" @click="projectEditorOpen = false">×</button></header>
+    <div v-if="courseEditorOpen" class="system-dialog-backdrop" @click.self="closeCourseEditor">
+      <form class="plan-editor" @submit.prevent="submitNewCourse">
+        <header><div><span>＋</span><div><h2>新增实验课程</h2><p>课程创建后将加入课程库，并自动选入当前教学任务</p></div></div><button type="button" @click="closeCourseEditor">×</button></header>
         <section>
           <div class="plan-form-grid">
-            <label>项目编码<input v-model.trim="newProject.project_code" maxlength="32" required placeholder="例如 PHYS-EXP-001" /></label>
-            <label>项目名称<input v-model.trim="newProject.project_name" maxlength="150" required /></label>
-            <label>项目分类<select v-model="newProject.category" required><option disabled value="">请选择</option><option value="BASIC">基础</option><option value="MECHANICS">力学</option><option value="ELECTRICITY">电学</option><option value="OPTICS">光学</option><option value="MODERN">近代物理</option><option value="OTHER">其他</option></select></label>
-            <label>所需节次<input v-model="newProject.required_slots" type="number" min="1" max="24" required /></label>
-            <label>实验形式<select v-model="newProject.group_mode" @change="newProject.group_mode === 'GROUP' && Number(newProject.default_group_size) < 2 ? newProject.default_group_size = '2' : null"><option value="INDIVIDUAL">单人实验</option><option value="GROUP">多人分组实验</option></select></label>
-            <label v-if="newProject.group_mode === 'GROUP'">每组人数<input v-model="newProject.default_group_size" type="number" min="2" max="100" required /></label>
-            <label>历史选中比例<input v-model="newProject.historical_selection_ratio" type="number" min="0" max="1" step="0.0001" required placeholder="0 至 1" /></label>
+            <label>课程名称<input v-model.trim="newCourse.course_name" maxlength="100" required placeholder="请输入实验课程名称" /></label>
+            <label>课程编码<input value="创建后由系统自动生成" disabled /></label>
+            <label>学分<input v-model="newCourse.credits" type="number" min="0" max="99" step="0.1" required /></label>
+            <label>默认课时<input v-model="newCourse.default_slots" type="number" min="1" max="24" step="1" required /></label>
+            <label class="full-field">课程说明<textarea v-model.trim="newCourse.description" maxlength="2000" rows="3" placeholder="可选"></textarea></label>
           </div>
         </section>
-        <footer><p>请确认资料准确，系统不会自动填充业务参数。</p><button type="button" @click="projectEditorOpen = false">取消</button><button type="submit">创建并加入</button></footer>
+        <footer><p>系统将生成唯一且稳定的课程编码，后续实验项目将归属于该课程。</p><button type="button" @click="closeCourseEditor">取消</button><button type="submit" :disabled="creatingCourse">{{ creatingCourse ? '创建中…' : '创建并选中' }}</button></footer>
       </form>
     </div>
 
@@ -2028,6 +2139,24 @@ const selectedCandidate = computed(() => {
           <label class="registration-quantity"><span>本次登记数量</span><input v-model.number="registrationDialog.quantity" type="number" min="1" max="500" step="1" required /><small>新登记仪器默认设为可用，编号生成后不可修改。</small></label>
           <div class="registration-preview"><span>登记完成后台账数量</span><strong>{{ registrationDialog.equipment.total_quantity + (Number(registrationDialog.quantity) || 0) }} 台 / 套</strong></div>
           <footer><button type="button" @click="registrationDialog = null">取消</button><button type="submit" :disabled="registrationBusy">{{ registrationBusy ? '登记中…' : '确认登记' }}</button></footer>
+        </form>
+      </div>
+    </Teleport>
+
+    <!-- 向现有实验室新增器材类型与首批仪器 -->
+    <Teleport to="body">
+      <div v-if="newLabEquipmentDialog" class="system-dialog-backdrop" @click.self="newLabEquipmentDialog = null">
+        <form class="approval-detail equipment-registration-dialog" @submit.prevent="submitNewLabEquipment">
+          <header><div><span>＋</span><div><h2>新增实验器材</h2><p>{{ newLabEquipmentDialog.lab.name }} · 系统自动生成器材类型编号和仪器号</p></div></div><button type="button" aria-label="关闭" @click="newLabEquipmentDialog = null">×</button></header>
+          <div class="plan-form-grid">
+            <label>器材名称<input v-model.trim="newLabEquipmentDialog.name" maxlength="100" required placeholder="例：数字万用表" /></label>
+            <label>型号 / 规格<input v-model.trim="newLabEquipmentDialog.model" maxlength="100" placeholder="例：UT61E+" /></label>
+            <label>账面数量<input v-model.number="newLabEquipmentDialog.quantity" type="number" min="1" max="500" step="1" required /></label>
+            <label>当前可用数量<input v-model.number="newLabEquipmentDialog.availableQuantity" type="number" min="0" :max="newLabEquipmentDialog.quantity" step="1" required /></label>
+            <label class="full-field">使用备注<input v-model.trim="newLabEquipmentDialog.usageNote" maxlength="500" placeholder="例：2 人一台" /></label>
+          </div>
+          <div class="registration-preview"><span>编号规则</span><strong>{{ newLabEquipmentDialog.lab.lab_code }}-EQ-XXXXXXXX-001 起</strong></div>
+          <footer><button type="button" @click="newLabEquipmentDialog = null">取消</button><button type="submit" :disabled="addingLabEquipment">{{ addingLabEquipment ? '新增中…' : '确认新增' }}</button></footer>
         </form>
       </div>
     </Teleport>
@@ -2079,30 +2208,24 @@ const selectedCandidate = computed(() => {
     <!-- 添加实验室弹窗 -->
     <Teleport to="body">
       <div v-if="addLabDialogOpen" class="system-dialog-backdrop" @click.self="addLabDialogOpen = false">
-        <form class="approval-detail" style="width:660px;max-height:85vh;overflow-y:auto" @submit.prevent="saveNewLab">
-          <header><div><span>⌂</span><div><h2>新建实验室</h2><p>填写实验室基本信息和设备台账</p></div></div><button type="button" @click="addLabDialogOpen = false">×</button></header>
-          <div style="display:flex;gap:1rem;margin-bottom:1rem">
-            <label style="flex:2">实验室名称<input v-model="newLab.name" placeholder="例：基础力学实验室 A204" style="width:100%" /></label>
-            <label style="flex:1">容纳人数<input v-model.number="newLab.safety_capacity" type="number" min="1" max="100" style="width:100%" /></label>
+        <form class="approval-detail lab-create-dialog" @submit.prevent="saveNewLab">
+          <header><div><span>⌂</span><div><h2>新建实验室</h2><p>统一编号后，系统将为每台器材生成可追踪的唯一编号</p></div></div><button type="button" @click="addLabDialogOpen = false">×</button></header>
+          <div class="lab-create-basics">
+            <label>实验室编号<input v-model.trim="newLab.lab_code" maxlength="16" pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,15}" required placeholder="例：A204" /><small>2–16 位字母、数字、- 或 _</small></label>
+            <label>实验室名称<input v-model="newLab.name" required placeholder="例：基础力学实验室" /></label>
+            <label>容纳人数<input v-model.number="newLab.safety_capacity" type="number" min="1" max="100" required /></label>
           </div>
-          <section style="background:#f7f8fa;border-radius:8px;padding:1rem">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
-              <strong>设备台账</strong><button type="button" @click="addEquipRow" style="background:#4769a8;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:.85rem">＋ 添加器材</button>
+          <section class="lab-create-equipment">
+            <div class="lab-create-equipment-title">
+              <div><strong>设备台账</strong><small>编号规则：实验室编号-器材类型编号-三位流水号</small></div><button type="button" @click="addEquipRow">＋ 添加器材</button>
             </div>
-            <div v-if="newLabEquip.length" style="max-height:280px;overflow-y:auto">
-              <div class="equipment-row equipment-head" style="display:flex;gap:6px;padding:6px 8px;font-weight:600;font-size:.85rem;border-bottom:2px solid #ddd">
-                <span style="flex:2">器材名称</span><span style="flex:1.5">型号/规格</span><span style="flex:0.8">账面数</span><span style="flex:0.8">可用数</span><span style="flex:1.5">备注</span><span style="width:28px"></span>
-              </div>
-              <div v-for="(eq, i) in newLabEquip" :key="i" style="display:flex;gap:6px;padding:6px 8px;align-items:center;border-bottom:1px solid #eee">
-                <span style="flex:2"><input v-model="eq.name" placeholder="器材名" style="width:100%" /></span>
-                <span style="flex:1.5"><input v-model="eq.model" placeholder="型号" style="width:100%" /></span>
-                <span style="flex:0.8"><input v-model.number="eq.total" type="number" min="1" style="width:100%" /></span>
-                <span style="flex:0.8"><input v-model.number="eq.usable" type="number" min="0" :max="eq.total" style="width:100%" /></span>
-                <span style="flex:1.5"><input v-model="eq.note" placeholder="如2人一台" style="width:100%" /></span>
-                <span style="width:28px"><button type="button" @click="removeEquipRow(i)" style="color:red;background:none;border:none;cursor:pointer;font-size:1.2rem">×</button></span>
-              </div>
+            <div v-if="newLabEquip.length" class="lab-equipment-entry-list">
+              <article v-for="(eq, i) in newLabEquip" :key="i" class="lab-equipment-entry">
+                <header><b>器材 {{ String(i + 1).padStart(2, '0') }}</b><code>编号示例：{{ equipmentNumberPreview(eq) }}</code><button type="button" aria-label="移除器材" @click="removeEquipRow(i)">×</button></header>
+                <div><label>器材名称<input v-model="eq.name" required placeholder="例：示波器" /></label><label>型号 / 规格<input v-model="eq.model" placeholder="例：TBS1102" /></label><label>账面数<input v-model.number="eq.total" type="number" min="1" max="500" required /></label><label>可用数<input v-model.number="eq.usable" type="number" min="0" :max="eq.total" required /></label><label>使用备注<input v-model="eq.note" placeholder="例：2 人一台" /></label></div>
+              </article>
             </div>
-            <p v-else style="color:#888;font-size:.9rem">暂无设备，可点击上方按钮添加</p>
+            <p v-else class="lab-equipment-empty">暂无设备，可点击“添加器材”建立首条台账</p>
           </section>
           <footer><button type="button" @click="addLabDialogOpen = false">取消</button><button type="submit">创建实验室</button></footer>
         </form>
@@ -2143,7 +2266,7 @@ const selectedCandidate = computed(() => {
       <div v-if="addCourseDialogOpen" class="system-dialog-backdrop" @click.self="addCourseDialogOpen = false">
         <form class="approval-detail course-dialog-form" style="width:440px" @submit.prevent="addTeachingTask">
           <header><div><span>＋</span><div><h2>添加实验课程</h2><p>从课程库中选择并创建教学任务</p></div></div><button type="button" @click="addCourseDialogOpen = false">×</button></header>
-          <label style="display:block;margin-bottom:1rem">实验课程<select v-model="selectedCourseId" style="width:100%"><option value="" disabled>请选择课程</option><option v-for="c in availableCourses" :key="c.id" :value="c.id">{{ c.course_code }} {{ c.course_name }}</option></select></label>
+          <div class="course-library-entry"><label>实验课程<select v-model="selectedCourseId"><option value="" disabled>请选择课程</option><option v-for="c in availableCourses" :key="c.id" :value="c.id">{{ c.course_code }} {{ c.course_name }}</option></select></label><button type="button" @click="openCourseEditor">＋ 新增实验课程</button></div>
           <div style="display:flex;gap:1rem;margin-bottom:1rem">
             <label style="flex:1">起始周<input v-model.number="newWeekStart" type="number" min="1" max="20" style="width:100%" /></label>
             <label style="flex:1">结束周<input v-model.number="newWeekEnd" type="number" min="1" max="20" style="width:100%" /></label>
@@ -2177,7 +2300,7 @@ const selectedCandidate = computed(() => {
             <label>项目名称 *<input v-model="addProjectDialog.project_name" placeholder="例：用单摆测量重力加速度" style="width:100%" /></label>
             <div class="auto-code-note"><span>编号</span><strong>系统自动生成</strong><small>将按课程编号顺序生成并保证唯一</small></div>
             <label>类别<select v-model="addProjectDialog.category" style="width:100%"><option>BASIC</option><option>MECHANICS</option><option>ELECTRICITY</option><option>OPTICS</option><option>MODERN</option><option>OTHER</option></select></label>
-            <label>所需学时<input v-model.number="addProjectDialog.required_slots" type="number" min="1" max="24" style="width:100%" /></label>
+            <label>连续课时（排课硬约束）<select v-model.number="addProjectDialog.required_slots" style="width:100%"><option :value="2">2 节连堂</option><option :value="4">4 节连堂</option></select><small>排课时占用完整连续时段，不会拆分</small></label>
             <label>实验形式<select v-model="addProjectDialog.group_mode" @change="addProjectDialog.group_mode === 'GROUP' && Number(addProjectDialog.default_group_size) < 2 ? addProjectDialog.default_group_size = 2 : null" style="width:100%"><option value="INDIVIDUAL">单人实验</option><option value="GROUP">多人分组实验</option></select></label>
             <label v-if="addProjectDialog.group_mode === 'GROUP'">每组人数<input v-model.number="addProjectDialog.default_group_size" type="number" min="2" max="100" style="width:100%" /></label>
             <label>往届选择比<input v-model.number="addProjectDialog.historical_selection_ratio" type="number" min="0" max="1" step="0.01" style="width:100%" /></label>

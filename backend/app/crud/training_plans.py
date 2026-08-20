@@ -377,6 +377,32 @@ async def get_active_courses(session: AsyncSession) -> list[ExperimentCourse]:
     return list(result.scalars())
 
 
+async def create_experiment_course(
+    session: AsyncSession,
+    *,
+    course_code: str,
+    course_name: str,
+    credits: Decimal,
+    default_slots: int,
+    description: str | None,
+    actor_id: UUID,
+) -> ExperimentCourse:
+    course = ExperimentCourse(
+        course_code=course_code.strip().upper(),
+        course_name=course_name.strip(),
+        course_type="EXPERIMENT",
+        credits=credits,
+        default_slots=default_slots,
+        description=description.strip() if description else None,
+        status="ACTIVE",
+        created_by=actor_id,
+        updated_by=actor_id,
+    )
+    session.add(course)
+    await session.flush()
+    return course
+
+
 async def get_course_projects(
     session: AsyncSession, course_id: UUID
 ) -> list[ExperimentProject]:

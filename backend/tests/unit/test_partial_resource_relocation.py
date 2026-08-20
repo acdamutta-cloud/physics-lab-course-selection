@@ -13,6 +13,14 @@ def test_interprets_two_students_per_device() -> None:
         assert result.students_per_unit == 2
 
 
+def test_empty_usage_note_defaults_to_one_student_per_device() -> None:
+    result = interpret_equipment_usage_note("")
+    assert result.usage_note == ""
+    assert result.students_per_unit == 1
+    assert result.sharing_rule_status == "CONFIRMED"
+    assert result.source == "SYSTEM_DEFAULT"
+
+
 def test_ambiguous_note_cannot_drive_automatic_capacity() -> None:
     result = interpret_equipment_usage_note("多人共用，轮流使用")
     assert result.sharing_rule_status == "AMBIGUOUS"

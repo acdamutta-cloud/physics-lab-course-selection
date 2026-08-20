@@ -105,6 +105,15 @@ def test_custom_project_requires_confirmed_business_fields() -> None:
             historical_selection_ratio=Decimal("1.1000"),
         )
 
+    with pytest.raises(ValidationError):
+        CreateProjectRequest(
+            project_name="不支持拆分课时的项目",
+            category="OTHER",
+            required_slots=3,
+            default_group_size=1,
+            historical_selection_ratio=Decimal("0.5000"),
+        )
+
 
 def test_project_group_mode_controls_group_size() -> None:
     individual = CreateProjectRequest(

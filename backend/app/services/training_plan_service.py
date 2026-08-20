@@ -1,12 +1,13 @@
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crud import training_plans as tp_crud
 from app.schemas.training_plan import (
     CourseInfo,
+    CreateCourseRequest,
     CreateProjectRequest,
     CreateTrainingPlanRequest,
     MajorInfo,
@@ -515,6 +516,39 @@ async def get_courses(session: AsyncSession) -> list[CourseInfo]:
     ]
 
 
+async def create_course(
+    session: AsyncSession,
+    data: CreateCourseRequest,
+    actor_id: UUID,
+) -> CourseInfo:
+    try:
+        course_code = f"EXP-{uuid4().hex[:12].upper()}"
+        course = await tp_crud.create_experiment_course(
+            session,
+            actor_id=actor_id,
+            course_code=course_code,
+            **data.model_dump(),
+        )
+        await tp_crud.add_operation_log(
+            session,
+            actor_id=actor_id,
+            operation_type="EXPERIMENT_COURSE_CREATED",
+            object_type="EXPERIMENT_COURSE",
+            object_id=course.id,
+            before_snapshot={},
+            after_snapshot={
+                "id": str(course.id),
+                "course_code": course.course_code,
+                "course_name": course.course_name,
+            },
+        )
+        await session.commit()
+        return _to_course_info(course)
+    except IntegrityError as exc:
+        await session.rollback()
+        raise TrainingPlanError("系统生成课程编码失败，请重试") from exc
+
+
 async def get_course_projects(
     session: AsyncSession, course_id: UUID
 ) -> list[ProjectInfo]:
@@ -570,6 +604,85 @@ async def create_course_project(
     except IntegrityError as exc:
         await session.rollback()
         raise TrainingPlanError("项目编码已存在，或该课程已有同名项目") from exc
+
+
+async def delete_course_project(
+    session: AsyncSession,
+    course_id: UUID,
+    project_id: UUID,
+    actor_id: UUID,
+) -> None:
+    from app.models.curriculum import (
+        ExperimentProject,
+        ProjectOrderConstraint,
+        TrainingPlanProject,
+    )
+    from app.models.enrollment import StudentProjectRecord
+    from app.models.scheduling import ExperimentSession, ProjectDemand
+
+    project = await session.scalar(
+        select(ExperimentProject)
+        .where(
+            ExperimentProject.id == project_id,
+            ExperimentProject.course_id == course_id,
+            ExperimentProject.status == "ACTIVE",
+        )
+        .with_for_update()
+    )
+    if project is None:
+        raise TrainingPlanError("实验项目不存在或不属于该课程", 404)
+
+    blocker_queries = (
+        select(func.count()).select_from(TrainingPlanProject).where(
+            TrainingPlanProject.project_id == project_id
+        ),
+        select(func.count()).select_from(ProjectOrderConstraint).where(
+            or_(
+                ProjectOrderConstraint.before_project_id == project_id,
+                ProjectOrderConstraint.after_project_id == project_id,
+            )
+        ),
+        select(func.count()).select_from(ExperimentSession).where(
+            ExperimentSession.project_id == project_id
+        ),
+        select(func.count()).select_from(StudentProjectRecord).where(
+            StudentProjectRecord.project_id == project_id
+        ),
+    )
+    blocker_count = 0
+    for query in blocker_queries:
+        blocker_count += int((await session.scalar(query)) or 0)
+    if blocker_count:
+        raise TrainingPlanError(
+            "项目已被培养方案、课表或学生记录引用，不能直接删除"
+        )
+
+    snapshot = {
+        "id": str(project.id),
+        "course_id": str(project.course_id),
+        "project_code": project.project_code,
+        "project_name": project.project_name,
+    }
+    try:
+        await session.execute(
+            delete(ProjectDemand).where(ProjectDemand.project_id == project_id)
+        )
+        await session.delete(project)
+        await tp_crud.add_operation_log(
+            session,
+            actor_id=actor_id,
+            operation_type="EXPERIMENT_PROJECT_DELETED",
+            object_type="EXPERIMENT_PROJECT",
+            object_id=project_id,
+            before_snapshot=snapshot,
+            after_snapshot={},
+        )
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise TrainingPlanError(
+            "项目仍有关联数据，不能直接删除"
+        ) from exc
 
 
 async def update_course_project_grouping(

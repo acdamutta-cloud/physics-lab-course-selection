@@ -1,3 +1,4 @@
+import re
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -18,14 +19,15 @@ from app.schemas.teaching_task import (
 )
 from app.schemas.training_plan import (
     CourseInfo,
+    CreateCourseRequest,
     CreateProjectRequest,
     MajorInfo,
     ProjectInfo,
     UpdateProjectGroupingRequest,
 )
+from app.services import equipment_asset_service as asset_svc
 from app.services import semester_course_service as sc_svc
 from app.services import training_plan_service as tp_svc
-from app.services import equipment_asset_service as asset_svc
 
 router = APIRouter(prefix="/admin", tags=["管理"])
 
@@ -46,6 +48,25 @@ async def list_courses(
 ):
     require_admin(current_user)
     return await tp_svc.get_courses(session)
+
+
+@router.post(
+    "/courses",
+    response_model=CourseInfo,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_course(
+    body: CreateCourseRequest,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    try:
+        return await tp_svc.create_course(session, body, current_user.id)
+    except tp_svc.TrainingPlanError as error:
+        raise HTTPException(
+            status_code=error.status_code, detail=error.message
+        )
 
 
 @router.get("/courses/{course_id}/projects", response_model=list[ProjectInfo])
@@ -73,6 +94,27 @@ async def create_course_project(
     try:
         return await tp_svc.create_course_project(
             session, course_id, body, current_user.id
+        )
+    except tp_svc.TrainingPlanError as error:
+        raise HTTPException(
+            status_code=error.status_code, detail=error.message
+        )
+
+
+@router.delete(
+    "/courses/{course_id}/projects/{project_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_course_project(
+    course_id: UUID,
+    project_id: UUID,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: UserProfile = Depends(get_current_user),
+):
+    require_admin(current_user)
+    try:
+        await tp_svc.delete_course_project(
+            session, course_id, project_id, current_user.id
         )
     except tp_svc.TrainingPlanError as error:
         raise HTTPException(
@@ -371,6 +413,50 @@ async def delete_lab(
     current_user: UserProfile = Depends(get_current_user),
 ):
     require_admin(current_user)
+    from app.models.resources import (
+        EquipmentAsset,
+        LabEquipmentInventory,
+        ResourceIssueReport,
+    )
+    from app.models.scheduling import ExperimentSession
+
+    asset_count = await session.scalar(
+        select(func.count(func.distinct(EquipmentAsset.id)))
+        .join(
+            LabEquipmentInventory,
+            EquipmentAsset.current_inventory_id == LabEquipmentInventory.id,
+        )
+        .where(
+            (EquipmentAsset.origin_laboratory_id == lab_id)
+            | (LabEquipmentInventory.laboratory_id == lab_id)
+        )
+    )
+    session_count = await session.scalar(
+        select(func.count(ExperimentSession.id)).where(
+            ExperimentSession.laboratory_id == lab_id
+        )
+    )
+    issue_count = await session.scalar(
+        select(func.count(ResourceIssueReport.id)).where(
+            ResourceIssueReport.laboratory_id == lab_id
+        )
+    )
+    asset_count = asset_count or 0
+    blockers = []
+    if asset_count:
+        blockers.append(f"{asset_count} 台有永久编号的仪器资产")
+    if session_count:
+        blockers.append(f"{session_count} 个实验场次")
+    if issue_count:
+        blockers.append(f"{issue_count} 条资源异常记录")
+    if blockers:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"无法删除实验室：仍存在{'、'.join(blockers)}。"
+                "请先完成仪器调拨或报废归档，并解除相关排课引用。"
+            ),
+        )
     ok = await res_crud.delete_lab(session, lab_id)
     if not ok:
         raise HTTPException(status_code=404, detail="实验室不存在")
@@ -388,8 +474,21 @@ async def batch_create_lab_with_equipment(
     from app.models.resources import EquipmentType, LabEquipmentInventory, Laboratory
     from app.services.equipment_usage_note_service import interpret_equipment_usage_note
     campus = (await session.execute(select(Campus).limit(1))).scalar_one()
+    lab_code = str(body.get("lab_code", "")).strip().upper()
+    code_pattern = re.compile(r"^[A-Z0-9][A-Z0-9_-]{1,15}$")
+    if not code_pattern.fullmatch(lab_code):
+        raise HTTPException(
+            status_code=422,
+            detail="实验室编号须为 2 至 16 位大写字母、数字、下划线或短横线",
+        )
+    if await session.scalar(
+        select(func.count()).select_from(Laboratory).where(
+            Laboratory.lab_code == lab_code
+        )
+    ):
+        raise HTTPException(status_code=409, detail="实验室编号已存在")
     lab = Laboratory(
-        lab_code=body.get("lab_code", body["name"][:8]),
+        lab_code=lab_code,
         name=body["name"], campus_id=campus.id,
         safety_capacity=body.get("safety_capacity", 24), status="ACTIVE",
     )
@@ -411,7 +510,7 @@ async def batch_create_lab_with_equipment(
         )).scalar_one_or_none()
         if existing_eq is None:
             existing_eq = EquipmentType(
-                equipment_code=f"EQ-{eq_name[:4].upper()}-{uuid4().hex[:4].upper()}",
+                equipment_code=f"EQ-{uuid4().hex[:8].upper()}",
                 name=eq_name, model=eq_model, unit="台", status="ACTIVE",
             )
             session.add(existing_eq)
@@ -429,7 +528,7 @@ async def batch_create_lab_with_equipment(
             usage_note=rule.usage_note or None,
             students_per_unit=rule.students_per_unit,
             sharing_rule_status=rule.sharing_rule_status,
-            sharing_rule_source="SEMANTIC_PARSER" if rule.usage_note else None,
+            sharing_rule_source=rule.source,
             sharing_rule_evidence=rule.evidence,
         )
         session.add(inventory)
@@ -454,10 +553,85 @@ async def add_lab_equipment(
     current_user: UserProfile = Depends(get_current_user),
 ):
     require_admin(current_user)
-    raise HTTPException(
-        status_code=410,
-        detail="汇总库存已改为只读，请使用批量登记单台仪器接口。",
+    from app.models.resources import (
+        EquipmentType,
+        LabEquipmentInventory,
+        Laboratory,
     )
+    from app.services.equipment_usage_note_service import (
+        interpret_equipment_usage_note,
+    )
+
+    lab = await session.get(Laboratory, lab_id)
+    if lab is None:
+        raise HTTPException(status_code=404, detail="实验室不存在")
+    name = str(body.get("name", "")).strip()
+    model = str(body.get("model", "")).strip()
+    if not name or len(name) > 100 or len(model) > 100:
+        raise HTTPException(status_code=422, detail="请填写有效的器材名称和型号")
+    try:
+        quantity = int(body.get("quantity", 0))
+        available_quantity = int(body.get("available_quantity", quantity))
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail="器材数量格式不正确") from error
+    if quantity < 1 or quantity > 500:
+        raise HTTPException(status_code=422, detail="账面数量必须在 1 到 500 之间")
+    if available_quantity < 0 or available_quantity > quantity:
+        raise HTTPException(status_code=422, detail="可用数量不能超过账面数量")
+
+    equipment = await session.scalar(
+        select(EquipmentType).where(
+            EquipmentType.name == name,
+            EquipmentType.model == model,
+        )
+    )
+    if equipment is None:
+        equipment = EquipmentType(
+            equipment_code=f"EQ-{uuid4().hex[:8].upper()}",
+            name=name,
+            model=model,
+            unit="台",
+            status="ACTIVE",
+        )
+        session.add(equipment)
+        await session.flush()
+    existing_inventory = await session.scalar(
+        select(LabEquipmentInventory).where(
+            LabEquipmentInventory.laboratory_id == lab_id,
+            LabEquipmentInventory.equipment_type_id == equipment.id,
+        )
+    )
+    if existing_inventory is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="当前实验室已有该器材，请使用“登记仪器”增加数量",
+        )
+
+    assets = await asset_svc.batch_create_assets(
+        session,
+        lab_id=lab_id,
+        equipment_type_id=equipment.id,
+        quantity=quantity,
+        available_quantity=available_quantity,
+        actor_id=current_user.id,
+        commit=False,
+    )
+    inventory = await session.get(
+        LabEquipmentInventory, assets[0].current_inventory_id
+    )
+    rule = interpret_equipment_usage_note(body.get("usage_note"))
+    inventory.usage_note = rule.usage_note or None
+    inventory.students_per_unit = rule.students_per_unit
+    inventory.sharing_rule_status = rule.sharing_rule_status
+    inventory.sharing_rule_source = rule.source
+    inventory.sharing_rule_evidence = rule.evidence
+    await session.commit()
+    return {
+        "id": str(inventory.id),
+        "equipment_type_id": str(equipment.id),
+        "equipment_code": equipment.equipment_code,
+        "instrument_numbers": [asset.instrument_no for asset in assets],
+    }
 
 
 @router.put("/labs/{lab_id}/equipment/{inv_id}")
@@ -516,7 +690,11 @@ async def delete_lab_equipment(
     current_user: UserProfile = Depends(get_current_user),
 ):
     require_admin(current_user)
-    from app.models.resources import EquipmentAsset
+    from app.models.resources import EquipmentAsset, LabEquipmentInventory
+
+    inventory = await session.get(LabEquipmentInventory, inv_id)
+    if inventory is None or inventory.laboratory_id != lab_id:
+        raise HTTPException(status_code=404, detail="设备台账不存在")
 
     asset_count = await session.scalar(
         select(func.count(EquipmentAsset.id)).where(
@@ -526,7 +704,10 @@ async def delete_lab_equipment(
     if asset_count:
         raise HTTPException(
             status_code=409,
-            detail="单台仪器资产不允许硬删除；报废请由教师发起并在资源异常中审批。",
+            detail=(
+                f"无法删除设备台账：仍关联 {asset_count} 台有永久编号的仪器。"
+                "请通过“查看编号”核对资产；需要移除时应先完成调拨或报废归档。"
+            ),
         )
     ok = await res_crud.delete_equipment_inventory(session, inv_id)
     if not ok:
