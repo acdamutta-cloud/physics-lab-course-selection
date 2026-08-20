@@ -7,12 +7,14 @@ import asyncio
 import getpass
 import math
 import sys
+from collections.abc import Sequence
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from uuid import UUID, uuid5
 
 from pwdlib import PasswordHash
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import AsyncSessionFactory, dispose_database_engine
 from app.models import (
@@ -69,6 +71,14 @@ def read_demo_password(*, password_stdin: bool) -> str:
     if first != second:
         raise ValueError("两次输入的演示账号密码不一致")
     return validate_demo_password(first)
+
+
+async def _flush_in_dependency_order(
+    session: AsyncSession, *groups: Sequence[object]
+) -> None:
+    for group in groups:
+        session.add_all(group)
+        await session.flush()
 
 
 async def _existing_demo_entity_count(session) -> int:
@@ -234,8 +244,11 @@ async def bootstrap_demo(password: str) -> bool:
             academic_status="ACTIVE",
             created_by=admin_id,
         )
-        session.add_all([teacher_user, teacher, student_user, student])
-        await session.flush()
+        await _flush_in_dependency_order(
+            session,
+            [teacher_user, student_user],
+            [teacher, student],
+        )
 
         bitmap = _empty_bitmap(weeks=18, days=7, slots=12)
         session.add_all(
@@ -387,17 +400,11 @@ async def bootstrap_demo(password: str) -> bool:
             status="ACTIVE",
             created_by=admin_id,
         )
-        session.add_all(
-            [
-                laboratory,
-                capability,
-                equipment_type,
-                inventory,
-                requirement,
-                qualification,
-            ]
+        await _flush_in_dependency_order(
+            session,
+            [laboratory, equipment_type, qualification],
+            [capability, inventory, requirement],
         )
-        await session.flush()
 
         task = TeachingTask(
             id=demo_id("teaching-task"),
@@ -431,7 +438,11 @@ async def bootstrap_demo(password: str) -> bool:
             required_session_count=1,
             calculation_snapshot={"source": "DEMO_BOOTSTRAP"},
         )
-        session.add_all([task, cohort, demand])
+        await _flush_in_dependency_order(
+            session,
+            [task],
+            [cohort, demand],
+        )
 
     print("最小演示资料初始化成功：")
     print("- 教师账号：demo_teacher")
