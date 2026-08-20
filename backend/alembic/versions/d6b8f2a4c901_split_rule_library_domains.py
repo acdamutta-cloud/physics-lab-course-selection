@@ -23,6 +23,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 MIGRATION_NAMESPACE = UUID("f8be95f8-4b2c-4c58-a2fc-1785ab633d9d")
+BASELINE_RULE_SET_ID = uuid5(MIGRATION_NAMESPACE, "clean-install-baseline-v1")
 SELECTION_RULE_CODES = {
     "STUDENT_TIME_CONFLICT",
     "PROJECT_DUPLICATE",
@@ -37,6 +38,19 @@ SCHEDULING_RULE_CODES = {
     "TEACHER_BALANCE",
     "EVENING_PENALTY",
 }
+
+BASELINE_RULES = (
+    ("TEACHER_TIME_CONFLICT", "教师时间不得冲突", "HARD"),
+    ("LAB_TIME_CONFLICT", "实验室时间不得冲突", "HARD"),
+    ("SESSION_CAPACITY", "场次不得超过容量", "HARD"),
+    ("TEACHER_QUALIFICATION", "教师须具备项目资格", "HARD"),
+    ("LAB_CAPABILITY", "实验室须支持对应项目", "HARD"),
+    ("EQUIPMENT_AVAILABLE", "设备数量须满足要求", "HARD"),
+    ("TEACHER_BALANCE", "教师工作量尽量均衡", "SOFT"),
+    ("EVENING_PENALTY", "尽量减少晚间场次", "SOFT"),
+    ("STUDENT_TIME_CONFLICT", "学生时间不得冲突", "HARD"),
+    ("PROJECT_DUPLICATE", "实验项目不得重复修读", "HARD"),
+)
 
 ADJUSTMENT_RULES = (
     ("RESCHEDULE_SAME_PROJECT", "调课须保持实验项目不变", "BLOCK"),
@@ -199,6 +213,60 @@ def _insert_domain_rules(
         ]
     if rows:
         connection.execute(rule_config.insert(), rows)
+
+
+def _ensure_clean_install_baseline() -> None:
+    """为从空库升级提供后续规则迁移所需的最小基线。
+
+    早期部署曾在执行迁移前运行独立演示 Seed，因此后续迁移合理地假定至少存在
+    一个已发布规则集。该 Seed 已被移除后，空库会在后续软规则迁移中失败。这里只
+    在 rule_set 完全为空时创建系统基线；任何已有部署都保持原样。
+    """
+
+    connection = op.get_bind()
+    rule_set, rule_config = _rule_tables()
+    existing_count = connection.scalar(
+        sa.select(sa.func.count()).select_from(rule_set)
+    )
+    if existing_count:
+        return
+
+    connection.execute(
+        rule_set.insert().values(
+            id=BASELINE_RULE_SET_ID,
+            rule_domain=None,
+            rule_set_code="SYSTEM-BASELINE",
+            version_no=1,
+            name="系统基础规则集 V1",
+            status="PUBLISHED",
+            published_at=sa.func.now(),
+            published_by=None,
+            created_by=None,
+            updated_by=None,
+        )
+    )
+    connection.execute(
+        rule_config.insert(),
+        [
+            {
+                "id": _rule_id(BASELINE_RULE_SET_ID, code),
+                "rule_set_id": BASELINE_RULE_SET_ID,
+                "rule_code": code,
+                "rule_name": name,
+                "enforcement_type": rule_type,
+                "scope_config": {"source": "SYSTEM_BASELINE"},
+                "condition_config": {"source": "SYSTEM_BASELINE"},
+                "action_config": {
+                    "action": "SCORE" if rule_type == "SOFT" else "BLOCK"
+                },
+                "weight": Decimal(1) if rule_type == "SOFT" else Decimal(0),
+                "priority": 100,
+                "description": f"{name}（系统基础规则）",
+                "enabled": True,
+            }
+            for code, name, rule_type in BASELINE_RULES
+        ],
+    )
 
 
 def _split_existing_rule_sets() -> dict[UUID, dict[str, UUID]]:
@@ -580,6 +648,7 @@ def upgrade() -> None:
         sa.Column("approval_rule_set_id", sa.Uuid(), nullable=True),
     )
 
+    _ensure_clean_install_baseline()
     domain_ids_by_source = _split_existing_rule_sets()
     _backfill_business_references(domain_ids_by_source)
 

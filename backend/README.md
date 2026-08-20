@@ -48,14 +48,9 @@ MODEL_PROVIDER=deepseek
 将真实 Key 仅填写在本地 `.env` 的等号后面。`.env` 已加入
 `.gitignore`，不得提交真实 API Key。
 
-如果暂时不调用真实模型，保持：
-
-```dotenv
-MODEL_PROVIDER=mock
-DEEPSEEK_API_KEY=
-HF_TOKEN=
-DASHSCOPE_API_KEY=
-```
+当前版本不提供 `mock` 模型供应方。只运行单元测试或非 AI 接口时可以不调用外部模型；
+需要验证 AI 对话时，必须选择 `dashscope`、`huggingface` 或 `deepseek` 并配置对应
+API Key。根目录生产 Compose 默认沿用 `backend/.env` 中的模型配置，不再强制覆盖。
 
 ## 3. 聊天模型配置说明
 
@@ -146,8 +141,23 @@ docker compose down -v
 
 ```powershell
 python -m scripts.init_database
-alembic revision --autogenerate -m "initial schema"
 alembic upgrade head
+```
+
+`alembic revision --autogenerate` 仅供开发者在修改 SQLAlchemy 模型后生成新的迁移，
+首次部署和普通升级不得执行该命令。
+
+迁移完成后，可安全、幂等地创建首个管理员：
+
+```powershell
+python -m scripts.create_admin --login-name admin
+```
+
+独立演示环境可在创建管理员后写入最小虚构资料；该命令不会自动执行，并会拒绝向
+已有机构或教学资料的数据库写入：
+
+```powershell
+python -m scripts.bootstrap_demo --confirm-demo-data
 ```
 
 ## 7. 配置文件位置

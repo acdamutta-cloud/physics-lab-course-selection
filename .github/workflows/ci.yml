@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-unit:
+    runs-on: ubuntu-latest
+    env:
+      APP_ENV: testing
+      POSTGRES_PASSWORD: ci-postgres-password
+      JWT_SECRET_KEY: ci-jwt-secret-for-tests-only
+      MODEL_PROVIDER: dashscope
+      DASHSCOPE_API_KEY: ci-placeholder-not-used
+      EMBEDDING_PROVIDER: disabled
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - name: Install backend dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run backend unit tests
+        working-directory: backend
+        run: python -m pytest tests/unit -q
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+  clean-compose-smoke:
+    runs-on: ubuntu-latest
+    needs:
+      - backend-unit
+      - frontend-build
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare isolated CI configuration
+        run: |
+          cp backend/.env.example backend/.env
+          sed -i 's/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci-postgres-password/' backend/.env
+          sed -i 's/^JWT_SECRET_KEY=.*/JWT_SECRET_KEY=ci-jwt-secret-for-tests-only/' backend/.env
+          sed -i 's/^MODEL_PROVIDER=.*/MODEL_PROVIDER=dashscope/' backend/.env
+          sed -i 's/^DASHSCOPE_API_KEY=.*/DASHSCOPE_API_KEY=ci-placeholder-not-used/' backend/.env
+          sed -i 's/^EMBEDDING_PROVIDER=.*/EMBEDDING_PROVIDER=disabled/' backend/.env
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Build and start from empty volumes
+        run: docker compose up -d --build
+      - name: Wait for application health
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8000/api/health >/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker compose ps
+          exit 1
+      - name: Create an isolated administrator
+        env:
+          CI_ADMIN_PASSWORD: CiAdminPassword-2026
+        run: |
+          printf '%s\n' "$CI_ADMIN_PASSWORD" | docker compose exec -T app \
+            python -m scripts.create_admin --login-name ci-admin --password-stdin
+      - name: Verify administrator login
+        env:
+          CI_ADMIN_PASSWORD: CiAdminPassword-2026
+        run: |
+          curl --fail --silent --output /dev/null \
+            --header 'Content-Type: application/json' \
+            --data "{\"login_name\":\"ci-admin\",\"password\":\"$CI_ADMIN_PASSWORD\"}" \
+            http://127.0.0.1:8000/api/v1/auth/login
+      - name: Bootstrap isolated demo data
+        env:
+          CI_DEMO_PASSWORD: CiDemoPassword-2026
+        run: |
+          printf '%s\n' "$CI_DEMO_PASSWORD" | docker compose exec -T app \
+            python -m scripts.bootstrap_demo --confirm-demo-data --password-stdin
+      - name: Verify demo student login
+        env:
+          CI_DEMO_PASSWORD: CiDemoPassword-2026
+        run: |
+          curl --fail --silent --output /dev/null \
+            --header 'Content-Type: application/json' \
+            --data "{\"login_name\":\"demo_student\",\"password\":\"$CI_DEMO_PASSWORD\"}" \
+            http://127.0.0.1:8000/api/v1/auth/login
+      - name: Verify BM25 RAG fallback
+        run: docker compose exec -T app python -m scripts.verify_operation_guide_search
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+      - name: Remove isolated CI services and volumes
+        if: always()
+        run: docker compose down -v

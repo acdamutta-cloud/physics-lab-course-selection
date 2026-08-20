@@ -86,4 +86,11 @@ backend/token.json
 /test_find_students.py
 /et --hard 2928a111d310194fb4a89719ee1be0c0e9e78eca
 
-/docs/
+# docs 中仅公开经审阅的运维与架构文档；其他本地资料继续忽略。
+/docs/*
+!/docs/architecture.md
+!/docs/deployment.md
+!/docs/configuration.md
+!/docs/backup-restore.md
+!/docs/rag.md
+!/docs/troubleshooting.md

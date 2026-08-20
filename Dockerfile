@@ -1,8 +1,10 @@
 # ==================== 前端构建阶段 ====================
-# 使用 DaoCloud 加速地址拉取 docker.io 镜像(国内网络直连 docker.io 不稳定)
-FROM docker.m.daocloud.io/library/node:20-alpine AS frontend-build
+# 默认使用 Docker Hub 官方镜像；网络受限环境可通过构建参数指定镜像仓库。
+ARG NODE_IMAGE=node:20-alpine
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${NODE_IMAGE} AS frontend-build
 
-ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG NPM_REGISTRY=https://registry.npmjs.org
 WORKDIR /build/frontend
 
 COPY frontend/package.json frontend/package-lock.json ./
@@ -12,9 +14,9 @@ COPY frontend/ ./
 RUN npm run build
 
 # ==================== 后端运行阶段 ====================
-FROM docker.m.daocloud.io/library/python:3.12-slim
+FROM ${PYTHON_IMAGE}
 
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_INDEX_URL=https://pypi.org/simple
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1

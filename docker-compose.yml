@@ -1,10 +1,11 @@
-# 生产/演示部署编排:postgres + redis + app(后端托管前端)
+# 生产部署编排:postgres + redis + app(后端托管前端)
 # 与 backend/docker-compose.yml(仅开发基础设施)相互独立。
 #
 # 配置复用 backend/.env(通过 env_file 注入,无需在根目录新建 .env)。
-# 注意:APP_ENV=production 要求 backend/.env 中存在 JWT_SECRET_KEY,
-# 若你的 .env 没有,请追加一行:JWT_SECRET_KEY=<随机串>
-# (生成命令:python -c "import secrets; print(secrets.token_urlsafe(48))")
+# 首次部署前必须从 backend/.env.example 复制并填写数据库密码、JWT 密钥
+# 以及所选模型供应方的 API Key。业务数据保存在命名卷中，不进入镜像。
+name: physics-lab
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -12,9 +13,7 @@ services:
     restart: unless-stopped
     env_file: ./backend/.env
     environment:
-      # POSTGRES_PASSWORD 由 env_file(backend/.env)注入,不要在此重复声明
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-physics_lab}
+      # PostgreSQL 用户、密码和数据库名均由 backend/.env 注入。
       TZ: Asia/Shanghai
     volumes:
       - physics_lab_postgres_data:/var/lib/postgresql/data
@@ -54,7 +53,13 @@ services:
       - physics_lab_network
 
   app:
-    build: .
+    build:
+      context: .
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:20-alpine}
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
     container_name: physics-lab-app
     restart: unless-stopped
     depends_on:
@@ -64,18 +69,14 @@ services:
         condition: service_healthy
     env_file: ./backend/.env
     environment:
-      # 以下显式值优先于 env_file,强制容器内地址与模型默认值
+      # 仅覆盖容器内部服务地址；账号、数据库名和模型配置沿用 backend/.env。
       APP_ENV: production
       TZ: Asia/Shanghai
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-physics_lab}
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
-      # 默认 Qwen3-14B(dashscope);如需换 DeepSeek,改这里为 deepseek
-      MODEL_PROVIDER: dashscope
     command: sh -c "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"
     ports:
       - "8000:8000"

@@ -1081,7 +1081,6 @@ const visibleScheduleEvents = computed(() =>
 )
 const visibleApprovals = computed(() => approvals.value.filter((item) => approvalFilter.value === '全部状态' || item.status === approvalFilter.value))
 const selectedApproval = computed(() => approvals.value.find((item) => item.id === selectedApprovalId.value) ?? null)
-const isTeacherType = computed(() => selectedApproval.value ? ['教师调课','场地调整','代课申请'].includes(selectedApproval.value.type) : false)
 watch(selectedApprovalId, (id) => {
   remediationPlans.value = []; selectedRemediationPlanId.value = ''
   if (!id) return
