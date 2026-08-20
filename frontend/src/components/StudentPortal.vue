@@ -203,6 +203,18 @@ function fmtSession(s: any) {
   return [s.project_name, w, d, t].filter(Boolean).join(' · ')
 }
 
+function toBeijingDate(value?: string): string {
+  // 后端时间字段为 UTC ISO 串,申请记录需按北京时间显示日期
+  if (!value) return ''
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return ''
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(parsed)
+  const get = (type: string) => parts.find(p => p.type === type)?.value ?? ''
+  return `${get('year')}-${get('month')}-${get('day')}`
+}
+
 const applications = computed(() => adjustmentApplications.value.map(item => {
   const source = item.payload?.source?.session
   const target = item.payload?.target
@@ -213,7 +225,7 @@ const applications = computed(() => adjustmentApplications.value.map(item => {
     rawId: item.id,
     type: typeMap[item.request_type],
     project: source || target ? `${fmtSession(source)} → ${fmtSession(target)}` : '实验调整',
-    date: (item.submitted_at || item.created_at || '').slice(0, 10),
+    date: toBeijingDate(item.submitted_at || item.created_at),
     status: statusMap[item.status] || item.status,
     note: (item as any).reject_reason || (item.status === 'CANCELLED' ? '已取消' : ''),
     reviewer: (item as any).reviewer || '',
@@ -244,7 +256,7 @@ const quickQuestions = [
   { icon: '🧭', text: '帮我推荐选课方案。' },
   { icon: '🔄', text: '我想调课，该怎么申请？' },
   { icon: '✏️', text: '如何申请补做实验？' },
-  { icon: '⏰', text: '选课时间窗口是什么时候？' },
+  { icon: '✅', text: '我已经选了哪些实验？' },
   { icon: '↩️', text: '退选有什么限制？' },
 ]
 
@@ -740,8 +752,8 @@ const courseSelectionProgress = computed(() => {
 })
 
 const displayNextLab = computed(() => {
-  if (dashboard.value?.next_lab) return { ...dashboard.value.next_lab, teacher_name: (dashboard.value.next_lab as any).teacher_name || '' }
-  return { week_no: 6, day_of_week: 3, start_slot: 5, end_slot: 8, project_name: '光电效应与普朗克常量测定', lab_name: '近代物理实验室 2', teacher_name: '周老师' }
+  if (!dashboard.value?.next_lab) return null
+  return { ...dashboard.value.next_lab, teacher_name: (dashboard.value.next_lab as any).teacher_name || '' }
 })
 
 const displayTermWeek = computed(() => dashboard.value?.term?.current_week ?? 6)
@@ -1070,12 +1082,28 @@ function adjustmentSessionText(item: AdjustmentSession) {
   return `${item.project_name} · 第${item.week_no}周${item.day_name} 第${item.start_slot}—${item.end_slot}节 · ${item.laboratory_name}`
 }
 
+const ADJUSTMENT_PAGE_SIZE = 10
+const adjustmentPage = ref(0)
+const adjustmentTotal = ref(0)
+
 async function fetchAdjustmentApplications() {
   try {
-    adjustmentApplications.value = await api.get<AdjustmentApplication[]>('/students/me/adjustments')
+    const data = await api.get<{ items: AdjustmentApplication[]; total: number }>(
+      `/students/me/adjustments?limit=${ADJUSTMENT_PAGE_SIZE}&offset=${adjustmentPage.value * ADJUSTMENT_PAGE_SIZE}`
+    )
+    adjustmentApplications.value = data.items
+    adjustmentTotal.value = data.total
   } catch (error) {
     showToast(error instanceof Error ? error.message : '申请记录加载失败')
   }
+}
+
+function changeAdjustmentPage(delta: number) {
+  const maxPage = Math.max(0, Math.ceil(adjustmentTotal.value / ADJUSTMENT_PAGE_SIZE) - 1)
+  const next = Math.min(maxPage, Math.max(0, adjustmentPage.value + delta))
+  if (next === adjustmentPage.value) return
+  adjustmentPage.value = next
+  fetchAdjustmentApplications()
 }
 
 async function openApplication(type: ApplicationType) {
@@ -1446,7 +1474,8 @@ onBeforeUnmount(stopGeneration)
             <div class="hero-copy">
               <span class="hero-kicker">MY PHYSICS LAB</span>
               <h2>探索，从一次严谨的实验开始。</h2>
-              <p>本学期第 {{ displayTermWeek }} 教学周 · 下一项实验安排在第 {{ displayNextLab.week_no }} 周{{ ['','周日','周一','周二','周三','周四','周五','周六'][displayNextLab.day_of_week] }} 第 {{ displayNextLab.start_slot }}–{{ displayNextLab.end_slot }} 节</p>
+              <p v-if="displayNextLab">本学期第 {{ displayTermWeek }} 教学周 · 下一项实验安排在第 {{ displayNextLab.week_no }} 周{{ ['','周日','周一','周二','周三','周四','周五','周六'][displayNextLab.day_of_week] }} 第 {{ displayNextLab.start_slot }}–{{ displayNextLab.end_slot }} 节</p>
+              <p v-else>本学期第 {{ displayTermWeek }} 教学周 · 暂无已选实验安排</p>
               <button type="button" @click="navigate('schedule')">查看我的实验课表 <span>→</span></button>
             </div>
             <div class="hero-orbit" aria-hidden="true"><i></i><b></b><em></em></div>
@@ -1501,9 +1530,16 @@ onBeforeUnmount(stopGeneration)
             </section>
 
             <section class="panel-card next-lab">
-              <div class="panel-title"><div><h3>下一项实验</h3><p>请提前完成实验预习</p></div><span class="week-badge">第 {{ displayNextLab.week_no }} 周</span></div>
-              <h4>{{ displayNextLab.project_name }}</h4>
-              <ul><li><span>◷</span>{{ ['','周日','周一','周二','周三','周四','周五','周六'][displayNextLab.day_of_week] }} 第 {{ displayNextLab.start_slot }}–{{ displayNextLab.end_slot }} 节</li><li><span>⌖</span>{{ displayNextLab.lab_name }}</li><li v-if="displayNextLab.teacher_name"><span>◎</span>{{ displayNextLab.teacher_name }}</li></ul>
+              <template v-if="displayNextLab">
+                <div class="panel-title"><div><h3>下一项实验</h3><p>请提前完成实验预习</p></div><span class="week-badge">第 {{ displayNextLab.week_no }} 周</span></div>
+                <h4>{{ displayNextLab.project_name }}</h4>
+                <ul><li><span>◷</span>{{ ['','周日','周一','周二','周三','周四','周五','周六'][displayNextLab.day_of_week] }} 第 {{ displayNextLab.start_slot }}–{{ displayNextLab.end_slot }} 节</li><li><span>⌖</span>{{ displayNextLab.lab_name }}</li><li v-if="displayNextLab.teacher_name"><span>◎</span>{{ displayNextLab.teacher_name }}</li></ul>
+              </template>
+              <template v-else>
+                <div class="panel-title"><div><h3>下一项实验</h3><p>完成选课后显示最近安排</p></div></div>
+                <h4 class="next-lab-empty">暂无已选实验</h4>
+                <ul><li><span>◷</span>请先在选课中心选择实验场次</li></ul>
+              </template>
             </section>
           </div>
 
@@ -1698,6 +1734,11 @@ onBeforeUnmount(stopGeneration)
               <div class="table-row application-head"><span>申请编号 / 类型</span><span>关联实验项目</span><span>申请日期</span><span>处理状态</span><span>审核人</span><span>审核说明</span></div>
               <div v-for="item in applications" :key="item.id" class="table-row application-row">
                 <span><b>{{ item.type }}</b><small>{{ item.id }}</small></span><span>{{ item.project }}</span><span>{{ item.date }}</span><span><i class="status" :class="{ pending: item.status === '审核中', confirmed: item.status === '已执行', rejected: item.status === '已驳回' || item.status === '已取消' }">{{ item.status }}</i></span><span>{{ item.reviewer || '—' }}</span><span>{{ item.note }} <button v-if="item.status === '审核中'" type="button" class="application-cancel" @click="cancelAdjustment(item.rawId)">取消</button></span>
+              </div>
+              <div v-if="adjustmentTotal > ADJUSTMENT_PAGE_SIZE" class="pagination-bar">
+                <button type="button" :disabled="adjustmentPage === 0" @click="changeAdjustmentPage(-1)">‹ 上一页</button>
+                <span>第 {{ adjustmentPage + 1 }} / {{ Math.max(1, Math.ceil(adjustmentTotal / ADJUSTMENT_PAGE_SIZE)) }} 页 · 共 {{ adjustmentTotal }} 条</span>
+                <button type="button" :disabled="(adjustmentPage + 1) * ADJUSTMENT_PAGE_SIZE >= adjustmentTotal" @click="changeAdjustmentPage(1)">下一页 ›</button>
               </div>
             </div>
           </section>

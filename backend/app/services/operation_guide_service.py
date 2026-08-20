@@ -6,6 +6,7 @@ import re
 from collections import Counter
 from collections.abc import Iterable
 
+import httpx
 from openai import AsyncOpenAI, OpenAIError
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -151,6 +152,8 @@ async def create_embeddings(texts: Iterable[str]) -> list[list[float]]:
     client = AsyncOpenAI(
         api_key=api_key.get_secret_value(),
         base_url=settings.effective_embedding_base_url,
+        # 忽略环境代理:代理不可达会导致 embedding 调用整体失败
+        http_client=httpx.AsyncClient(trust_env=False),
     )
     response = await client.embeddings.create(
         model=settings.embedding_model,

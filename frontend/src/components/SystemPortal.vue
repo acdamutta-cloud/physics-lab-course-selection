@@ -783,6 +783,9 @@ const remediationLoading = ref(false)
 const relocationModalOpen = ref(false)
 const relocationPlans = ref<any[]>([])
 const relocationLoading = ref(false)
+const reviewingIssueId = ref<string | null>(null)
+const reviewingRepairUpdateId = ref<string | null>(null)
+const executingRelocation = ref(false)
 const relocationIssueId = ref('')
 const selectedRelocationPlanIds = ref<Record<string, string>>({})
 const rejectReason = ref('')
@@ -823,13 +826,18 @@ function pendingExtensionForIssue(issueId: string) {
 
 const rejectDialogOpen = ref(false)
 const rejectTargetId = ref('')
+const ADMIN_PAGE_SIZE = 10
+const adminApprovalPage = ref(0)
+const adminApprovalTotal = ref(0)
 
 async function fetchApprovals() {
   try {
-    const [items, teacherItems] = await Promise.all([
-      api.get<any[]>('/admin/adjustments'),
+    const [data, teacherItems] = await Promise.all([
+      api.get<{ items: any[]; total: number }>(`/admin/adjustments?limit=${ADMIN_PAGE_SIZE}&offset=${adminApprovalPage.value * ADMIN_PAGE_SIZE}`),
       api.get<any[]>('/admin/teacher-adjustments').catch(() => []),
     ])
+    const items = data.items
+    adminApprovalTotal.value = data.total + teacherItems.length
     const statusMap: Record<string, ApprovalStatus> = {
       PENDING_REVIEW: '待审批', EXECUTED: '已通过', APPROVED: '已通过',
       REJECTED: '已驳回', CANCELLED: '已取消', AUTO_EXECUTED: '已通过',
@@ -861,6 +869,14 @@ async function fetchApprovals() {
     teacherApprovals.forEach((a: any) => { if (!seen.has(a.rawId)) studentApprovals.push(a) })
     approvals.value = studentApprovals
   } catch { /* keep mock */ }
+}
+
+function changeAdminApprovalPage(delta: number) {
+  const maxPage = Math.max(0, Math.ceil(adminApprovalTotal.value / ADMIN_PAGE_SIZE) - 1)
+  const next = Math.min(maxPage, Math.max(0, adminApprovalPage.value + delta))
+  if (next === adminApprovalPage.value) return
+  adminApprovalPage.value = next
+  fetchApprovals()
 }
 
 async function fetchAdminResourceIssues() {
@@ -910,97 +926,96 @@ async function reviewResourceIssue(item: any, approved: boolean) {
   if (!window.confirm(approved
     ? (isScrap ? `确认审批仪器 ${target} 的报废申请吗？系统会先校验全部相关课程。` : `确认批准仪器 ${target} 进入检修吗？`)
     : `确认驳回该${isScrap ? '报废申请' : '资源异常'}吗？`)) return
+  reviewingIssueId.value = item.id
   try {
     await api.post(`/admin/resource-issues/${item.id}/review`, { approved, approved_quantity: approved ? item.affected_quantity : null, comment: '' })
     await fetchAdminResourceIssues(); await fetchLabs()
     if (approved) {
-      const issues = adminResourceIssues.value
-      const updated = issues.find((i: any) => i.id === item.id)
+      const updated = adminResourceIssues.value.find((i: any) => i.id === item.id)
       if (updated && (updated.status === 'RELOCATION_REQUIRED' || updated.remediation_status === 'REMEDIATION_REQUIRED')) {
-        relocationIssueId.value = updated.id
-        await generateResourceRelocationPlans()
-        if (relocationPlans.value.length) {
-          relocationModalOpen.value = true
-          return
-        }
+        showToast('已批准，当前存在容量缺口，请点击工单上的「生成分流方案」')
+        return
       }
     }
     showToast(approved ? '已批准，资源台账已更新' : '已驳回')
   } catch (e: any) { showToast(e?.message || '操作失败') }
+  finally { reviewingIssueId.value = null }
 }
 
 async function reviewRepairUpdate(item: any, approved: boolean) {
   if (!window.confirm(approved ? `确认该检修进展吗？` : '确认驳回该检修进展吗？')) return
+  reviewingRepairUpdateId.value = item.id
   try {
     await api.post(`/admin/resource-repair-updates/${item.id}/review`, { approved, comment: '' })
     await fetchAdminResourceIssues(); await fetchLabs()
     if (approved && item.update_type === 'EXTEND_REPAIR') {
-      // 延期批准后检查是否需要调整学生
+      // 延期批准后若产生容量缺口，提示管理员手动生成分流方案
       const issues = await api.get<any[]>('/admin/resource-issues')
       const updated = issues.find((i: any) => i.id === item.resource_issue_id || i.id === item.issue_id)
       if (updated && updated.remediation_status === 'REMEDIATION_REQUIRED') {
-        relocationIssueId.value = updated.id
-        await generateResourceRelocationPlans()
-        if (relocationPlans.value.length) {
-          relocationModalOpen.value = true
-          return
-        }
+        showToast('延期已确认，当前存在容量缺口，请点击工单上的「生成分流方案」')
+        return
       }
     }
     showToast(approved ? '检修进展已确认' : '检修进展已驳回')
   } catch (e: any) { showToast(e?.message || '操作失败') }
+  finally { reviewingRepairUpdateId.value = null }
 }
 
-async function generateResourceRelocationPlans() {
-  if (!relocationIssueId.value) return
-  relocationLoading.value = true; relocationPlans.value = []; selectedRelocationPlanIds.value = {}
+// 按钮触发生成分流方案：任何路径都必须给出可见反馈
+async function openRelocationPlans(issueId: string) {
+  if (!issueId) return showToast('请选择需要分流的工单')
+  relocationIssueId.value = issueId
+  relocationPlans.value = []; selectedRelocationPlanIds.value = {}
+  relocationLoading.value = true
   try {
-    relocationPlans.value = await api.post<any[]>(`/admin/resource-issues/${relocationIssueId.value}/remediation/recommend`, {})
+    relocationPlans.value = await api.post<any[]>(`/admin/resource-issues/${issueId}/remediation/recommend`, {})
     for (const plan of relocationPlans.value) {
       if (!selectedRelocationPlanIds.value[plan.source_session_id] && !plan.remaining_unresolved_count) {
         selectedRelocationPlanIds.value[plan.source_session_id] = plan.id
       }
     }
+    // 方案生成成功后审批可能由"待分流"转为"检修中"，刷新列表状态
+    const current = adminResourceIssues.value.find((i: any) => i.id === issueId)
+    await fetchAdminResourceIssues()
+    if (relocationPlans.value.length) {
+      relocationModalOpen.value = true
+    } else if (current?.impact?.shortage) {
+      showToast('已生成：当前容量不足且暂无可行的分流方案')
+    } else {
+      showToast('已生成：当前容量已满足，无需分流')
+    }
   } catch (e: any) { showToast(e?.message || '生成分流方案失败') }
   finally { relocationLoading.value = false }
 }
 
-async function generateRelocationPlans(issueId: string) {
-  relocationIssueId.value = issueId
-  await generateResourceRelocationPlans()
-  relocationModalOpen.value = true
-}
 
-async function executeResourceRelocationPlan(planId?: string) {
-  const issue = adminResourceIssues.value.find((item: any) => item.id === relocationIssueId.value)
-  const isScrap = issue?.issue_type === 'EQUIPMENT_SCRAP'
-  const planIds = isScrap ? Object.values(selectedRelocationPlanIds.value) : (planId ? [planId] : [])
-  const plan = relocationPlans.value.find((p: any) => p.id === (planId || planIds[0]))
+async function executeResourceRelocationPlan(planId: string) {
+  const plan = relocationPlans.value.find((p: any) => p.id === planId)
   if (!plan) return
-  const sourceCount = new Set(relocationPlans.value.map((item: any) => item.source_session_id)).size
-  if (isScrap && planIds.length !== sourceCount) { showToast('请为每个受影响场次选择一套完整分流方案'); return }
-  const unresolved = planIds.reduce((sum, id) => sum + (relocationPlans.value.find((p: any) => p.id === id)?.remaining_unresolved_count || 0), 0)
-  if (unresolved > 0) { showToast(`仍有 ${unresolved} 名学生未覆盖，不能执行最终报废`); return }
-  const msg = isScrap
-    ? `确认原子化执行该分流方案并批准报废 ${issue?.asset?.instrument_no || '该仪器'} 吗？`
-    : `确认执行该迁移方案吗？将迁移 ${plan.planned_relocation_count} 名学生。`
-  if (!window.confirm(msg)) return
+  if (plan.remaining_unresolved_count > 0) { showToast(`仍有 ${plan.remaining_unresolved_count} 名学生未覆盖`); return }
+  if (!window.confirm(`确认执行该迁移方案吗？将迁移 ${plan.planned_relocation_count} 名学生。`)) return
+  executingRelocation.value = true
   try {
-    if (isScrap) {
-      await api.post(`/admin/resource-issues/${relocationIssueId.value}/execute-relocation-and-scrap`, { plan_ids: planIds })
-    } else {
-      await api.post(`/admin/resource-issues/${relocationIssueId.value}/remediation/plans/${planId}/execute`, {})
-    }
-    showToast(isScrap ? '分流已执行，仪器已报废' : '迁移方案已执行')
+    await api.post(`/admin/resource-issues/${relocationIssueId.value}/remediation/plans/${planId}/execute`, {})
+    showToast('迁移方案已执行')
     relocationModalOpen.value = false
     await fetchAdminResourceIssues()
   } catch (e: any) { showToast(e?.message || '执行失败') }
+  finally { executingRelocation.value = false }
 }
 
 function fmtRelocationTarget(target: any) {
   if (!target) return '—'
   const dayNames = ['', '周日', '周一', '周二', '周三', '周四', '周五', '周六']
   return `第${target.week_no}周 ${dayNames[target.day_of_week] || ''} 第${target.start_slot}—${target.end_slot}节`
+}
+function relocationTargetText(summary: any) {
+  if (!summary?.targets?.length) return ''
+  const dayNames = ['', '周日', '周一', '周二', '周三', '周四', '周五', '周六']
+  const first = summary.targets[0]
+  const extra = summary.targets.length > 1 ? ` 等 ${summary.targets.length} 个场次` : ''
+  return ` · 迁至第${first.week_no}周 ${dayNames[first.day_of_week] || ''} 第${first.start_slot}—${first.end_slot}节${extra}`
 }
 
 async function generateRemediationPlans() {
@@ -1454,9 +1469,13 @@ async function savePlanDraft() {
       ? await api.put<PlanDetail>(`/training-plans/${currentPlanId.value}`, payload)
       : await api.post<PlanDetail>('/training-plans', payload)
     currentPlanId.value = saved.id
+    // 保存后立即发布:培养方案必须保持已发布状态,学生端选课才能读取。
+    // 发布会自动归档同专业同入学年份的其他已发布版本;内容不完整时
+    // 发布会拒绝,方案保持草稿可继续编辑。
+    await api.post(`/training-plans/${saved.id}/publish`, {})
     planEditorOpen.value = false
     await loadPlans()
-    showToast('培养方案草稿已保存')
+    showToast('培养方案已保存并发布')
   } catch (error) {
     showToast(error instanceof Error ? error.message : '培养方案保存失败')
   } finally {
@@ -1844,6 +1863,11 @@ const selectedCandidate = computed(() => {
             <div class="approval-table">
               <div class="approval-row approval-head"><span>申请编号 / 来源</span><span>申请人</span><span>申请类型</span><span>关联项目</span><span>提交时间</span><span>审批状态</span><span>操作</span></div>
               <div v-for="item in visibleApprovals" :key="item.id" class="approval-row"><span><b>{{ item.id }}</b><small>{{ item.source }}</small></span><span>{{ item.applicant }}</span><span><i class="approval-type" :class="item.type === '调课申请' || item.type === '教师调课' ? 'type-reschedule' : item.type === '换组申请' || item.type === '场地调整' ? 'type-change' : item.type === '补做申请' || item.type === '代课申请' ? 'type-makeup' : 'type-reschedule'">{{ item.type }}</i></span><span>{{ item.subject }}</span><span>{{ item.submitted }}</span><span><i class="approval-status" :class="{ pending: item.status === '待审批', approved: item.status === '已通过', rejected: item.status === '已驳回', cancelled: item.status === '已取消' }">{{ item.status }}</i></span><span><button @click="selectedApprovalId = item.id">{{ item.status === '待审批' ? '去审批' : '查看结果' }}</button></span></div>
+              <div v-if="adminApprovalTotal > ADMIN_PAGE_SIZE" class="pagination-bar">
+                <button type="button" :disabled="adminApprovalPage === 0" @click="changeAdminApprovalPage(-1)">‹ 上一页</button>
+                <span>第 {{ adminApprovalPage + 1 }} / {{ Math.max(1, Math.ceil(adminApprovalTotal / ADMIN_PAGE_SIZE)) }} 页 · 共 {{ adminApprovalTotal }} 条</span>
+                <button type="button" :disabled="(adminApprovalPage + 1) * ADMIN_PAGE_SIZE >= adminApprovalTotal" @click="changeAdminApprovalPage(1)">下一页 ›</button>
+              </div>
             </div>
           </section>
           <section class="system-panel admin-issue-panel">
@@ -1852,8 +1876,8 @@ const selectedCandidate = computed(() => {
             <div class="admin-issue-toolbar"><div><button type="button" :class="{ active: adminIssueTypeFilter === 'ALL' }" @click="adminIssueTypeFilter = 'ALL'">全部类型</button><button type="button" :class="{ active: adminIssueTypeFilter === 'EQUIPMENT_FAILURE' }" @click="adminIssueTypeFilter = 'EQUIPMENT_FAILURE'">故障上报</button><button type="button" :class="{ active: adminIssueTypeFilter === 'EQUIPMENT_SCRAP' }" @click="adminIssueTypeFilter = 'EQUIPMENT_SCRAP'">报废申请</button></div><label><span>⌕</span><input v-model="adminIssueKeyword" placeholder="搜索工单、教师或仪器号" /></label><select v-model="adminIssueStatusFilter"><option value="ALL">全部状态</option><option value="PENDING_REVIEW">待审批</option><option value="PROCESSING">检修中</option><option value="RELOCATION_REQUIRED">待分流</option><option value="RESOLVED">已恢复</option><option value="SCRAPPED">已报废</option><option value="REJECTED">已驳回</option></select></div>
             <div class="admin-issue-list">
               <article v-for="item in filteredAdminResourceIssues" :key="item.id" class="admin-issue-card" :class="{ scrap: item.issue_type === 'EQUIPMENT_SCRAP' }">
-                <header><div><i>{{ item.issue_type === 'EQUIPMENT_SCRAP' ? '报废' : '故障' }}</i><span><b>{{ item.report_no }}</b><small>{{ (item.created_at || '').slice(0, 16).replace('T', ' ') }} · {{ item.severity }}</small></span></div><em :class="item.status.toLowerCase()">{{ resourceStatusName(item.status) }}</em></header>
-                <div class="admin-issue-body"><section><small>仪器设备</small><strong>{{ item.asset?.instrument_no || '历史汇总工单' }}</strong><span>{{ item.asset?.equipment_name || '—' }} · {{ item.asset?.laboratory_name || labs.find(l => l.id === item.laboratory_id)?.name || '—' }}</span></section><section><small>上报教师</small><strong>{{ item.reporter?.name || '—' }}</strong><span>{{ item.reporter?.employee_no || '教师信息未加载' }}</span></section><section><small>教学影响</small><strong>{{ item.impact_course_count }} 门课程 · {{ item.impact_session_count }} 个场次</strong><span :class="{ warning: item.impact?.shortage }">{{ item.impact_student_count }} 名学生需分流</span></section><section><small>处置要求</small><strong>{{ item.impact?.shortage ? '必须先完成学生分流' : '当前容量满足要求' }}</strong><span v-if="item.source_issue">来源故障 {{ item.source_issue.report_no }}</span><span v-else>无关联来源工单</span></section></div>
+                <header><div><i>{{ item.issue_type === 'EQUIPMENT_SCRAP' ? '报废' : '故障' }}</i><span><b>{{ item.report_no }}</b><small>{{ formatResourceTime(item.created_at) }} · {{ item.severity }}</small></span></div><em :class="item.status.toLowerCase()">{{ resourceStatusName(item.status) }}</em></header>
+                <div class="admin-issue-body"><section><small>仪器设备</small><strong>{{ item.asset?.instrument_no || '历史汇总工单' }}</strong><span>{{ item.asset?.equipment_name || '—' }} · {{ item.asset?.laboratory_name || labs.find(l => l.id === item.laboratory_id)?.name || '—' }}</span></section><section><small>上报教师</small><strong>{{ item.reporter?.name || '—' }}</strong><span>{{ item.reporter?.employee_no || '教师信息未加载' }}</span></section><section v-if="item.impact?.shortage || item.relocation_summary"><small>教学影响</small><strong>{{ item.impact_course_count }} 门课程 · {{ item.impact_session_count }} 个场次</strong><span v-if="item.relocation_summary" class="capacity-safe">✓ 已分流 {{ item.relocation_summary.migrated_count }} 名学生</span><span v-else-if="item.impact_student_count > 0" :class="{ warning: item.impact?.shortage }">{{ item.impact_student_count }} 名学生需分流</span></section><section v-if="item.impact?.shortage || item.relocation_summary"><small>处置要求</small><strong>{{ item.relocation_summary ? '已分流完成' : (item.status === 'RELOCATION_REQUIRED' ? '必须先完成学生分流' : '检修中 · 容量不足，需生成分流方案') }}</strong><span v-if="item.relocation_summary" class="capacity-safe">✓ 已分流 {{ item.relocation_summary.migrated_count }} 名学生{{ relocationTargetText(item.relocation_summary) }}</span><span v-else-if="item.source_issue">来源故障 {{ item.source_issue.report_no }}</span></section></div>
                 <div v-if="item.issue_type === 'EQUIPMENT_FAILURE'" class="admin-repair-timeline">
                   <section><small>检修开始</small><strong>{{ formatResourceTime(item.impact_start) }}</strong></section><i>→</i>
                   <section><small>当前预计完成</small><strong>{{ formatResourceTime(item.impact_end) }}</strong></section>
@@ -1861,11 +1885,11 @@ const selectedCandidate = computed(() => {
                   <template v-else-if="item.resolved_at"><i>→</i><section class="resolved"><small>实际检修完成</small><strong>{{ formatResourceTime(item.resolved_at) }}</strong></section></template>
                 </div>
                 <p>{{ item.description }}</p>
-                <footer><span v-if="item.impact?.shortage" class="relocation-warning">! 分流未完成前禁止最终报废</span><span v-else class="capacity-safe">✓ 无容量缺口</span><div><template v-if="item.status === 'PENDING_REVIEW'"><button type="button" class="danger" @click="reviewResourceIssue(item, false)">驳回</button><button type="button" class="primary" @click="reviewResourceIssue(item, true)">{{ item.issue_type === 'EQUIPMENT_SCRAP' ? '审核报废' : '批准检修' }}</button></template><button v-else-if="item.status === 'RELOCATION_REQUIRED' || (item.status === 'PROCESSING' && item.impact?.shortage)" type="button" class="primary" @click="generateRelocationPlans(item.id)">生成分流方案</button><small v-else>流程已处理</small></div></footer>
+                <footer><span v-if="!item.impact?.shortage" class="capacity-safe">✓ 无容量缺口</span><div><template v-if="item.status === 'PENDING_REVIEW'"><button type="button" class="danger" :disabled="reviewingIssueId === item.id" @click="reviewResourceIssue(item, false)">{{ reviewingIssueId === item.id ? '处理中…' : '驳回' }}</button><button type="button" class="primary" :disabled="reviewingIssueId === item.id" @click="reviewResourceIssue(item, true)">{{ reviewingIssueId === item.id ? '处理中…' : (item.issue_type === 'EQUIPMENT_SCRAP' ? '审核报废' : '批准检修') }}</button></template><template v-else-if="['PROCESSING', 'RELOCATION_REQUIRED'].includes(item.status) && item.impact?.shortage"><button type="button" class="primary" :disabled="relocationLoading" @click="openRelocationPlans(item.id)">{{ relocationLoading && relocationIssueId === item.id ? '生成中…' : '生成分流方案' }}</button></template><small v-else>流程已处理</small></div></footer>
               </article>
               <div v-if="!filteredAdminResourceIssues.length" class="admin-issue-empty"><span>✓</span><strong>暂无符合条件的资源异常</strong><p>新的故障上报或报废申请会显示在这里。</p></div>
             </div>
-            <section v-if="adminRepairUpdates.some(item => item.approval_status === 'PENDING')" class="repair-review-section"><header><div><h4>待确认检修进展</h4><p>教师提交的完成或延期申请</p></div><span>{{ adminRepairUpdates.filter(item => item.approval_status === 'PENDING').length }} 项</span></header><article v-for="item in adminRepairUpdates.filter(item => item.approval_status === 'PENDING')" :key="item.id"><span>↻</span><p><b>{{ item.update_type === 'COMPLETE_RESTORE' ? '单台仪器检修完成' : '申请延期检修' }}</b><small v-if="item.update_type === 'EXTEND_REPAIR'">申请延期至 {{ formatResourceTime(item.proposed_end_time) }}</small><small>{{ item.note || '教师提交了检修进展' }}</small></p><button type="button" @click="reviewRepairUpdate(item, false)">驳回</button><button type="button" class="primary" @click="reviewRepairUpdate(item, true)">确认并更新台账</button></article></section>
+            <section v-if="adminRepairUpdates.some(item => item.approval_status === 'PENDING')" class="repair-review-section"><header><div><h4>待确认检修进展</h4><p>教师提交的完成或延期申请</p></div><span>{{ adminRepairUpdates.filter(item => item.approval_status === 'PENDING').length }} 项</span></header><article v-for="item in adminRepairUpdates.filter(item => item.approval_status === 'PENDING')" :key="item.id"><span>↻</span><p><b>{{ item.update_type === 'COMPLETE_RESTORE' ? '单台仪器检修完成' : '申请延期检修' }}</b><small v-if="item.update_type === 'EXTEND_REPAIR'">申请延期至 {{ formatResourceTime(item.proposed_end_time) }}</small><small>{{ item.note || '教师提交了检修进展' }}</small></p><button type="button" :disabled="reviewingRepairUpdateId === item.id" @click="reviewRepairUpdate(item, false)">{{ reviewingRepairUpdateId === item.id ? '处理中…' : '驳回' }}</button><button type="button" class="primary" :disabled="reviewingRepairUpdateId === item.id" @click="reviewRepairUpdate(item, true)">{{ reviewingRepairUpdateId === item.id ? '处理中…' : '确认并更新台账' }}</button></article></section>
           </section>
         </template>
       </main>
@@ -1903,18 +1927,12 @@ const selectedCandidate = computed(() => {
                 <span v-else style="display:inline-block;padding:2px 6px;border-radius:3px;color:#a16c2e;background:#fbf1e1;font-size:7px">暂无可行场次</span>
               </div>
             </div>
-            <label v-if="adminResourceIssues.find(item => item.id === relocationIssueId)?.issue_type === 'EQUIPMENT_SCRAP'" style="display:flex;align-items:center;gap:6px;margin:8px 0;font-size:10px;color:#405864">
-              <input v-model="selectedRelocationPlanIds[plan.source_session_id]" type="radio" :name="`relocation-${plan.source_session_id}`" :value="plan.id" :disabled="plan.remaining_unresolved_count > 0"> 选择此场次方案
-            </label>
             <div v-if="plan.status !== 'EXECUTED'" style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
               <button @click="relocationModalOpen = false" style="padding:7px 14px;border:1px solid #dce4e8;border-radius:5px;color:#657885;background:#fff;font-size:8px;cursor:pointer">关闭</button>
-              <button v-if="adminResourceIssues.find(item => item.id === relocationIssueId)?.issue_type !== 'EQUIPMENT_SCRAP'" :disabled="plan.remaining_unresolved_count > 0" @click="executeResourceRelocationPlan(plan.id)" style="padding:7px 14px;border:0;border-radius:5px;color:#fff;background:#27ae60;font-size:8px;cursor:pointer">执行迁移方案</button>
+              <button :disabled="plan.remaining_unresolved_count > 0 || executingRelocation" @click="executeResourceRelocationPlan(plan.id)" style="padding:7px 14px;border:0;border-radius:5px;color:#fff;background:#27ae60;font-size:8px;cursor:pointer">{{ executingRelocation ? '执行中…' : '执行迁移方案' }}</button>
             </div>
             <div v-else style="text-align:right;margin-top:8px;color:#27ae60;font-size:9px">✓ 已执行</div>
           </article>
-          <footer v-if="relocationPlans.length && adminResourceIssues.find(item => item.id === relocationIssueId)?.issue_type === 'EQUIPMENT_SCRAP'" style="display:flex;justify-content:flex-end;margin-top:12px">
-            <button @click="executeResourceRelocationPlan()" style="padding:9px 16px;border:0;border-radius:6px;color:#fff;background:#167a7d;cursor:pointer">执行全部分流并批准报废</button>
-          </footer>
         </template>
       </div>
     </div>
@@ -1965,7 +1983,7 @@ const selectedCandidate = computed(() => {
           <label class="full-field">实验项目顺序要求<textarea v-model="activePlanCourse.orderRule" rows="3" placeholder="例如：必须先完成基础测量项目，再选择近代物理项目"></textarea></label>
           <div class="rule-options"><label><input type="checkbox" checked disabled />未完成先修课程时禁止选课</label><label><input type="checkbox" checked disabled />必做项目优先于选做项目</label><label><input v-model="activePlanCourse.allowOrderOverride" type="checkbox" />允许特殊情况跳过项目顺序</label></div>
         </section>
-        <footer><p>保存后写入培养方案草稿，发布前仍可继续修改。</p><button type="button" @click="planEditorOpen = false">取消</button><button type="submit" :disabled="savingPlan">{{ savingPlan ? '保存中...' : '保存草稿' }}</button></footer>
+        <footer><p>保存后立即发布生效，同专业同入学年份的旧版本将被新版本替换；内容不完整时无法发布。</p><button type="button" @click="planEditorOpen = false">取消</button><button type="submit" :disabled="savingPlan">{{ savingPlan ? '保存中...' : '保存并发布' }}</button></footer>
       </form>
     </div>
 
@@ -1990,7 +2008,7 @@ const selectedCandidate = computed(() => {
     <div v-if="selectedApproval" class="system-dialog-backdrop" @click.self="selectedApprovalId = null">
       <aside class="approval-detail" style="max-height:85vh;overflow-y:auto">
         <header><div><span>✓</span><div><h2>审批详情</h2><p>{{ selectedApproval.id }}</p></div></div><button @click="selectedApprovalId = null">×</button></header>
-        <dl><div><dt>申请人</dt><dd>{{ selectedApproval.applicant }}</dd></div><div><dt>申请类型</dt><dd><i class="approval-type" :class="selectedApproval.type === '调课申请' || selectedApproval.type === '教师调课' ? 'type-reschedule' : selectedApproval.type === '换组申请' ? 'type-change' : 'type-makeup'">{{ selectedApproval.type }}</i></dd></div><div><dt>原项目/场次</dt><dd>{{ isTeacherType ? formatAdjustSession(selectedApproval.source_info) : (formatAdjustSession(selectedApproval.source_info?.session) || selectedApproval.source_info?.project_name || selectedApproval.subject) }}</dd></div><div><dt>目标安排</dt><dd>{{ selectedApproval.type === '代课申请' ? (selectedApproval.target_info?.teacher_name || '—') : (isTeacherType ? formatAdjustSession(selectedApproval.target_info) : (formatAdjustSession(selectedApproval.target_info) || selectedApproval.subject)) }}</dd></div><div><dt>申请原因</dt><dd>{{ selectedApproval.reason_text || '—' }}</dd></div><div><dt>当前状态</dt><dd><i class="approval-status" :class="{ pending: selectedApproval.status === '待审批', approved: selectedApproval.status === '已通过', rejected: selectedApproval.status === '已驳回', cancelled: selectedApproval.status === '已取消' }">{{ selectedApproval.status }}</i></dd></div></dl>
+        <dl><div><dt>申请人</dt><dd>{{ selectedApproval.applicant }}</dd></div><div><dt>申请类型</dt><dd><i class="approval-type" :class="selectedApproval.type === '调课申请' || selectedApproval.type === '教师调课' ? 'type-reschedule' : selectedApproval.type === '换组申请' ? 'type-change' : 'type-makeup'">{{ selectedApproval.type }}</i></dd></div><div><dt>原项目/场次</dt><dd>{{ formatAdjustSession(selectedApproval.source_info) || selectedApproval.subject || '—' }}</dd></div><div><dt>目标安排</dt><dd>{{ selectedApproval.type === '代课申请' ? (selectedApproval.target_info?.teacher_name || '—') : (formatAdjustSession(selectedApproval.target_info) || selectedApproval.subject || '—') }}</dd></div><div><dt>申请原因</dt><dd>{{ selectedApproval.reason_text || '—' }}</dd></div><div><dt>当前状态</dt><dd><i class="approval-status" :class="{ pending: selectedApproval.status === '待审批', approved: selectedApproval.status === '已通过', rejected: selectedApproval.status === '已驳回', cancelled: selectedApproval.status === '已取消' }">{{ selectedApproval.status }}</i></dd></div></dl>
         <section v-if="selectedApproval.validation_result?.affected_students?.length" class="rejection"><span>受影响学生（{{ selectedApproval.validation_result.affected_students.length }}人）</span><p v-for="student in selectedApproval.validation_result.affected_students" :key="student.student_id"><b>{{ student.name }} {{ student.student_no }}</b>：{{ student.reasons.join('、') }}</p><small>存在冲突时必须先选择覆盖全部学生的安置方案，批准时会在同一事务中完成学生换场次。</small><button type="button" class="remediation-generate" :disabled="remediationLoading" @click="generateRemediationPlans">{{ remediationLoading ? '正在生成…' : '生成学生安置方案' }}</button></section>
         <section v-if="remediationPlans.length" class="remediation-plans"><span>请选择安置方案</span><label v-for="plan in remediationPlans" :key="plan.id" :class="{ active: selectedRemediationPlanId === plan.id }"><input v-model="selectedRemediationPlanId" type="radio" :value="plan.id"><div><b>方案 {{ plan.plan_no }} · {{ plan.summary?.description }}</b><p v-for="entry in plan.items" :key="entry.student_id">{{ entry.student_name }}：{{ entry.project_name }} · 第{{ entry.week_no }}周 {{ ['','周日','周一','周二','周三','周四','周五','周六'][entry.day_of_week] }} 第{{ entry.start_slot }}—{{ entry.end_slot }}节 · {{ entry.laboratory_name }}</p></div></label></section>
         <section v-if="selectedApproval.status === '已驳回'" class="rejection"><span>驳回理由</span><p>{{ selectedApproval.result }}</p></section>

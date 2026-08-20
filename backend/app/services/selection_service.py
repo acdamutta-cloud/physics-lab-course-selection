@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -15,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.selection_precheck import (
     applications_key,
+    ensure_selection_context,
     idempotency_key,
     selected_projects_key,
     student_context_key,
@@ -32,8 +34,8 @@ from app.models.enrollment import StudentProjectRecord
 from app.models.identity import Student
 from app.models.scheduling import ExperimentSession, ScheduleVersion
 from app.schemas.student_consultation import SelectionEligibilityResult
-from app.services.student_cache_service import refresh_experiment_views_after_commit
 from app.services.selection_window_service import resolve_window_gate
+from app.services.student_cache_service import refresh_experiment_views_after_commit
 from app.services.student_consultation_service import check_selection_eligibility
 
 logger = logging.getLogger(__name__)
@@ -301,7 +303,9 @@ return {1, meta[2], meta[3], rule['requirement_type']}
 
 LUA_FINALIZE = """
 redis.call('ZREM', KEYS[1], ARGV[1])
-redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[2]))
+-- 预留键必须随提交成功删除,否则残留 24h 期间同项目任何选课都会被
+-- 预检当作"已选"(PROJECT_ALREADY_SELECTED)拒绝,退课后重选也会误伤。
+redis.call('DEL', KEYS[2])
 if redis.call('GET', KEYS[3]) == ARGV[3] then redis.call('DEL', KEYS[3]) end
 return 1
 """
@@ -487,6 +491,7 @@ async def enqueue_select_session(
     term_id: UUID,
     session_id: UUID,
     window_gate: dict[str, object] | None = None,
+    ensure_context: Callable[[], Awaitable[None]] | None = None,
 ) -> SelectionOperationResult:
     """Finish admission in Redis and return without waiting for PostgreSQL."""
 
@@ -498,6 +503,20 @@ async def enqueue_select_session(
         enqueue=True,
         window_gate=window_gate,
     )
+    if code == -3 and ensure_context is not None:
+        # 预检缓存缺失(-3):选课提交成功会同步删除准入 context,若本次
+        # 请求恰好落在后台重建完成前,会误报"选课状态发生变化"。补建
+        # context 后最多重试一次;LUA -3 分支已释放锁、无其他副作用,
+        # 重试安全且幂等。
+        await ensure_context()
+        code, project_id, course_id, request_id, detail = await _preflight_reserve(
+            redis,
+            student_id=student_id,
+            term_id=term_id,
+            session_id=session_id,
+            enqueue=True,
+            window_gate=window_gate,
+        )
     rejected = _preflight_failure_result(
         code=code,
         student_id=student_id,
@@ -708,12 +727,20 @@ async def enqueue_select_session_with_fallback(
             result="ineligible", message=gate["message"]
         )
     try:
+        # 准入上下文可能因缓存清理/过期缺失,选课前同步补建,
+        # 避免学生命中 SELECTION_CACHE_MISSING("选课状态发生变化")。
+        await ensure_selection_context(
+            db, student_id=student_id, term_id=term_id, redis=redis
+        )
         return await enqueue_select_session(
             redis,
             student_id=student_id,
             term_id=term_id,
             session_id=session_id,
             window_gate=gate,
+            ensure_context=lambda: ensure_selection_context(
+                db, student_id=student_id, term_id=term_id, redis=redis
+            ),
         )
     except (RedisError, OSError):
         logger.warning(
@@ -932,6 +959,12 @@ async def select_session(
 ) -> SelectionOperationResult:
     """Compatibility path for internal callers that still need a final result."""
 
+    # AI 方案执行等内部调用同样需要准入上下文;课表发布批量清理后,
+    # 缺失的上下文会命中 SELECTION_CACHE_MISSING("选课状态发生变化")。
+    # ensure_selection_context 幂等且内部已处理 Redis 不可用降级。
+    await ensure_selection_context(
+        db, student_id=student_id, term_id=term_id, redis=redis
+    )
     gate = await resolve_window_gate(db, term_id)
     if not gate["open"]:
         return SelectionOperationResult(
@@ -944,6 +977,20 @@ async def select_session(
         session_id=session_id,
         window_gate=gate,
     )
+    if code == -3:
+        # 预检缓存缺失(-3):提交成功会同步删除准入 context,后台重建与
+        # 批量执行存在竞态窗口;补建后最多重试一次,避免"选课状态发生
+        # 变化"误报。LUA -3 分支已释放锁、无其他副作用,重试安全。
+        await ensure_selection_context(
+            db, student_id=student_id, term_id=term_id, redis=redis
+        )
+        code, project_id, course_id, token, detail = await _preflight_reserve(
+            redis,
+            student_id=student_id,
+            term_id=term_id,
+            session_id=session_id,
+            window_gate=gate,
+        )
     rejected = _preflight_failure_result(
         code=code,
         student_id=student_id,

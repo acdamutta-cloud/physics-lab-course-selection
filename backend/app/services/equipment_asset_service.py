@@ -6,7 +6,6 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.curriculum import AcademicTerm
 from app.models.resources import (
     EquipmentAsset,
     EquipmentAssetEvent,
@@ -20,7 +19,6 @@ from app.models.resources import (
 )
 from app.models.scheduling import ExperimentSession, ScheduleVersion
 
-
 ACTIVE_ASSET_STATUSES = {"AVAILABLE", "QUARANTINED", "UNDER_REPAIR", "DISABLED", "LOST"}
 
 
@@ -32,6 +30,10 @@ async def sync_inventory_counts(session: AsyncSession, inventory_id: UUID) -> No
     )
     if inventory is None:
         raise LookupError("设备汇总库存不存在。")
+    # 全局 autoflush=False（app/db/session.py）：显式 flush 让本事务内 pending
+    # 的资产状态变更（如审批通过转入检修）先落库，避免统计滞后一台导致
+    # 容量误判（23 台报 4 次：第 4 次审批应扣后 19 < 20 触发分流）。
+    await session.flush()
     statuses = list(
         (
             await session.execute(
@@ -191,9 +193,10 @@ async def create_asset_issue(session: AsyncSession, *, teacher_id: UUID, actor_i
     previous_status = asset.status
     session.add(ResourceIssueAsset(resource_issue_id=item.id, asset_id=asset.id, active=True, previous_status=previous_status, created_by=actor_id, updated_by=actor_id))
     session.add(ResourceIssueObservation(resource_issue_id=item.id, reporter_teacher_id=teacher_id, severity=severity, description=description, created_by=actor_id, updated_by=actor_id))
-    asset.status = "QUARANTINED"; asset.updated_by = actor_id
-    session.add(EquipmentAssetEvent(asset_id=asset.id, event_type="SCRAP_REQUEST" if issue_type == "EQUIPMENT_SCRAP" else "ISSUE_REPORT", from_status=previous_status, to_status="QUARANTINED", to_inventory_id=asset.current_inventory_id, resource_issue_id=item.id, note=description, created_by=actor_id, updated_by=actor_id))
-    await sync_inventory_counts(session, asset.current_inventory_id)
+    # 上报不隔离仪器：审批通过后才转入检修/报废并扣减可用库存。
+    # 否则多台仪器同时上报会一次性扣光容量，导致前几台审批也误判为需分流
+    # （如 23 台报 4 次，应前 3 次审批直接通过、第 4 次才生成分流方案）。
+    session.add(EquipmentAssetEvent(asset_id=asset.id, event_type="SCRAP_REQUEST" if issue_type == "EQUIPMENT_SCRAP" else "ISSUE_REPORT", from_status=previous_status, to_status=previous_status, to_inventory_id=asset.current_inventory_id, resource_issue_id=item.id, note=description, created_by=actor_id, updated_by=actor_id))
     await session.commit(); await session.refresh(item)
     return item, False
 
@@ -266,3 +269,88 @@ async def transfer_asset(session: AsyncSession, *, asset_id: UUID, target_lab_id
 async def asset_events(session: AsyncSession, asset_id: UUID) -> list[dict[str, object]]:
     rows = list((await session.execute(select(EquipmentAssetEvent).where(EquipmentAssetEvent.asset_id == asset_id).order_by(EquipmentAssetEvent.created_at.desc()))).scalars())
     return [{"id": str(item.id), "event_type": item.event_type, "from_status": item.from_status, "to_status": item.to_status, "note": item.note or "", "created_at": item.created_at} for item in rows]
+
+
+async def issue_assets_payload_map(
+    session: AsyncSession, issue_ids: list[UUID]
+) -> dict[UUID, dict[str, object] | None]:
+    """Batch variant of issue_asset_payload: one round-trip set instead of N+1.
+
+    Returns {issue_id: payload | None}; payload semantics match
+    issue_asset_payload (first active linked asset).
+    """
+    if not issue_ids:
+        return {}
+    links = list(
+        (
+            await session.execute(
+                select(ResourceIssueAsset).where(
+                    ResourceIssueAsset.resource_issue_id.in_(issue_ids),
+                    ResourceIssueAsset.active.is_(True),
+                )
+            )
+        ).scalars()
+    )
+    asset_ids = {link.asset_id for link in links}
+    assets = {
+        item.id: item
+        for item in (
+            await session.execute(
+                select(EquipmentAsset).where(EquipmentAsset.id.in_(asset_ids))
+            )
+        ).scalars()
+    }
+    inventory_ids = {
+        asset.current_inventory_id
+        for asset in assets.values()
+        if asset.current_inventory_id
+    }
+    inventories = {
+        item.id: item
+        for item in (
+            await session.execute(
+                select(LabEquipmentInventory).where(
+                    LabEquipmentInventory.id.in_(inventory_ids)
+                )
+            )
+        ).scalars()
+    }
+    equipment_ids = {asset.equipment_type_id for asset in assets.values()}
+    equipment_types = {
+        item.id: item
+        for item in (
+            await session.execute(
+                select(EquipmentType).where(EquipmentType.id.in_(equipment_ids))
+            )
+        ).scalars()
+    }
+    lab_ids = {inventory.laboratory_id for inventory in inventories.values()}
+    labs = {
+        item.id: item
+        for item in (
+            await session.execute(
+                select(Laboratory).where(Laboratory.id.in_(lab_ids))
+            )
+        ).scalars()
+    }
+    result: dict[UUID, dict[str, object] | None] = {}
+    for issue_id in issue_ids:
+        linked = next(
+            (link for link in links if link.resource_issue_id == issue_id), None
+        )
+        if linked is None or linked.asset_id not in assets:
+            result[issue_id] = None
+            continue
+        asset = assets[linked.asset_id]
+        inventory = inventories.get(asset.current_inventory_id)
+        equipment = equipment_types.get(asset.equipment_type_id)
+        lab = labs.get(inventory.laboratory_id) if inventory else None
+        if equipment is None or lab is None:
+            result[issue_id] = None
+            continue
+        payload = asset_dict(asset, equipment, lab)
+        payload["linked_asset_count"] = sum(
+            1 for link in links if link.resource_issue_id == issue_id
+        )
+        result[issue_id] = payload
+    return result

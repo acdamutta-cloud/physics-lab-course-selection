@@ -8,6 +8,7 @@ import secrets
 from datetime import UTC, datetime
 from uuid import UUID
 
+from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
@@ -293,6 +294,29 @@ async def refresh_selection_context(
         return False
     await write_selection_context(student_id, term_id, *built)
     return True
+
+
+async def ensure_selection_context(
+    session: AsyncSession,
+    *,
+    student_id: UUID,
+    term_id: UUID,
+    redis: Redis | None = None,
+) -> None:
+    """选课准入前确保 context 缓存存在,缺失时同步构建(幂等)。
+
+    课表发布批量清理或缓存过期后,学生的准入上下文可能缺失,直接进 Lua
+    会命中 SELECTION_CACHE_MISSING。这里在准入前补建,避免学生刷页面时
+    被"选课状态发生变化"挡住。Redis 不可用时静默返回,由调用方降级。
+    """
+
+    try:
+        client = redis or get_redis_client()
+        if await client.exists(student_context_key(student_id, term_id)):
+            return
+    except Exception:  # noqa: BLE001 - admission falls back on its own
+        return
+    await refresh_selection_context(session, student_id=student_id, term_id=term_id)
 
 
 async def invalidate_selection_context(student_id: UUID, term_id: UUID) -> None:

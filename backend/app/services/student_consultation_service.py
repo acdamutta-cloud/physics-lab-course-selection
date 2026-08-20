@@ -37,6 +37,7 @@ from app.schemas.student_consultation import (
     weekday_name,
     weekday_number,
 )
+from app.services.selection_window_service import resolve_window_gate
 
 ACTIVE_PROJECT_STATUSES = {"SELECTED", "COMPLETED", "ABSENT", "MAKEUP_PENDING"}
 TIME_OCCUPYING_STATUSES = {"SELECTED", "MAKEUP_PENDING"}
@@ -273,6 +274,7 @@ async def check_selection_eligibility(
     student_id: UUID,
     session_id: UUID,
     lock_target: bool = False,
+    check_window: bool = True,
 ) -> SelectionEligibilityResult:
     context = await _load_context(
         session,
@@ -325,6 +327,16 @@ async def check_selection_eligibility(
             )
         )
 
+    if check_window:
+        window_gate = await resolve_window_gate(session, context.term.id)
+        if not window_gate["open"]:
+            block(
+                "SELECTION_WINDOW_NOT_OPEN",
+                "WINDOW",
+                window_gate["message"] or "当前不在选课时间范围内。",
+                window_start=window_gate["start"],
+                window_end=window_gate["end"],
+            )
     if context.student.academic_status != "ACTIVE":
         block("STUDENT_INACTIVE", "COURSE", "当前学籍状态不允许选课。")
     if context.plan_course is None or project is None:
@@ -1010,6 +1022,16 @@ def _preference_score(
             score -= 100
     if item.week_no in preferences.avoided_weeks:
         score -= 90
+    if preferences.week_range is not None:
+        # 周次范围是软偏好:范围内优先,范围外明显降权但不排除,
+        # 保证必做覆盖优先时仍能凑出完整方案。
+        if _week_matches_range(item.week_no, preferences.week_range):
+            score += 50
+            reasons.append(
+                f"符合{_week_range_description(preferences.week_range)}的时间范围"
+            )
+        else:
+            score -= 45
     if preferences.avoid_weekend and item.day_of_week in {1, 7}:
         score -= 100
     if item.start_slot <= 8:
@@ -1106,6 +1128,37 @@ def _preference_explanations(
             warnings.append(f"{item.project_name}未能避开周末")
         if item.week_no in preferences.avoided_weeks:
             warnings.append(f"{item.project_name}未能避开第{item.week_no}周")
+
+    categories = list(dict.fromkeys(preferences.preferred_categories))
+    if categories:
+        category_labels = {
+            "BASIC": "基础",
+            "MECHANICS": "力学",
+            "ELECTRICITY": "电学",
+            "OPTICS": "光学",
+            "MODERN": "近代物理",
+        }
+        labels = "、".join(category_labels.get(item, item) for item in categories)
+        matched = [item for item in sessions if item.category in categories]
+        if matched:
+            reasons.append(f"{len(matched)}个新增场次符合{labels}模块偏好")
+        else:
+            warnings.append(f"当前可用场次中未找到{labels}模块的实验场次")
+
+    if preferences.week_range is not None:
+        description = _week_range_description(preferences.week_range)
+        in_range = [
+            item
+            for item in sessions
+            if _week_matches_range(item.week_no, preferences.week_range)
+        ]
+        if in_range:
+            reasons.append(f"{len(in_range)}个新增场次符合{description}的时间范围")
+        for item in sessions:
+            if item not in in_range:
+                warnings.append(
+                    f"{item.project_name}未能安排在{description}的时间范围内"
+                )
 
     return list(dict.fromkeys(reasons)), list(dict.fromkeys(warnings))
 
@@ -1501,10 +1554,6 @@ async def recommend_selection_plans(
                 continue
             feasible = False
             for before_session in sessions_by_project.get(before_project_id, []):
-                if not _week_matches_range(
-                    before_session.week_no, preferences.week_range
-                ):
-                    continue
                 if session_end_ordinal(before_session) >= session_start_ordinal(
                     candidate
                 ):
@@ -1525,8 +1574,6 @@ async def recommend_selection_plans(
     raw_session_by_id: dict[UUID, ExperimentSession] = {}
     for candidate in sessions:
         if candidate.project_id not in relevant_project_ids:
-            continue
-        if not _week_matches_range(candidate.week_no, preferences.week_range):
             continue
         meta = project_meta.get(candidate.project_id)
         if meta is None:

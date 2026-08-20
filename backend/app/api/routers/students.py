@@ -261,6 +261,9 @@ async def _get_dashboard_uncached(
                 }
 
         for pc in plan_courses:
+            # 已通过的课程不再展示(选课页只展示未通过课程)
+            if comp_map.get(pc.course_id) == "PASSED":
+                continue
             req_count = len(
                 [p for p in pc.projects if p.requirement_type == "REQUIRED"]
             )

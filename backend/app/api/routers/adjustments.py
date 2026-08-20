@@ -2,7 +2,7 @@ import json
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
@@ -196,11 +196,16 @@ async def submit_adjustment(
 async def list_my_adjustments(
     session: AsyncSession = Depends(get_db_session),
     user: UserProfile = Depends(get_current_user),
+    limit: int = 20,
+    offset: int = 0,
 ):
     student = await _student(session, user)
-    items = await list_adjustment_applications(session, student_id=student.id)
-    # 过滤掉资源异常导致的系统自动迁移记录（非学生发起）
-    items = [i for i in items if not (i.payload or {}).get("resource_issue_id")]
+    items, total = await list_adjustment_applications(
+        session,
+        student_id=student.id,
+        limit=max(1, min(limit, 100)),
+        offset=max(0, offset),
+    )
     # 为已驳回项附加驳回理由
     from app.models.application import ApprovalRecord
     from app.models.identity import Teacher as TeacherModel
@@ -256,7 +261,7 @@ async def list_my_adjustments(
             d["reject_reason"] = comment_map.get(i.id, "已驳回")
         d["reviewer"] = reviewer_map.get(i.id, "")
         result.append(d)
-    return result
+    return {"items": result, "total": total, "limit": limit, "offset": offset}
 
 
 @router.get(
@@ -423,17 +428,31 @@ async def teacher_review_adjustment(
 @router.get("/admin/adjustments")
 async def list_all_adjustments(
     status: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
     session: AsyncSession = Depends(get_db_session),
     user: UserProfile = Depends(get_current_user),
 ):
-    """管理员查看所有申请（含学生姓名和项目名）。"""
+    """管理员查看所有申请（含学生姓名和项目名），分页返回。"""
     if user.user_type != "ADMIN":
         raise HTTPException(status_code=403, detail="仅管理员可查")
     from sqlalchemy import select as sa_select
 
-    stmt = sa_select(ApplicationRequest).order_by(ApplicationRequest.created_at.desc())
-    if status is not None:
-        stmt = stmt.where(ApplicationRequest.status == status)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    filters = [ApplicationRequest.status == status] if status is not None else []
+    total = (
+        await session.scalar(
+            sa_select(func.count(ApplicationRequest.id)).where(*filters)
+        )
+    ) or 0
+    stmt = (
+        sa_select(ApplicationRequest)
+        .where(*filters)
+        .order_by(ApplicationRequest.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
     items = list((await session.execute(stmt)).scalars())
 
     # 批量加载学生和项目
@@ -526,6 +545,40 @@ async def list_all_adjustments(
                     from app.models.identity import Teacher as TModel
                     st = await session.get(TModel, sub_tid)
                     out["target_info"] = {"teacher_name": st.name if st else ""}
+        elif item.original_session_id:
+            # 学生调课（含资源异常迁移自动创建）：原场次 + 该学生当前已选场次
+            from app.models.curriculum import ExperimentProject as EP
+            from app.models.enrollment import StudentProjectRecord as SPR
+            from app.models.scheduling import ExperimentSession as ES
+            orig_sess = await session.get(ES, item.original_session_id)
+            if orig_sess is not None:
+                proj = await session.get(EP, orig_sess.project_id) if orig_sess.project_id else None
+                out["source_info"] = {
+                    "week_no": orig_sess.week_no,
+                    "day_of_week": orig_sess.day_of_week,
+                    "start_slot": orig_sess.start_slot,
+                    "end_slot": orig_sess.end_slot,
+                    "project_name": proj.project_name if proj else "",
+                }
+                if sid and orig_sess.project_id:
+                    current = await session.scalar(
+                        select(SPR).where(
+                            SPR.student_id == sid,
+                            SPR.project_id == orig_sess.project_id,
+                            SPR.status == "SELECTED",
+                        ).limit(1)
+                    )
+                    if current is not None and current.session_id and current.session_id != item.original_session_id:
+                        tgt = await session.get(ES, current.session_id)
+                        if tgt is not None:
+                            tproj = await session.get(EP, tgt.project_id) if tgt.project_id else None
+                            out["target_info"] = {
+                                "week_no": tgt.week_no,
+                                "day_of_week": tgt.day_of_week,
+                                "start_slot": tgt.start_slot,
+                                "end_slot": tgt.end_slot,
+                                "project_name": tproj.project_name if tproj else "",
+                            }
         # 最新审批记录的驳回意见
         if item.status in ("REJECTED",) and "reviewed_at" not in out:
             from app.models.application import ApprovalRecord
@@ -577,7 +630,7 @@ async def list_all_adjustments(
             rid2 = r["id"] if isinstance(r["id"], UUID) else UUID(r["id"])
             if rid2 in plan_by_app:
                 r["executed_plan"] = plan_by_app[rid2]
-    return result
+    return {"items": result, "total": total, "limit": limit, "offset": offset}
 
 
 @router.post(

@@ -806,3 +806,5 @@
   .ai-selection-item-action { min-width: 0; align-items: stretch; }
   .ai-project-alternatives > article { grid-template-columns: 1fr; }
 }
+
+.pagination-bar{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:10px;padding:10px 0}.pagination-bar button{padding:6px 14px;border:1px solid #c7dcda;border-radius:6px;color:#2c7477;background:#f4faf9;font-size:9px;font-weight:600;cursor:pointer}.pagination-bar button:disabled{opacity:.4;cursor:not-allowed}.pagination-bar span{color:#7b8c94;font-size:9px}

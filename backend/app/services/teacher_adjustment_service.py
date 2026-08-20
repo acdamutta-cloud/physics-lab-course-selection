@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config.settings import get_settings
+from app.db.session import AsyncSessionFactory
 from app.models.application import ApplicationRequest, ApprovalRecord
 from app.models.curriculum import AcademicTerm, ExperimentCourse, ExperimentProject
 from app.models.enrollment import StudentProjectRecord
@@ -50,7 +54,10 @@ from app.schemas.teacher_adjustment import (
 )
 from app.services import equipment_asset_service as asset_svc
 from app.services.resource_capacity_service import (
+    cache_resource_impact,
     equipment_student_capacity,
+    get_cached_resource_impact,
+    invalidate_resource_impact_cache,
     minimum_resource_capacity,
     relocation_requirement,
 )
@@ -68,6 +75,8 @@ from app.services.student_adjustment_service import (
 from app.services.student_cache_service import refresh_experiment_views_after_commit
 
 ACTIVE_APPLICATIONS = {"SUBMITTED", "VALIDATING", "PENDING_REVIEW", "APPROVED"}
+
+logger = logging.getLogger(__name__)
 
 
 async def _teacher_session(
@@ -361,6 +370,136 @@ async def validate_substitution(
     )
 
 
+async def _apply_session_change(
+    session: AsyncSession, *, item: ApplicationRequest, actor_id: UUID
+) -> ExperimentSession:
+    """执行教师调整的正式变更：修改场次并写入覆盖审计记录。"""
+    original = await session.get(ExperimentSession, item.original_session_id)
+    if original is None:
+        raise LookupError("原实验场次不存在。")
+    if item.request_type == "TEACHER_ADJUSTMENT":
+        override_type = "TIME"
+        before = {
+            "week_no": original.week_no,
+            "day_of_week": original.day_of_week,
+            "start_slot": original.start_slot,
+            "end_slot": original.end_slot,
+        }
+        after = dict(item.payload["target_time"])
+        # 直接修改原表，课表实时生效
+        original.week_no = after["week_no"]
+        original.day_of_week = after["day_of_week"]
+        original.start_slot = after["start_slot"]
+        original.end_slot = after["end_slot"]
+    elif item.request_type == "LAB_CHANGE":
+        override_type = "LAB"
+        before = {"laboratory_id": str(original.laboratory_id)}
+        after = {"laboratory_id": item.payload["target_laboratory_id"]}
+        original.laboratory_id = UUID(after["laboratory_id"])
+    else:
+        override_type = "TEACHER"
+        before = {"teacher_id": str(original.teacher_id)}
+        after = {"teacher_id": item.payload["substitute_teacher_id"]}
+    # 保留覆盖记录作为审计日志
+    active = list(
+        (
+            await session.execute(
+                select(SessionExecutionOverride).where(
+                    SessionExecutionOverride.session_id == original.id,
+                    SessionExecutionOverride.override_type == override_type,
+                    SessionExecutionOverride.status == "ACTIVE",
+                )
+            )
+        ).scalars()
+    )
+    for old in active:
+        old.status = "SUPERSEDED"
+    session.add(
+        SessionExecutionOverride(
+            session_id=original.id,
+            application_id=item.id,
+            override_type=override_type,
+            before_snapshot=before,
+            after_snapshot=after,
+            effective_from=datetime.now(UTC),
+            created_by=actor_id,
+            updated_by=actor_id,
+        )
+    )
+    if item.request_type == "TEACHER_SUBSTITUTION":
+        timetable_entry = await session.scalar(
+            select(TeacherTimetableEntry).where(
+                TeacherTimetableEntry.experiment_session_id == original.id
+            )
+        )
+        if timetable_entry is not None:
+            new_tid = UUID(str(item.payload["substitute_teacher_id"]))
+            timetable_entry.teacher_id = new_tid
+        # 同步更新 ExperimentSession.teacher_id
+        original.teacher_id = UUID(str(item.payload["substitute_teacher_id"]))
+    return original
+
+
+async def _notify_teacher_adjustment_result(
+    session: AsyncSession, *, item: ApplicationRequest, approved: bool
+) -> None:
+    """通知申请教师审批/执行结果（代课场景同时通知代课教师）；Redis 故障不影响主流程。"""
+    try:
+        import json as _json
+
+        from app.db.redis_client import get_redis_client
+
+        redis = get_redis_client()
+        label_map = {
+            "TEACHER_ADJUSTMENT": "调课",
+            "LAB_CHANGE": "场地调整",
+            "TEACHER_SUBSTITUTION": "代课",
+        }
+        label = label_map.get(item.request_type, item.request_type)
+        decision_text = "已通过" if approved else "已驳回"
+        applicant_msg = f"你的{label}申请{decision_text}"
+        if approved and item.request_type == "TEACHER_SUBSTITUTION":
+            sub_tid = item.payload.get("substitute_teacher_id")
+            if sub_tid:
+                substitute = await session.get(Teacher, UUID(str(sub_tid)))
+                if substitute is not None:
+                    applicant_msg += f"，由{substitute.name}老师代课"
+        await redis.lpush(
+            f"teacher:{item.applicant_user_id}:notifications",
+            _json.dumps(
+                {
+                    "request_no": item.request_no,
+                    "title": f"{label}申请{decision_text}",
+                    "msg": applicant_msg,
+                    "type": label,
+                    "time": datetime.now(UTC).strftime("%m-%d %H:%M"),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        # 代课申请通过/驳回后通知代课老师
+        if item.request_type == "TEACHER_SUBSTITUTION":
+            sub_tid = item.payload.get("substitute_teacher_id")
+            if sub_tid:
+                substitute = await session.get(Teacher, UUID(str(sub_tid)))
+                if substitute is not None and substitute.user_id is not None:
+                    await redis.lpush(
+                        f"teacher:{substitute.user_id}:notifications",
+                        _json.dumps(
+                            {
+                                "request_no": item.request_no,
+                                "title": f"代课申请{decision_text}",
+                                "msg": f"代课申请{decision_text} · {item.request_no}",
+                                "type": "代课",
+                                "time": datetime.now(UTC).strftime("%m-%d %H:%M"),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+    except Exception:
+        pass
+
+
 async def create_teacher_adjustment(
     session: AsyncSession,
     *,
@@ -422,6 +561,11 @@ async def create_teacher_adjustment(
     original = await _teacher_session(
         session, teacher_id=teacher_id, session_id=body.original_session_id
     )
+    # 自动批准：调课/场地调整校验通过且不影响他人（无硬冲突、无受影响学生）时直接执行；
+    # 代课涉及代课教师本人，一律走审批（代课教师确认 -> 管理员批准）。
+    auto_approve = (
+        body.request_type != "TEACHER_SUBSTITUTION" and validation.allowed
+    )
     item = ApplicationRequest(
         request_no=f"TA-{datetime.now(UTC):%Y%m%d}-{uuid4().hex[:8].upper()}",
         request_type=body.request_type,
@@ -432,18 +576,37 @@ async def create_teacher_adjustment(
         reason=body.reason,
         payload=payload,
         validation_result=validation.model_dump(mode="json"),
-        approval_route="TEACHER_ADMIN"
-        if body.request_type == "TEACHER_SUBSTITUTION"
-        else "ADMIN",
+        approval_route="AUTO"
+        if auto_approve
+        else (
+            "TEACHER_ADMIN"
+            if body.request_type == "TEACHER_SUBSTITUTION"
+            else "ADMIN"
+        ),
         reservation_status="NONE",
         idempotency_key=body.idempotency_key,
-        status="PENDING_REVIEW",
+        status="APPROVED" if auto_approve else "PENDING_REVIEW",
         submitted_at=datetime.now(UTC),
         created_by=actor_id,
         updated_by=actor_id,
     )
     session.add(item)
     await session.flush()
+    if auto_approve:
+        await _apply_session_change(session, item=item, actor_id=actor_id)
+        session.add(
+            ApprovalRecord(
+                application_id=item.id,
+                approval_type="AUTO",
+                approver_user_id=None,
+                decision="APPROVED",
+                matched_rules=validation.model_dump(mode="json"),
+                comment="确定性规则校验通过，系统自动审批。",
+                decided_at=datetime.now(UTC),
+            )
+        )
+        item.status = "EXECUTED"
+        item.executed_at = datetime.now(UTC)
     if body.request_type == "TEACHER_SUBSTITUTION":
         substitute = await session.get(Teacher, body.substitute_teacher_id)
         session.add_all(
@@ -467,6 +630,38 @@ async def create_teacher_adjustment(
         )
     await session.commit()
     await session.refresh(item)
+
+    if auto_approve:
+        # 自动执行结果通知申请教师本人
+        await _notify_teacher_adjustment_result(
+            session, item=item, approved=True
+        )
+        # 调课改时间影响该场次全部已选学生，刷新其课表视图缓存
+        if body.request_type == "TEACHER_ADJUSTMENT":
+            try:
+                schedule = await session.get(
+                    ScheduleVersion, original.schedule_version_id
+                )
+                if schedule is not None:
+                    student_ids = list(
+                        (
+                            await session.execute(
+                                select(StudentProjectRecord.student_id).where(
+                                    StudentProjectRecord.session_id == original.id,
+                                    StudentProjectRecord.status.in_(
+                                        ["SELECTED", "MAKEUP_PENDING"]
+                                    ),
+                                )
+                            )
+                        ).scalars()
+                    )
+                    for student_id in student_ids:
+                        await refresh_experiment_views_after_commit(
+                            student_id, schedule.term_id
+                        )
+            except Exception:
+                pass
+        return item
 
     # 推送管理员通知（教师发起的调课/场地调整/代课申请）
     try:
@@ -697,9 +892,9 @@ async def approve_teacher_adjustment(
             and remediation_plan_id is None
         ):
             raise ValueError("该调课存在受影响学生，必须先选择完整的学生安置方案。")
-        original = await session.get(ExperimentSession, item.original_session_id)
-        if original is None:
-            raise LookupError("原实验场次不存在。")
+        original = await _apply_session_change(
+            session, item=item, actor_id=actor_id
+        )
         remediation_plan: AdjustmentRemediationPlan | None = None
         remediation_items: list[AdjustmentRemediationItem] = []
         remediation_records: list[tuple[StudentProjectRecord, ExperimentSession]] = []
@@ -785,121 +980,10 @@ async def approve_teacher_adjustment(
                 for target_id, count in target_counts.items()
             ):
                 raise ValueError("学生安置目标场次的剩余容量已不足，请重新生成方案。")
-        if item.request_type == "TEACHER_ADJUSTMENT":
-            override_type = "TIME"
-            before = {
-                "week_no": original.week_no,
-                "day_of_week": original.day_of_week,
-                "start_slot": original.start_slot,
-                "end_slot": original.end_slot,
-            }
-            after = dict(item.payload["target_time"])
-            # 直接修改原表，课表实时生效
-            original.week_no = after["week_no"]
-            original.day_of_week = after["day_of_week"]
-            original.start_slot = after["start_slot"]
-            original.end_slot = after["end_slot"]
-        elif item.request_type == "LAB_CHANGE":
-            override_type = "LAB"
-            before = {"laboratory_id": str(original.laboratory_id)}
-            after = {"laboratory_id": item.payload["target_laboratory_id"]}
-            original.laboratory_id = UUID(after["laboratory_id"])
-        else:
-            override_type = "TEACHER"
-            before = {"teacher_id": str(original.teacher_id)}
-            after = {"teacher_id": item.payload["substitute_teacher_id"]}
-        # 保留覆盖记录作为审计日志
-        active = list(
-            (
-                await session.execute(
-                    select(SessionExecutionOverride).where(
-                        SessionExecutionOverride.session_id == original.id,
-                        SessionExecutionOverride.override_type == override_type,
-                        SessionExecutionOverride.status == "ACTIVE",
-                    )
-                )
-            ).scalars()
-        )
-        for old in active:
-            old.status = "SUPERSEDED"
-        session.add(
-            SessionExecutionOverride(
-                session_id=original.id,
-                application_id=item.id,
-                override_type=override_type,
-                before_snapshot=before,
-                after_snapshot=after,
-                effective_from=datetime.now(UTC),
-                created_by=actor_id,
-                updated_by=actor_id,
-            )
-        )
-        if item.request_type == "TEACHER_SUBSTITUTION":
-            timetable_entry = await session.scalar(
-                select(TeacherTimetableEntry).where(
-                    TeacherTimetableEntry.experiment_session_id == original.id
-                )
-            )
-            if timetable_entry is not None:
-                new_tid = UUID(str(item.payload["substitute_teacher_id"]))
-                timetable_entry.teacher_id = new_tid
-            # 同步更新 ExperimentSession.teacher_id
-            original.teacher_id = UUID(str(item.payload["substitute_teacher_id"]))
         # 审批结果通知：申请教师本人（代课场景即被代的原教师）+ 代课教师
-        try:
-            import json as _json
-
-            from app.db.redis_client import get_redis_client
-
-            redis = get_redis_client()
-            label_map = {
-                "TEACHER_ADJUSTMENT": "调课",
-                "LAB_CHANGE": "场地调整",
-                "TEACHER_SUBSTITUTION": "代课",
-            }
-            label = label_map.get(item.request_type, item.request_type)
-            decision_text = "已通过" if approved else "已驳回"
-            applicant_msg = f"你的{label}申请{decision_text}"
-            if approved and item.request_type == "TEACHER_SUBSTITUTION":
-                sub_tid = item.payload.get("substitute_teacher_id")
-                if sub_tid:
-                    substitute = await session.get(Teacher, UUID(str(sub_tid)))
-                    if substitute is not None:
-                        applicant_msg += f"，由{substitute.name}老师代课"
-            await redis.lpush(
-                f"teacher:{item.applicant_user_id}:notifications",
-                _json.dumps(
-                    {
-                        "request_no": item.request_no,
-                        "title": f"{label}申请{decision_text}",
-                        "msg": applicant_msg,
-                        "type": label,
-                        "time": datetime.now(UTC).strftime("%m-%d %H:%M"),
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-            # 代课申请通过/驳回后通知代课老师
-            if item.request_type == "TEACHER_SUBSTITUTION":
-                sub_tid = item.payload.get("substitute_teacher_id")
-                if sub_tid:
-                    substitute = await session.get(Teacher, UUID(str(sub_tid)))
-                    if substitute is not None and substitute.user_id is not None:
-                        await redis.lpush(
-                            f"teacher:{substitute.user_id}:notifications",
-                            _json.dumps(
-                                {
-                                    "request_no": item.request_no,
-                                    "title": f"代课申请{decision_text}",
-                                    "msg": f"代课申请{decision_text} · {item.request_no}",
-                                    "type": "代课",
-                                    "time": datetime.now(UTC).strftime("%m-%d %H:%M"),
-                                },
-                                ensure_ascii=False,
-                            ),
-                        )
-        except Exception:
-            pass
+        await _notify_teacher_adjustment_result(
+            session, item=item, approved=approved
+        )
 
         if remediation_plan is not None:
             for record, target in remediation_records:
@@ -1081,9 +1165,72 @@ async def create_resource_issue(
     return item
 
 
-async def resource_impact(
-    session: AsyncSession, issue: ResourceIssueReport
+async def resource_impact_summary(
+    session: AsyncSession, *, issue: ResourceIssueReport
 ) -> dict[str, object]:
+    """Lightweight impact stats for terminal issues (RESOLVED/CLOSED/SCRAPPED).
+
+    Counts affected sessions/courses/selected students with one aggregate SQL
+    instead of the full resource_impact scan (0.3-0.9s per call). Shortage is
+    always False: terminal issues no longer reduce capacity.
+    """
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT COUNT(DISTINCT s.id)::int AS sessions,
+                       COUNT(DISTINCT p.course_id)::int AS courses,
+                       COALESCE(SUM(s.selected_count), 0)::int AS students
+                FROM experiment_session s
+                JOIN schedule_version v
+                  ON v.id = s.schedule_version_id
+                 AND v.status IN ('PUBLISHED', 'DRAFT', 'CANDIDATE')
+                JOIN academic_term t ON t.id = v.term_id
+                JOIN experiment_project p ON p.id = s.project_id
+                JOIN project_equipment_requirement r
+                  ON r.project_id = p.id AND r.required
+                WHERE s.laboratory_id = :lab
+                  AND s.status IN ('OPEN', 'FULL', 'DRAFT')
+                  AND r.equipment_type_id = :eqtype
+                  AND (t.start_date - EXTRACT(DOW FROM t.start_date)::int
+                       + (s.week_no - 1) * 7 + (s.day_of_week - 1))::date
+                      BETWEEN :start AND :end
+                """
+            ),
+            {
+                "lab": issue.laboratory_id,
+                "eqtype": issue.equipment_type_id,
+                "start": issue.impact_start.date(),
+                "end": issue.impact_end.date(),
+            },
+        )
+    ).first()
+    sessions, courses, students = row
+    return {
+        "known": True,
+        "shortage": False,
+        "available": 0,
+        "required": 0,
+        "total_required_relocation_count": 0,
+        "course_count": int(courses or 0),
+        "session_count": int(sessions or 0),
+        "student_count": int(students or 0),
+        "affected_sessions": [],
+    }
+
+
+async def resource_impact(
+    session: AsyncSession,
+    issue: ResourceIssueReport,
+    *,
+    include_sessions: bool = True,
+    pending_deduction: bool = False,
+    skip_cache: bool = False,
+) -> dict[str, object]:
+    variant = "full" if include_sessions else "lite"
+    cached = await get_cached_resource_impact(issue.id, issue.status, variant)
+    if cached is not None and not (pending_deduction or skip_cache):
+        return cached
     inventory = await session.get(LabEquipmentInventory, issue.inventory_id)
     if inventory is None:
         return {
@@ -1119,6 +1266,9 @@ async def resource_impact(
     )
     affected: list[dict[str, object]] = []
     total_required = 0
+    max_selected = 0
+    affected_course_ids: set[UUID] = set()
+    affected_session_count = 0
     known = True
     asset_backed = await asset_svc.asset_for_issue(session, issue.id) is not None
     draft_capacity_warnings: list[dict[str, object]] = []
@@ -1198,7 +1348,7 @@ async def resource_impact(
         <= issue.impact_end.date()
     ]
     students_by_session: dict[UUID, list[Student]] = {}
-    if dated_session_ids:
+    if dated_session_ids and include_sessions:
         for student, session_id in (
             await session.execute(
                 select(Student, StudentProjectRecord.session_id)
@@ -1229,8 +1379,10 @@ async def resource_impact(
             inventories_by_type=inventories_by_type,
             requirement_pairs=requirement_pairs_by_project.get(item.project_id, []),
             issue=issue,
-            # 单台资产在教师提交时已经隔离并同步汇总，不能再次扣减。
-            project_pending_issue=not asset_backed,
+            # 资产上报不隔离（审批通过才扣减）；pending_deduction 时预扣
+            # 本台（如报废审批/生成方案需按"扣后容量"判断是否触发分流）。
+            project_pending_issue=(not asset_backed) or pending_deduction,
+            pending_deduction=pending_deduction,
         )
         requirement = relocation_requirement(
             item.selected_count, int(capacity["effective_capacity"])
@@ -1249,44 +1401,56 @@ async def resource_impact(
             )
         project = projects.get(item.project_id)
         course = courses.get(project.course_id) if project else None
-        student_rows = students_by_session.get(item.id, [])
-        affected.append(
-            {
-                "session_id": str(item.id),
-                "session_code": item.session_code,
-                "project_id": str(item.project_id),
-                "project_name": project.project_name if project else "",
-                "course_id": str(course.id) if course else None,
-                "course_name": course.course_name if course else "",
-                "week_no": item.week_no,
-                "day_of_week": item.day_of_week,
-                "start_slot": item.start_slot,
-                "end_slot": item.end_slot,
-                **requirement,
-                "required_relocation_count": (
-                    capacity_deficit if schedule_version.status == "PUBLISHED" else 0
-                ),
-                "schedule_version_status": schedule_version.status,
-                "requires_draft_revalidation": (
-                    schedule_version.status != "PUBLISHED" and capacity_deficit > 0
-                ),
-                "students": [
-                    {"student_id": str(student.id), "student_no": student.student_no,
-                     "student_name": student.name}
-                    for student in student_rows
-                ],
-                "capacity_snapshot": capacity,
-            }
-        )
-    return {
+        max_selected = max(max_selected, item.selected_count or 0)
+        # 只统计有实际选课学生的场次：空场次不影响教学，避免
+        # "1 门课程 · 2000+ 个场次"的误导性统计
+        if (item.selected_count or 0) > 0:
+            affected_session_count += 1
+        if course is not None:
+            affected_course_ids.add(course.id)
+        if include_sessions:
+            student_rows = students_by_session.get(item.id, [])
+            affected.append(
+                {
+                    "session_id": str(item.id),
+                    "session_code": item.session_code,
+                    "project_id": str(item.project_id),
+                    "project_name": project.project_name if project else "",
+                    "course_id": str(course.id) if course else None,
+                    "course_name": course.course_name if course else "",
+                    "week_no": item.week_no,
+                    "day_of_week": item.day_of_week,
+                    "start_slot": item.start_slot,
+                    "end_slot": item.end_slot,
+                    **requirement,
+                    "required_relocation_count": (
+                        capacity_deficit if schedule_version.status == "PUBLISHED" else 0
+                    ),
+                    "schedule_version_status": schedule_version.status,
+                    "requires_draft_revalidation": (
+                        schedule_version.status != "PUBLISHED" and capacity_deficit > 0
+                    ),
+                    "students": [
+                        {"student_id": str(student.id), "student_no": student.student_no,
+                         "student_name": student.name}
+                        for student in student_rows
+                    ],
+                    "capacity_snapshot": capacity,
+                }
+            )
+    result: dict[str, object] = {
         "shortage": total_required > 0,
         "known": known,
         "available": inventory.usable_quantity,
-        "required": max((int(item["selected_count"]) for item in affected), default=0),
+        "required": max_selected,
         "total_required_relocation_count": total_required,
+        "course_count": len(affected_course_ids),
+        "session_count": affected_session_count,
         "draft_capacity_warnings": draft_capacity_warnings,
         "affected_sessions": affected,
     }
+    await cache_resource_impact(issue.id, issue.status, result, variant)
+    return result
 
 
 def _session_capacity_loaded(
@@ -1298,6 +1462,7 @@ def _session_capacity_loaded(
     requirement_pairs: list[tuple[ProjectEquipmentRequirement, EquipmentType]],
     issue: ResourceIssueReport,
     project_pending_issue: bool,
+    pending_deduction: bool = False,
 ) -> dict[str, object]:
     """批量预加载版的场次容量计算，逻辑与 calculate_session_resource_capacity 等价。
 
@@ -1331,7 +1496,9 @@ def _session_capacity_loaded(
             if (
                 issue is not None
                 and project_pending_issue
-                and issue.status in {"REPORTED", "PENDING_REVIEW"}
+                # pending_deduction（报废审批/生成方案预扣本台）不受状态限制；
+                # 普通预扣仅在上报/待审阶段，避免 PROCESSING 后重复扣减
+                and (pending_deduction or issue.status in {"REPORTED", "PENDING_REVIEW"})
                 and inventory.id == issue.inventory_id
             ):
                 usable = max(0, usable - issue.affected_quantity)
@@ -1430,6 +1597,14 @@ async def review_resource_issue(
 
     asset_row = await asset_svc.asset_for_issue(session, issue.id)
     if asset_row is not None:
+        # 锁定库存行，串行化多台故障的审批扣减：避免并发批准时各自读到
+        # 未扣减的 usable_quantity，导致累计缺口无人认领（全部进检修）。
+        if getattr(issue, "inventory_id", None) is not None:
+            await session.execute(
+                select(LabEquipmentInventory.id)
+                .where(LabEquipmentInventory.id == issue.inventory_id)
+                .with_for_update()
+            )
         asset, link = asset_row
         if issue.status in {"RESOLVED", "REJECTED", "SCRAPPED"}:
             return issue, await resource_impact(session, issue)
@@ -1457,7 +1632,9 @@ async def review_resource_issue(
             return issue, {"shortage": False, "affected_sessions": []}
         if issue.issue_type == "EQUIPMENT_SCRAP":
             issue.approved_quantity = 1
-            impact = await resource_impact(session, issue)
+            # 预扣本台后判断容量（与故障"审批即扣减"一致）：
+            # 23 台报 4 次报废，前 3 次扣后仍够直接报废，第 4 次扣后 19 < 20 才触发分流。
+            impact = await resource_impact(session, issue, pending_deduction=True)
             if impact.get("shortage"):
                 issue.status = "RELOCATION_REQUIRED"
                 issue.remediation_status = "REMEDIATION_REQUIRED"
@@ -1483,10 +1660,19 @@ async def review_resource_issue(
             session, issue, actor_id=actor_id,
             target_status="UNDER_REPAIR", close_link=False,
         )
-        issue.approved_quantity = 1; issue.status = "PROCESSING"
+        issue.approved_quantity = 1
         issue.approved_by = actor_id; issue.approved_at = datetime.now(UTC)
-        impact = await resource_impact(session, issue)
-        issue.remediation_status = "REMEDIATION_REQUIRED" if impact.get("shortage") else "NOT_REQUIRED"
+        # restore 已扣减：绕过缓存重算，避免命中"扣减前"的 PENDING_REVIEW 缓存
+        impact = await resource_impact(session, issue, skip_cache=True)
+        if impact.get("shortage"):
+            # 容量不足：审批未完成，先进入待分流，分流方案生成后才转检修
+            issue.status = "RELOCATION_REQUIRED"
+            issue.remediation_status = "REMEDIATION_REQUIRED"
+            await session.commit()
+            await _notify_reporter("通过，等待学生分流方案")
+            return issue, impact
+        issue.status = "PROCESSING"
+        issue.remediation_status = "NOT_REQUIRED"
         await session.commit()
         await _notify_reporter("通过，已转维修处理")
         return issue, impact
@@ -1544,15 +1730,20 @@ async def review_resource_issue(
             )
         )
     issue.approved_quantity = quantity
-    issue.status = "PROCESSING"
     issue.approved_by = actor_id
     issue.approved_at = datetime.now(UTC)
     issue.updated_by = actor_id
     await session.flush()
     impact = await resource_impact(session, issue)
-    issue.remediation_status = (
-        "REMEDIATION_REQUIRED" if impact.get("shortage") else "NOT_REQUIRED"
-    )
+    if impact.get("shortage"):
+        # 容量不足：审批未完成，先进入待分流，分流方案生成后才转检修
+        issue.status = "RELOCATION_REQUIRED"
+        issue.remediation_status = "REMEDIATION_REQUIRED"
+        await session.commit()
+        await _notify_reporter("通过，等待学生分流方案")
+        return issue, impact
+    issue.status = "PROCESSING"
+    issue.remediation_status = "NOT_REQUIRED"
     await session.commit()
     await _notify_reporter("通过，已转维修处理")
     return issue, impact
@@ -1763,6 +1954,7 @@ async def _restore_legacy_inventory_for_update(
                 )
             )
             issue.restored_quantity += quantity
+        await invalidate_resource_impact_cache(issue.id, issue.status)
         if issue.restored_quantity >= issue.approved_quantity:
             issue.status = "RESOLVED"
             issue.resolved_at = datetime.now(UTC)
@@ -1771,7 +1963,7 @@ async def _restore_legacy_inventory_for_update(
 async def auto_extend_overdue_issues(
     session: AsyncSession,
     *,
-    actor_id: UUID,
+    actor_id: UUID | None = None,
 ) -> int:
     """Scan PROCESSING issues past impact_end and auto-extend by 7 days.
 
@@ -1802,6 +1994,7 @@ async def auto_extend_overdue_issues(
     for issue in rows:
         issue.impact_end = now + timedelta(days=7)
         issue.updated_by = actor_id
+        await invalidate_resource_impact_cache(issue.id, issue.status)
 
         impact = await resource_impact(session, issue)
         issue.remediation_status = (
@@ -1831,9 +2024,12 @@ async def auto_extend_overdue_issues(
             _json_dumps(
                 {
                     "request_no": issue.report_no,
+                    "title": "资源检修自动延期",
                     "msg": msg,
-                    "time": now.strftime("%Y-%m-%d %H:%M"),
-                }
+                    "type": "资源异常",
+                    "time": now.strftime("%m-%d %H:%M"),
+                },
+                ensure_ascii=False,
             ),
         )
         if issue.reporter_teacher_id is not None:
@@ -1844,12 +2040,36 @@ async def auto_extend_overdue_issues(
                     _json_dumps(
                         {
                             "request_no": issue.report_no,
+                            "title": "资源检修自动延期",
                             "msg": msg,
-                            "time": now.strftime("%Y-%m-%d %H:%M"),
-                        }
+                            "type": "资源异常",
+                            "time": now.strftime("%m-%d %H:%M"),
+                        },
+                        ensure_ascii=False,
                     ),
                 )
         count += 1
 
     await session.commit()
     return count
+
+
+async def periodic_resource_issue_overdue_scan() -> None:
+    """Scan PROCESSING resource issues past impact_end and auto-extend them.
+
+    Runs periodically in the app lifespan; no admin action required.
+    """
+
+    settings = get_settings()
+    while True:
+        try:
+            async with AsyncSessionFactory() as session:
+                await auto_extend_overdue_issues(session, actor_id=None)
+            await asyncio.sleep(settings.resource_issue_overdue_scan_seconds)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.warning(
+                "Periodic resource-issue overdue scan failed", exc_info=True
+            )
+            await asyncio.sleep(60)

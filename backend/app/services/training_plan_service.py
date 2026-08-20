@@ -1,7 +1,7 @@
 from uuid import UUID
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crud import training_plans as tp_crud
@@ -423,7 +423,8 @@ async def copy_plan_to_draft(
             actor_id=actor_id,
             courses_data=courses_data,
         )
-        await tp_crud.archive_plan(session, source, actor_id)
+        # 不立即归档原方案:编辑期间原已发布方案保持生效,学生端选课
+        # 不受影响;新版本保存并发布时由 publish_plan 统一归档旧版本。
         loaded = await tp_crud.get_plan_detail(session, copied.id)
         await tp_crud.add_operation_log(
             session,

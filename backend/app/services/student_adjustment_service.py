@@ -4,7 +4,8 @@ from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, not_, or_, select
+from sqlalchemy import select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -352,6 +353,7 @@ async def validate_student_adjustment(
         student_id=student_id,
         session_id=target.id,
         lock_target=lock_rows,
+        check_window=False,
     )
     ignored_codes = {"PROJECT_OCCUPIED_BY_APPLICATION"}
     if source.project_id == target.project_id:
@@ -858,18 +860,36 @@ async def create_adjustment_application(
 
 
 async def list_adjustment_applications(
-    session: AsyncSession, *, student_id: UUID
-) -> list[AdjustmentApplicationOut]:
+    session: AsyncSession,
+    *,
+    student_id: UUID,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[list[AdjustmentApplicationOut], int]:
+    """分页返回学生本人发起的调整申请(排除资源异常的系统自动迁移)。"""
+
+    base_filter = [
+        ApplicationRequest.student_id == student_id,
+        # 资源异常导致的系统自动迁移记录不是学生发起的申请
+        not_(ApplicationRequest.payload.has_key("resource_issue_id")),
+    ]
+    total = (
+        await session.scalar(
+            sa_select(func.count(ApplicationRequest.id)).where(*base_filter)
+        )
+    ) or 0
     items = list(
         (
             await session.execute(
                 select(ApplicationRequest)
-                .where(ApplicationRequest.student_id == student_id)
+                .where(*base_filter)
                 .order_by(ApplicationRequest.created_at.desc())
+                .limit(limit)
+                .offset(offset)
             )
         ).scalars()
     )
-    return [application_out(item) for item in items]
+    return [application_out(item) for item in items], total
 
 
 async def cancel_adjustment_application(

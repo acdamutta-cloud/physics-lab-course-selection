@@ -21,6 +21,7 @@ from app.schemas.student_consultation import (
 )
 from app.services.effective_session_service import effective_session_values
 from app.services.operation_guide_service import search_operation_guides
+from app.services.selection_window_service import resolve_window_gate
 from app.services.student_adjustment_service import get_adjustment_context
 from app.services.student_consultation_service import (
     check_selection_eligibility,
@@ -357,6 +358,14 @@ async def preview_deselection_tool(
     )
     if not records:
         return {"sessions": [], "message": "你本学期当前没有可以取消的已选实验场次。"}
+
+    window_gate = await resolve_window_gate(session, term.id)
+    if not window_gate["withdraw_open"]:
+        return {
+            "sessions": [],
+            "status": "WINDOW_CLOSED",
+            "message": window_gate["withdraw_message"] or "当前不在退选时间范围内。",
+        }
 
     course_ids = {str(item) for item in resolved.get("course_ids", [])}
     project_ids = {str(item) for item in resolved.get("project_ids", [])}

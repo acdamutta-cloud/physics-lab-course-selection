@@ -22,8 +22,12 @@ from app.models.teaching_adjustment import (
 )
 from app.schemas.student_consultation import SelectionPreferences
 from app.schemas.teacher_adjustment import ResourceRelocationSelection
+from app.services.equipment_asset_service import (
+    restore_or_transition_issue_asset,
+)
 from app.services.resource_capacity_service import (
     calculate_session_resource_capacity,
+    invalidate_resource_impact_cache,
 )
 from app.services.student_adjustment_service import (
     recommend_adjustment_options,
@@ -73,11 +77,21 @@ async def generate_resource_relocation_plans(
         raise LookupError("资源异常记录不存在。")
     if issue.status not in {"PROCESSING", "RELOCATION_REQUIRED"}:
         raise ValueError("资源异常审批通过且确认需要分流后才能生成学生迁移方案。")
-    impact = await resource_impact(session, issue)
+    is_scrap = getattr(issue, "issue_type", None) == "EQUIPMENT_SCRAP"
+    # 报废按"扣后容量"判断（审批时的预扣语义）；故障已实际扣减（UNDER_REPAIR）
+    impact = await resource_impact(
+        session, issue, skip_cache=not is_scrap, pending_deduction=is_scrap,
+    )
     if not impact.get("known", False):
         raise ValueError("仪器使用备注或项目能力配置尚未确认，不能自动生成迁移方案。")
     if not impact.get("shortage"):
         issue.remediation_status = "NOT_REQUIRED"
+        # 容量已满足：待分流状态下的审批在此完成
+        if issue.status == "RELOCATION_REQUIRED":
+            if is_scrap:
+                await _complete_scrap_issue(session, issue, actor_id=actor_id)
+            else:
+                issue.status = "PROCESSING"
         await session.commit()
         return []
 
@@ -225,8 +239,34 @@ async def generate_resource_relocation_plans(
                 )
             plans.append(plan)
     issue.remediation_status = "REMEDIATION_REQUIRED"
+    if issue.status == "RELOCATION_REQUIRED":
+        if is_scrap:
+            # 报废工单：生成方案成功即报废（与故障"生成方案即通过"对齐）。
+            # 迁移方案可后续在弹窗中单独执行，不再阻塞报废。
+            await _complete_scrap_issue(session, issue, actor_id=actor_id)
+        else:
+            # 故障：待分流状态下的审批完成，转检修中
+            issue.status = "PROCESSING"
     await session.commit()
     return plans
+
+
+async def _complete_scrap_issue(
+    session: AsyncSession, issue: ResourceIssueReport, *, actor_id: UUID,
+) -> None:
+    """报废工单完成：资产置 SCRAPPED、工单关闭、关联故障工单关闭。"""
+
+    await restore_or_transition_issue_asset(
+        session, issue, actor_id=actor_id,
+        target_status="SCRAPPED", close_link=True,
+    )
+    issue.status = "SCRAPPED"; issue.remediation_status = "REMEDIATED"
+    issue.resolved_at = datetime.now(UTC)
+    if issue.source_issue_id:
+        source_issue = await session.get(ResourceIssueReport, issue.source_issue_id)
+        if source_issue is not None:
+            source_issue.status = "CLOSED"
+            source_issue.resolved_at = datetime.now(UTC)
 
 
 async def validate_resource_relocation_plan(
@@ -529,6 +569,8 @@ async def execute_resource_relocation_plan(
     plan.status = "EXECUTED"
     plan.updated_by = actor_id
     await session.flush()
+    # 迁移改变了场次 selected_count，需失效后再重算，避免命中迁移前缓存
+    await invalidate_resource_impact_cache(issue.id, issue.status)
     remaining = await resource_impact(session, issue)
     issue.remediation_status = (
         "PARTIALLY_REMEDIATED"

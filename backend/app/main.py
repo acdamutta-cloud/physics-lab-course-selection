@@ -17,6 +17,9 @@ from app.services.student_cache_service import (
     periodic_selection_context_warmup,
     periodic_student_cache_warmup,
 )
+from app.services.teacher_adjustment_service import (
+    periodic_resource_issue_overdue_scan,
+)
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -35,11 +38,13 @@ async def lifespan(app: FastAPI):
     selection_context_warm_task = asyncio.create_task(
         periodic_selection_context_warmup()
     )
+    overdue_scan_task = asyncio.create_task(periodic_resource_issue_overdue_scan())
     yield
     worker_task.cancel()
     auth_warm_task.cancel()
     cache_warm_task.cancel()
     selection_context_warm_task.cancel()
+    overdue_scan_task.cancel()
     try:
         await worker_task
     except asyncio.CancelledError:
@@ -54,6 +59,10 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await selection_context_warm_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await overdue_scan_task
     except asyncio.CancelledError:
         pass
     await dispose_database_engine()

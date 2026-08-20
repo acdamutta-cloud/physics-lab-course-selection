@@ -135,11 +135,12 @@ class StudentAgentPlan(BaseModel):
     needs_clarification: bool = False
     clarification_question: str | None = None
     direct_answer_allowed: bool = False
+    term_fact_query: Literal["NONE", "CURRENT_WEEK", "SELECTION_WINDOW"] = "NONE"
 
 
 class SelectionViolation(BaseModel):
     code: str
-    scope: Literal["COURSE", "PROJECT", "SESSION", "DATA"]
+    scope: Literal["COURSE", "PROJECT", "SESSION", "DATA", "WINDOW"]
     message: str
     details: dict[str, object] = Field(default_factory=dict)
 
@@ -200,18 +201,46 @@ class WeekRangePreference(BaseModel):
 
 
 class SelectionPreferences(BaseModel):
-    avoid_weekend: bool = False
-    avoid_evening: bool = False
-    preferred_periods: list[TimePeriod] = Field(default_factory=list)
-    avoided_periods: list[TimePeriod] = Field(default_factory=list)
-    preferred_days: list[WeekdayName] = Field(default_factory=list)
-    avoided_days: list[WeekdayName] = Field(default_factory=list)
-    week_range: WeekRangePreference | None = None
-    avoided_weeks: list[WeekNumber] = Field(default_factory=list)
+    avoid_weekend: bool = Field(
+        default=False, description="学生表达不要/尽量不安排周末时设为 true"
+    )
+    avoid_evening: bool = Field(
+        default=False, description="学生表达不要/尽量不安排晚上(第9-12节)时设为 true"
+    )
+    preferred_periods: list[TimePeriod] = Field(
+        default_factory=list,
+        description="学生喜欢/优先的时间段:MORNING上午、AFTERNOON下午、EVENING晚上",
+    )
+    avoided_periods: list[TimePeriod] = Field(
+        default_factory=list,
+        description="学生不喜欢/尽量避开的时间段:MORNING上午、AFTERNOON下午、EVENING晚上",
+    )
+    preferred_days: list[WeekdayName] = Field(
+        default_factory=list, description="学生喜欢/优先的星期(周日、周一…周六)"
+    )
+    avoided_days: list[WeekdayName] = Field(
+        default_factory=list, description="学生不喜欢/尽量避开的星期(周日、周一…周六)"
+    )
+    week_range: WeekRangePreference | None = Field(
+        default=None, description="学生指定的周次范围,如第9周及以后、第5周以前、第6到第10周"
+    )
+    avoided_weeks: list[WeekNumber] = Field(
+        default_factory=list, description="学生明确表示尽量不选的单个教学周"
+    )
     preferred_categories: list[
         Literal["BASIC", "MECHANICS", "ELECTRICITY", "OPTICS", "MODERN"]
-    ] = Field(default_factory=list)
-    preferred_teacher_names: list[str] = Field(default_factory=list, max_length=8)
+    ] = Field(
+        default_factory=list,
+        description=(
+            "学生偏好的实验模块:BASIC基础、MECHANICS力学、"
+            "ELECTRICITY电学/电磁、OPTICS光学、MODERN近代物理"
+        ),
+    )
+    preferred_teacher_names: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description="学生优先选择的教师姓名(去掉'老师'称谓,可多个)",
+    )
 
     @field_validator("preferred_teacher_names")
     @classmethod

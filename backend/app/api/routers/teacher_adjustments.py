@@ -8,8 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from starlette.responses import StreamingResponse
 
-from app.agents.registry import invoke_registered_graph, stream_registered_graph
 from app.agents.nodes.teacher_adjustment_agent import extract_teacher_preferences
+from app.agents.registry import invoke_registered_graph, stream_registered_graph
 from app.api.dependencies import get_current_user
 from app.crud.teaching_tasks import get_or_create_active_term
 from app.db.session import get_db_session
@@ -23,18 +23,20 @@ from app.models.teaching_adjustment import (
     AdjustmentRemediationPlan,
     ApplicationApprovalTask,
     EquipmentInventoryMovement,
+    ResourceRelocationItem,
     ResourceRelocationPlan,
     ResourceRepairUpdate,
     SessionExecutionOverride,
 )
 from app.schemas.auth import UserProfile
+from app.schemas.student_consultation import SelectionPreferences
 from app.schemas.teacher_adjustment import (
     AdjustmentReviewRequest,
+    EquipmentScrapCreateRequest,
     LabChangePreviewRequest,
     RepairUpdateCreateRequest,
     RepairUpdateReviewRequest,
     ResourceIssueCreateRequest,
-    EquipmentScrapCreateRequest,
     ResourceIssueReviewRequest,
     ResourceRelocationPlanUpdateRequest,
     ResourceRelocationRecommendationRequest,
@@ -46,7 +48,7 @@ from app.schemas.teacher_adjustment import (
     TeacherReschedulePreviewRequest,
     TeacherRescheduleRecommendationRequest,
 )
-from app.schemas.student_consultation import SelectionPreferences
+from app.services import equipment_asset_service as asset_svc
 from app.services.resource_relocation_service import (
     execute_resource_relocation_plan,
     generate_resource_relocation_plans,
@@ -63,13 +65,13 @@ from app.services.teacher_adjustment_service import (
     generate_remediation_plans,
     list_teacher_adjustments,
     resource_impact,
+    resource_impact_summary,
     review_repair_update,
     review_resource_issue,
     validate_lab_change,
     validate_reschedule,
     validate_substitution,
 )
-from app.services import equipment_asset_service as asset_svc
 
 router = APIRouter(tags=["教师教学调整"])
 
@@ -407,7 +409,13 @@ async def submit_teacher_adjustment(
 async def my_teacher_adjustments(
     session: AsyncSession = Depends(get_db_session),
     user: UserProfile = Depends(get_current_user),
+    limit: int = 20,
+    offset: int = 0,
 ):
+    """教师本人的调整申请与代课指定(合并后内存分页,数据量小)。"""
+
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
     teacher = await _teacher(session, user)
     items = await list_teacher_adjustments(session, teacher_id=teacher.id)
     # 同时查询该教师作为代课教师被指定的申请
@@ -428,7 +436,7 @@ async def my_teacher_adjustments(
             items.append(sub)
     print(f"[DEBUG] total items for {teacher.name}: {len(items)}", flush=True)
     if not items:
-        return []
+        return {"items": [], "total": 0, "limit": limit, "offset": offset}
     session_ids = {item.original_session_id for item in items if item.original_session_id}
     original_sessions: dict[UUID, ExperimentSession] = {}
     if session_ids:
@@ -526,7 +534,13 @@ async def my_teacher_adjustments(
                     "teacher_name": tt.name if tt else "",
                 }
         result.append(entry)
-    return result
+    total = len(result)
+    return {
+        "items": result[offset : offset + limit],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.post("/teachers/me/substitution-tasks/{application_id}/confirm")
@@ -664,9 +678,12 @@ async def teacher_equipment_scrap_requests(
 ):
     teacher = await _teacher(session, user)
     rows = list((await session.execute(select(ResourceIssueReport).where(ResourceIssueReport.reporter_teacher_id == teacher.id, ResourceIssueReport.issue_type == "EQUIPMENT_SCRAP").order_by(ResourceIssueReport.created_at.desc()))).scalars())
+    asset_payloads = await asset_svc.issue_assets_payload_map(
+        session, [item.id for item in rows]
+    )
     result = []
     for item in rows:
-        value = _issue(item); value["asset"] = await asset_svc.issue_asset_payload(session, item.id); result.append(value)
+        value = _issue(item); value["asset"] = asset_payloads.get(item.id); result.append(value)
     return result
 
 
@@ -711,10 +728,13 @@ async def my_resource_issues(
                     "note": upd.note,
                 }
             )
+    asset_payloads = await asset_svc.issue_assets_payload_map(
+        session, [item.id for item in rows]
+    )
     result: list[dict[str, object]] = []
     for item in rows:
         entry = _issue(item)
-        entry["asset"] = await asset_svc.issue_asset_payload(session, item.id)
+        entry["asset"] = asset_payloads.get(item.id)
         entry["pending_update"] = pending_updates.get(item.id)
         result.append(entry)
     return result
@@ -1016,6 +1036,59 @@ async def admin_resource_issues(
             await session.execute(select(Teacher).where(Teacher.id.in_(teacher_ids)))
         ).scalars()
     } if teacher_ids else {}
+    # 关联资产与来源记录批量加载，避免逐条查询
+    asset_payloads = await asset_svc.issue_assets_payload_map(
+        session, [item.id for item in rows]
+    )
+    source_ids = {item.source_issue_id for item in rows if item.source_issue_id}
+    sources = {
+        item.id: item
+        for item in (
+            await session.execute(
+                select(ResourceIssueReport).where(
+                    ResourceIssueReport.id.in_(source_ids)
+                )
+            )
+        ).scalars()
+    } if source_ids else {}
+    # 已结束 issue 的影响不再变化，用轻量聚合 SQL 替代全量扫描
+    active_statuses = {"PENDING_REVIEW", "PROCESSING", "RELOCATION_REQUIRED"}
+    # 已执行的分流方案摘要：卡片展示分流结果（迁移人数 + 目标场次）
+    issue_ids = [item.id for item in rows]
+    executed_plans = {
+        plan.resource_issue_id: plan
+        for plan in (
+            await session.execute(
+                select(ResourceRelocationPlan).where(
+                    ResourceRelocationPlan.resource_issue_id.in_(issue_ids),
+                    ResourceRelocationPlan.status == "EXECUTED",
+                )
+            )
+        ).scalars()
+    }
+    target_session_ids: set[UUID] = set()
+    if executed_plans:
+        for plan in executed_plans.values():
+            target_session_ids.update(
+                (
+                    await session.execute(
+                        select(ResourceRelocationItem.target_session_id).where(
+                            ResourceRelocationItem.plan_id == plan.id,
+                            ResourceRelocationItem.target_session_id.isnot(None),
+                        )
+                    )
+                ).scalars()
+            )
+    target_sessions = {
+        item.id: item
+        for item in (
+            await session.execute(
+                select(ExperimentSession).where(
+                    ExperimentSession.id.in_(target_session_ids)
+                )
+            )
+        ).scalars()
+    } if target_session_ids else {}
     for item in rows:
         value = _issue(item)
         reporter = teachers.get(item.reporter_teacher_id)
@@ -1029,22 +1102,48 @@ async def admin_resource_issues(
             if reporter
             else None
         )
-        value["asset"] = await asset_svc.issue_asset_payload(session, item.id)
-        source_issue = await session.get(ResourceIssueReport, item.source_issue_id) if item.source_issue_id else None
+        value["asset"] = asset_payloads.get(item.id)
+        plan = executed_plans.get(item.id)
+        if plan is not None:
+            value["relocation_summary"] = {
+                "plan_no": plan.plan_no,
+                "migrated_count": int(plan.planned_relocation_count or 0),
+                "targets": [
+                    {
+                        "session_id": str(t.id),
+                        "session_code": t.session_code,
+                        "week_no": t.week_no,
+                        "day_of_week": t.day_of_week,
+                        "start_slot": t.start_slot,
+                        "end_slot": t.end_slot,
+                    }
+                    for t in target_sessions.values()
+                ],
+                "executed_at": plan.updated_at or plan.created_at,
+            }
+        else:
+            value["relocation_summary"] = None
+        source_issue = sources.get(item.source_issue_id) if item.source_issue_id else None
         value["source_issue"] = (
             {"id": str(source_issue.id), "report_no": source_issue.report_no,
              "status": source_issue.status}
             if source_issue else None
         )
-        value["impact"] = await resource_impact(session, item)
-        affected = value["impact"].get("affected_sessions", [])
-        value["impact_course_count"] = len(
-            {entry.get("course_id") for entry in affected if entry.get("course_id")}
-        )
-        value["impact_session_count"] = len(affected)
-        value["impact_student_count"] = int(
-            value["impact"].get("total_required_relocation_count", 0)
-        )
+        if item.status in active_statuses:
+            # 列表页只需统计与 shortage 判断，明细场次不进响应（数千条会撑大 payload）
+            impact = await resource_impact(session, item, include_sessions=False)
+            value["impact"] = impact
+            value["impact_course_count"] = int(impact.get("course_count", 0))
+            value["impact_session_count"] = int(impact.get("session_count", 0))
+            value["impact_student_count"] = int(
+                impact.get("total_required_relocation_count", 0)
+            )
+        else:
+            summary = await resource_impact_summary(session, issue=item)
+            value["impact"] = summary
+            value["impact_course_count"] = summary["course_count"]
+            value["impact_session_count"] = summary["session_count"]
+            value["impact_student_count"] = summary["student_count"]
         result.append(value)
     return result
 

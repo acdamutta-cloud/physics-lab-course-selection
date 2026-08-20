@@ -101,6 +101,9 @@ class Settings(BaseSettings):
     selection_context_missing_scan_seconds: int = Field(
         default=300, ge=30, le=3600
     )
+    resource_issue_overdue_scan_seconds: int = Field(
+        default=600, ge=60, le=86400
+    )
     selection_context_warm_concurrency: int = Field(default=10, ge=1, le=30)
 
     jwt_secret_key: SecretStr = SecretStr("")

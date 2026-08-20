@@ -92,7 +92,7 @@ const viewMeta: Record<TeacherView, { title: string; subtitle: string }> = {
   home: { title: teacherGreeting.value, subtitle: '教学周信息加载中...' },
   schedule: { title: '教师课表', subtitle: '按教学周查看个人实验教学安排' },
   classes: { title: '项目学生管理', subtitle: '按实验项目场次查看自主选课学生的基本信息' },
-  adjustments: { title: '教学调整申请', subtitle: '提交并跟踪调课、场地调整及代课申请' },
+  adjustments: { title: '教学调整申请', subtitle: '提交并跟踪调课及代课申请' },
   resources: { title: '资源异常上报', subtitle: '上报实验室、仪器与耗材异常并跟踪处理进度' },
 }
 
@@ -151,6 +151,48 @@ async function loadAllWeeks() {
   } catch { allWeeksSessions.value = [] }
 }
 
+/** 整页截图按 A4 页高纵向切片，生成多页 PDF，避免长内容被压进单页。 */
+function canvasToPdf(canvas: HTMLCanvasElement, orientation: 'p' | 'l', marginX = 0) {
+  const pdf = new jsPDF(orientation, 'mm', 'a4')
+  const pageW = pdf.internal.pageSize.getWidth()
+  const pageH = pdf.internal.pageSize.getHeight()
+  const drawW = pageW - marginX * 2
+  const drawH = (canvas.height * drawW) / canvas.width
+  const imgData = canvas.toDataURL('image/png')
+  let heightLeft = drawH
+  let position = marginX
+  pdf.addImage(imgData, 'PNG', marginX, position, drawW, drawH)
+  heightLeft -= pageH - marginX
+  while (heightLeft > 0) {
+    position -= pageH - marginX
+    pdf.addPage()
+    pdf.addImage(imgData, 'PNG', marginX, position, drawW, drawH)
+    heightLeft -= pageH - marginX
+  }
+  return pdf
+}
+
+/** html2canvas 对离屏元素(left:-9999px)和超高 canvas 渲染不可靠，
+ *  导出期间把容器临时移入视口，渲染完成后再复位。 */
+function withVisibleExportEl<T>(el: HTMLElement, render: () => Promise<T>): Promise<T> {
+  const prev = {
+    position: el.style.position,
+    left: el.style.left,
+    top: el.style.top,
+    zIndex: el.style.zIndex,
+  }
+  el.style.position = 'fixed'
+  el.style.left = '0'
+  el.style.top = '0'
+  el.style.zIndex = '-1'
+  return render().finally(() => {
+    el.style.position = prev.position
+    el.style.left = prev.left
+    el.style.top = prev.top
+    el.style.zIndex = prev.zIndex
+  })
+}
+
 async function exportSchedule(format: 'png' | 'pdf') {
   if (exportTeacherBusy.value) return
   exportTeacherBusy.value = true
@@ -159,17 +201,33 @@ async function exportSchedule(format: 'png' | 'pdf') {
     await nextTick()
     const el = exportTeacherRef.value
     if (!el) { showToast('导出失败'); return }
-    const canvas = await html2canvas(el, { backgroundColor: '#ffffff', scale: 2 })
     if (format === 'png') {
+      const canvas = await withVisibleExportEl(el, () => html2canvas(el, { backgroundColor: '#ffffff', scale: 2 }))
       const link = document.createElement('a')
       link.download = `教师课表_${teacherName.value}.png`
       link.href = canvas.toDataURL('image/png')
       link.click()
     } else {
+      // 逐周截图拼多页 PDF：一次截图全部周堆叠会生成超高 canvas，
+      // html2canvas 对超高/超大面积渲染输出不完整，导致内容缺失。
+      const weeks = Array.from(el.querySelectorAll<HTMLElement>('.export-week'))
+      if (!weeks.length) { showToast('导出失败'); return }
       const pdf = new jsPDF('l', 'mm', 'a4')
-      const w = pdf.internal.pageSize.getWidth()
-      const h = (canvas.height * w) / canvas.width
-      pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, w, h)
+      const pageW = pdf.internal.pageSize.getWidth()
+      await withVisibleExportEl(el, async () => {
+        for (const [i, weekEl] of weeks.entries()) {
+          const canvas = await html2canvas(weekEl, { backgroundColor: '#ffffff', scale: 2 })
+          const imgData = canvas.toDataURL('image/png')
+          const drawW = pageW - 16
+          const drawH = (canvas.height * drawW) / canvas.width
+          if (i > 0) pdf.addPage()
+          if (i === 0) {
+            pdf.setFontSize(14)
+            pdf.text(`${teacherName.value} 教师课表`, 8, 6)
+          }
+          pdf.addImage(imgData, 'PNG', 8, 10, drawW, drawH)
+        }
+      })
       pdf.save(`教师课表_${teacherName.value}.pdf`)
     }
     showToast(format === 'png' ? '图片已导出' : 'PDF已导出')
@@ -187,11 +245,8 @@ async function exportStudentList() {
     await nextTick()
     const el = exportListRef.value
     if (!el) { showToast('导出失败'); return }
-    const canvas = await html2canvas(el, { backgroundColor: '#ffffff', scale: 2 })
-    const pdf = new jsPDF('p', 'mm', 'a4')
-    const w = pdf.internal.pageSize.getWidth() - 20
-    const h = (canvas.height * w) / canvas.width
-    pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 10, 10, w, h)
+    const canvas = await withVisibleExportEl(el, () => html2canvas(el, { backgroundColor: '#ffffff', scale: 2 }))
+    const pdf = canvasToPdf(canvas, 'p', 10)
     const projName = projectList.value.find(p => p.project_id === selectedProjectId.value)?.project_name || '项目'
     pdf.save(`${projName}_学生名单.pdf`)
     showToast('名单已导出')
@@ -493,10 +548,11 @@ function useAiOption(option: any) {
 
 async function submitAdjustment() {
   if (!adjustmentOriginalSessionId.value || !adjustmentReason.value.trim()) return showToast('请选择原场次并填写申请原因')
-  if (!window.confirm('确认提交该教学调整申请吗？提交后将进入相应审核流程。')) return
+  const isAuto = adjustmentTypeCode() !== 'TEACHER_SUBSTITUTION'
+  if (!window.confirm(isAuto ? '确认提交该申请吗？校验通过且不影响他人时将自动执行。' : '确认提交该代课申请吗？提交后需代课教师确认，再由管理员批准。')) return
   submitBusy.value = true
   try {
-    await api.post('/teachers/me/adjustments', {
+    const resp = await api.post<any>('/teachers/me/adjustments', {
       request_type: adjustmentTypeCode(), original_session_id: adjustmentOriginalSessionId.value,
       reason: adjustmentReason.value,
       target_time: adjustmentDialog.value === '调课申请' ? timeTarget() : null,
@@ -505,15 +561,23 @@ async function submitAdjustment() {
       idempotency_key: crypto.randomUUID(),
     })
     adjustmentDialog.value = null
-    showToast('申请已提交，等待审核')
+    showToast(resp?.status === 'EXECUTED' ? '校验通过，已自动执行' : '申请已提交，等待审核')
     await fetchOwnTeacherAdjustments()
   } catch (e: any) { showToast(e?.message || '提交失败') }
   submitBusy.value = false
 }
 
+const TEACHER_ADJUST_PAGE_SIZE = 10
+const teacherAdjustPage = ref(0)
+const teacherAdjustTotal = ref(0)
+
 async function fetchOwnTeacherAdjustments() {
   try {
-    const items = (await api.get<any[]>('/teachers/me/adjustments')).filter((item: any) => item.request_type !== 'TEACHER_SUBSTITUTION')
+    const data = await api.get<{ items: any[]; total: number }>(
+      `/teachers/me/adjustments?limit=${TEACHER_ADJUST_PAGE_SIZE}&offset=${teacherAdjustPage.value * TEACHER_ADJUST_PAGE_SIZE}`
+    )
+    const items = data.items.filter((item: any) => item.request_type !== 'TEACHER_SUBSTITUTION')
+    teacherAdjustTotal.value = data.total
     const typeName: any = { TEACHER_ADJUSTMENT: '调课申请', LAB_CHANGE: '场地调整申请', TEACHER_SUBSTITUTION: '代课申请' }
     const statusName: any = { PENDING_REVIEW: '审核中', EXECUTED: '已通过', REJECTED: '已驳回', FAILED: '执行失败' }
     teacherOwnAdjustments.value = items.map((item: any) => {
@@ -538,6 +602,14 @@ async function fetchOwnTeacherAdjustments() {
   } catch { teacherOwnAdjustments.value = [] }
 }
 
+function changeTeacherAdjustPage(delta: number) {
+  const maxPage = Math.max(0, Math.ceil(teacherAdjustTotal.value / TEACHER_ADJUST_PAGE_SIZE) - 1)
+  const next = Math.min(maxPage, Math.max(0, teacherAdjustPage.value + delta))
+  if (next === teacherAdjustPage.value) return
+  teacherAdjustPage.value = next
+  fetchOwnTeacherAdjustments()
+}
+
 async function fetchSubstitutionTasks() {
   try {
     const items = await api.get<any[]>('/teachers/me/substitution-tasks')
@@ -558,13 +630,14 @@ async function confirmSubstitutionTask(id: string, approved: boolean) {
 
 async function fetchSubstitutionResults() {
   try {
-    const items = await api.get<any[]>('/teachers/me/adjustments')
-    substitutionResults.value = items.filter((item: any) => item.request_type === 'TEACHER_SUBSTITUTION').map((item: any) => ({
+    const data = await api.get<{ items: any[] }>('/teachers/me/adjustments')
+    substitutionResults.value = data.items.filter((item: any) => item.request_type === 'TEACHER_SUBSTITUTION').map((item: any) => ({
       id: item.request_no,
       substituteTeacherName: item.target_info?.teacher_name || '',
       courseName: item.source_info?.project_name || '',
       status: item.status,
       date: (item.submitted_at || '').slice(0, 10),
+      timeText: formatTime(item.source_info),
     }))
   } catch { substitutionResults.value = [] }
 }
@@ -762,7 +835,7 @@ async function submitRepairExtension() {
                 <div class="teacher-panel-title"><div><h3>教学工具</h3></div></div>
                 <button type="button" @click="navigate('schedule')"><span class="teal">▦</span><div><strong>我的课表</strong><small>查看已排实验场次</small></div><i>→</i></button>
                 <button type="button" @click="navigate('classes')"><span class="blue">♙</span><div><strong>项目学生管理</strong><small>查看选课学生名单</small></div><i>→</i></button>
-                <button type="button" @click="navigate('adjustments')"><span class="purple">⇄</span><div><strong>教学调整申请</strong><small>调课、场地调整</small></div><i>→</i></button>
+                <button type="button" @click="navigate('adjustments')"><span class="purple">⇄</span><div><strong>教学调整申请</strong><small>调课、代课申请</small></div><i>→</i></button>
               </section>
             </aside>
           </div>
@@ -862,7 +935,6 @@ async function submitRepairExtension() {
         <template v-else-if="activeView === 'adjustments'">
           <section class="adjustment-types">
             <button type="button" @click="openAdjustment('调课申请')"><span class="teal">⇄</span><div><strong>调课申请</strong><small>调整教学周、日期或时段</small></div><i>→</i></button>
-            <button type="button" @click="openAdjustment('场地调整申请')"><span class="blue">⌖</span><div><strong>场地调整申请</strong><small>调整实验场次使用的实验室</small></div><i>→</i></button>
             <button type="button" @click="openAdjustment('代课申请')"><span class="purple">Ⅱ</span><div><strong>代课申请</strong><small>因特殊情况暂停实验教学</small></div><i>→</i></button>
           </section>
           <section class="teacher-panel adjustment-records" style="margin-bottom:18px">
@@ -904,6 +976,11 @@ async function submitRepairExtension() {
                 </tr>
                 </tbody>
               </table>
+              <div v-if="teacherAdjustTotal > TEACHER_ADJUST_PAGE_SIZE" class="pagination-bar">
+                <button type="button" :disabled="teacherAdjustPage === 0" @click="changeTeacherAdjustPage(-1)">‹ 上一页</button>
+                <span>第 {{ teacherAdjustPage + 1 }} / {{ Math.max(1, Math.ceil(teacherAdjustTotal / TEACHER_ADJUST_PAGE_SIZE)) }} 页 · 共 {{ teacherAdjustTotal }} 条</span>
+                <button type="button" :disabled="(teacherAdjustPage + 1) * TEACHER_ADJUST_PAGE_SIZE >= teacherAdjustTotal" @click="changeTeacherAdjustPage(1)">下一页 ›</button>
+              </div>
             </div>
           </section>
           <section v-if="substitutionTasks.length" class="teacher-panel adjustment-records" style="margin-bottom:18px">
@@ -929,11 +1006,12 @@ async function submitRepairExtension() {
             <div class="teacher-panel-title"><div><h3>代课审批记录</h3><p>其他教师提交的代课申请中您作为代课教师的记录</p></div></div>
             <div class="adjustment-table-wrap">
               <table class="adjustment-table">
-                <thead><tr><th>申请编号</th><th>实验项目</th><th>代课教师</th><th>申请日期</th><th>审批状态</th></tr></thead>
+                <thead><tr><th>申请编号</th><th>实验项目</th><th>上课时间</th><th>代课教师</th><th>申请日期</th><th>审批状态</th></tr></thead>
                 <tbody>
                 <tr v-for="rec in substitutionResults" :key="rec.id">
                   <td><b>{{ rec.id }}</b></td>
                   <td>{{ rec.courseName }}</td>
+                  <td>{{ rec.timeText || '—' }}</td>
                   <td>{{ rec.substituteTeacherName }}</td>
                   <td>{{ rec.date || '—' }}</td>
                   <td><i class="teacher-status" :class="{ normal: rec.status === 'EXECUTED', pending: rec.status === 'PENDING_REVIEW', rejected: rec.status === 'REJECTED' }">{{ rec.status === 'EXECUTED' ? '已通过' : rec.status === 'PENDING_REVIEW' ? '审核中' : rec.status === 'REJECTED' ? '已驳回' : rec.status }}</i></td>

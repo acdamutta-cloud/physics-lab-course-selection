@@ -580,3 +580,5 @@
   .teacher-adjustment-dialog .teacher-validation { margin-right: 14px; margin-left: 14px; }
 }
 .resource-action-tabs{display:flex;gap:6px;margin:0 0 16px;padding:4px;border-radius:8px;background:#f0f4f5}.resource-action-tabs button{flex:1;padding:9px;border:0;border-radius:6px;color:#71828d;background:transparent;font-size:10px;font-weight:600}.resource-action-tabs button.active{color:#fff;background:#287d82;box-shadow:0 3px 10px rgba(40,125,130,.18)}
+
+.pagination-bar{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:10px;padding:10px 0}.pagination-bar button{padding:6px 14px;border:1px solid #c7dcda;border-radius:6px;color:#2c7477;background:#f4faf9;font-size:9px;font-weight:600;cursor:pointer}.pagination-bar button:disabled{opacity:.4;cursor:not-allowed}.pagination-bar span{color:#7b8c94;font-size:9px}

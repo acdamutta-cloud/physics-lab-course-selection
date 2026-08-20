@@ -1590,3 +1590,109 @@ def test_project_change_without_locator_does_not_choose_arbitrary_required_proje
     assert "没有可以申请换组的项目" in result["message"]
     assert "2个是必做项目" in result["message"]
     assert "超声波声速测量" not in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_eligibility_blocks_when_selection_window_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import student_consultation_service as svc
+
+    target = SimpleNamespace(
+        id=uuid4(),
+        project_id=uuid4(),
+        project=SimpleNamespace(course_id=uuid4()),
+        status="OPEN",
+        selected_count=0,
+        capacity=30,
+        week_no=1,
+        day_of_week=1,
+        start_slot=1,
+        end_slot=4,
+    )
+    context = SimpleNamespace(
+        term=SimpleNamespace(id=uuid4()),
+        student=SimpleNamespace(academic_status="ACTIVE"),
+        schedule_status="PUBLISHED",
+        target=target,
+        plan_course=None,
+        bitmap=None,
+        records=[],
+        application_sessions=[],
+        application_project_ids=set(),
+    )
+    monkeypatch.setattr(svc, "_load_context", AsyncMock(return_value=context))
+    monkeypatch.setattr(
+        svc,
+        "resolve_window_gate",
+        AsyncMock(
+            return_value={
+                "open": False,
+                "withdraw_open": True,
+                "start": 1,
+                "end": 2,
+                "withdraw_end": 3,
+                "message": "选课已结束。",
+                "withdraw_message": "",
+            }
+        ),
+    )
+
+    result = await svc.check_selection_eligibility(
+        MagicMock(), student_id=uuid4(), session_id=target.id
+    )
+
+    assert any(
+        violation.code == "SELECTION_WINDOW_NOT_OPEN"
+        and violation.scope == "WINDOW"
+        for violation in result.violations
+    )
+
+
+@pytest.mark.asyncio
+async def test_eligibility_skips_window_when_check_window_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import student_consultation_service as svc
+
+    target = SimpleNamespace(
+        id=uuid4(),
+        project_id=uuid4(),
+        project=SimpleNamespace(course_id=uuid4()),
+        status="OPEN",
+        selected_count=0,
+        capacity=30,
+        week_no=1,
+        day_of_week=1,
+        start_slot=1,
+        end_slot=4,
+    )
+    context = SimpleNamespace(
+        term=SimpleNamespace(id=uuid4()),
+        student=SimpleNamespace(academic_status="ACTIVE"),
+        schedule_status="PUBLISHED",
+        target=target,
+        plan_course=None,
+        bitmap=None,
+        records=[],
+        application_sessions=[],
+        application_project_ids=set(),
+    )
+    monkeypatch.setattr(svc, "_load_context", AsyncMock(return_value=context))
+    gate = AsyncMock(
+        side_effect=AssertionError("窗口门控不应被调用（运行调整路径）")
+    )
+    monkeypatch.setattr(svc, "resolve_window_gate", gate)
+
+    result = await svc.check_selection_eligibility(
+        MagicMock(),
+        student_id=uuid4(),
+        session_id=target.id,
+        check_window=False,
+    )
+
+    assert not any(
+        violation.code == "SELECTION_WINDOW_NOT_OPEN"
+        for violation in result.violations
+    )
+    gate.assert_not_awaited()

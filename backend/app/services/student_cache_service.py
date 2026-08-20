@@ -70,6 +70,23 @@ async def refresh_experiment_views_after_commit(
     else:
         await invalidate_ai_context(student_id, term_id)
     await invalidate_selection_context(student_id, term_id)
+    # 准入上下文必须立即可用:提交成功即删除 context,而批量方案执行
+    # (execute_plan)会顺序连续处理多个场次;若重建放后台,下一个场次的
+    # LUA 预检会在重建完成前命中 SELECTION_CACHE_MISSING(-3),表现为
+    # "选课状态发生变化,请刷新后重试。"。这里同步重建准入 context,
+    # 后台 rebuild 只负责 dashboard/ai 视图。
+    try:
+        async with AsyncSessionFactory() as session:
+            await refresh_selection_context(
+                session, student_id=student_id, term_id=term_id
+            )
+    except Exception:
+        logger.warning(
+            "Selection context rebuild after commit failed student=%s term=%s",
+            student_id,
+            term_id,
+            exc_info=True,
+        )
     identity = (student_id, term_id)
     if identity in _PENDING_REFRESHES:
         _PENDING_REFRESHES[identity] = _PENDING_REFRESHES[identity] or dashboard
@@ -93,6 +110,59 @@ async def refresh_experiment_views_after_commit(
             _PENDING_REFRESHES.pop(identity, None)
 
     _start_background(rebuild())
+
+
+async def _unlink_batch(redis: object, keys: list[str]) -> int:
+    pipe = redis.pipeline(transaction=False)
+    for key in keys:
+        pipe.unlink(key)
+    results = await pipe.execute()
+    return sum(int(value) for value in results)
+
+
+async def invalidate_term_selection_caches(term_id: UUID) -> int:
+    """课表发布批量退选后,清理该学期全部学生的选课相关缓存。
+
+    发布新课表会把全学期学生的选课记录批量置为 WITHDRAWN(见
+    schedule_service.publish_selected_schedule)。若不清理 Redis,残留的
+    已选项目集合会在 TTL 内把学生挡在"同一实验项目只能选择一个场次"上。
+    缓存清理必须 fail-open:Redis 故障不能阻塞课表发布。
+    """
+
+    term = str(term_id)
+    patterns = [
+        f"selection:student-context:*:{term}:v1",
+        f"selection:selected-projects:*:{term}",
+        f"selection:applications:*:{term}",
+        f"selection:project:*:{term}:*",
+        f"student:dashboard:*:{term}:v2",
+        f"student:dashboard-static:*:{term}:v2",
+        f"student:dashboard-dynamic:*:{term}:v2",
+        f"student:dashboard-summary:*:{term}:v2",
+        f"student:timetable:*:{term}:v2",
+        f"ai:student-context:*:{term}:v2",
+    ]
+    redis = get_redis_client()
+    deleted = 0
+    try:
+        for pattern in patterns:
+            batch: list[str] = []
+            async for key in redis.scan_iter(match=pattern, count=500):
+                batch.append(key)
+                if len(batch) >= 500:
+                    deleted += await _unlink_batch(redis, batch)
+                    batch = []
+            if batch:
+                deleted += await _unlink_batch(redis, batch)
+    except Exception:  # noqa: BLE001 - cache cleanup must not block publishing
+        logger.warning(
+            "Term-wide selection cache cleanup failed term=%s", term, exc_info=True
+        )
+        return 0
+    logger.info(
+        "Term-wide selection cache cleanup deleted=%s term=%s", deleted, term
+    )
+    return deleted
 
 
 async def _profile(student: Student, user: UserAccount) -> UserProfile:

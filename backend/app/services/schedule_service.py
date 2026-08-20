@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -43,6 +44,8 @@ from app.services.course_availability_service import (
 )
 from app.services.resource_feasibility_service import get_project_lab_options
 from app.services.teacher_timetable_service import rebuild_teacher_timetable
+
+logger = logging.getLogger(__name__)
 
 
 class ScheduleServiceError(Exception):
@@ -816,6 +819,28 @@ async def publish_selected_schedule(
     except Exception:
         await session.rollback()
         raise
+
+    # 发布已提交,批量退选已生效:同步更新 Redis——
+    # 1) 清理该学期全部学生的选课相关缓存,避免残留的"已选项目集合"
+    #    在新课表下误挡学生选课;
+    # 2) 为新发布场次初始化 session meta 与库存键,学生无需等后端重启。
+    # 任一步失败都不回滚已生效的发布(fail-open)。
+    try:
+        from app.services.selection_service import warm_open_session_stocks
+        from app.services.student_cache_service import (
+            invalidate_term_selection_caches,
+        )
+
+        await invalidate_term_selection_caches(job.term_id)
+        await warm_open_session_stocks()
+    except Exception:  # noqa: BLE001 - published schedule stays valid
+        logger.warning(
+            "Post-publish cache sync failed job=%s term=%s",
+            job.id,
+            job.term_id,
+            exc_info=True,
+        )
+
     return await get_schedule_job(session, job.id)
 
 

@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.config import get_stream_writer
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,10 +30,14 @@ from app.models.scheduling import ExperimentSession, ScheduleVersion
 from app.schemas.student_consultation import (
     ConsultationCard,
     ConsultationMessage,
+    SelectionPreferences,
     StudentAgentPlan,
     weekday_name,
 )
+from app.services.selection_window_service import get_term_window
 from app.services.student_adjustment_service import get_adjustment_context
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts" / "student_advisor"
 PLANNER_PROMPT = PROMPT_DIR / "planner_v2.md"
@@ -82,6 +89,19 @@ def _message_role(message: ConsultationMessage | dict[str, object]) -> str:
     if isinstance(message, dict):
         return str(message.get("role", ""))
     return message.role
+
+
+# AI 回答里的"推荐理由/注意"段由后端生成、含"符合XX偏好"等字样；若原样
+# 进入下一轮 planner 的对话上下文，会被模型当作学生偏好来源，造成偏好漂移
+# （如历史里出现"早上、下午偏好"）。裁剪到该段之前，保留场次清单等中性内容。
+_PREFERENCE_POLLUTION_PATTERN = re.compile(r"(推荐理由|注意)[:：]")
+
+
+def _planner_message_content(message: ConsultationMessage | dict[str, object]) -> str:
+    content = _message_content(message)
+    if _message_role(message) == "assistant":
+        content = _PREFERENCE_POLLUTION_PATTERN.split(content, 1)[0]
+    return content
 
 
 async def normalize_request(
@@ -219,6 +239,12 @@ async def _build_base_context(state: StudentConsultationState) -> dict[str, obje
                 "laboratory_name": session_fact.get("laboratory_name"),
             }
         )
+    today = datetime.now(UTC).date()
+    if today < state["term"].start_date:
+        current_week = 0
+    else:
+        current_week = (today - state["term"].start_date).days // 7 + 1
+    window = await get_term_window(session, state["term"].id)
     base_context = {
         "student": {
             "display_name": student.name,
@@ -229,7 +255,23 @@ async def _build_base_context(state: StudentConsultationState) -> dict[str, obje
         "term": {
             "academic_year": state["term"].academic_year,
             "semester_no": state["term"].semester_no,
+            "current_week": current_week,
+            "total_weeks": state["term"].total_weeks,
         },
+        "selection_window": (
+            {
+                "start_at": window.start_at.isoformat(),
+                "end_at": window.end_at.isoformat(),
+                "withdraw_end_at": (
+                    window.withdraw_end_at.isoformat()
+                    if window.withdraw_end_at
+                    else None
+                ),
+                "status": window.status,
+            }
+            if window is not None
+            else None
+        ),
         "training_plan_summary": {
             "plan_code": plan.get("plan_code") if isinstance(plan, dict) else None,
             "courses": course_summaries,
@@ -242,7 +284,7 @@ async def _build_base_context(state: StudentConsultationState) -> dict[str, obje
 
 def _planner_input(state: StudentConsultationState) -> list[object]:
     conversation = [
-        {"role": _message_role(item), "content": _message_content(item)}
+        {"role": _message_role(item), "content": _planner_message_content(item)}
         for item in state.get("conversation_context", [])
     ]
     page = (
@@ -322,7 +364,7 @@ async def plan_with_llm(
             "tool_requests": plan.tool_requests,
             "repaired_plan_attempted": False,
         }
-    except Exception as first_error:  # noqa: BLE001 - provider/schema failures vary
+    except Exception as first_error:
         provider_message = _provider_failure_message(first_error)
         if provider_message:
             logger.warning(
@@ -336,11 +378,22 @@ async def plan_with_llm(
                 "repaired_plan_attempted": False,
             }
         try:
+            if isinstance(first_error, ValidationError):
+                error_detail = json.dumps(
+                    first_error.errors(), ensure_ascii=False, default=str
+                )
+            else:
+                error_detail = str(first_error)
+            logger.warning(
+                "Student AI planner output invalid, repairing: %s",
+                error_detail,
+                exc_info=True,
+            )
             repair_messages = [
                 *messages,
                 HumanMessage(
                     content="上一次输出无法解析。请只输出一个符合Schema的JSON对象，"
-                    f"不要解释。校验错误：{type(first_error).__name__}"
+                    f"不要解释。校验错误：{error_detail}"
                 ),
             ]
             response = await model.ainvoke(repair_messages)
@@ -352,7 +405,7 @@ async def plan_with_llm(
                 "tool_requests": plan.tool_requests,
                 "repaired_plan_attempted": True,
             }
-        except Exception as repair_error:  # noqa: BLE001 - provider/schema failures vary
+        except Exception as repair_error:
             provider_message = _provider_failure_message(repair_error)
             if provider_message:
                 logger.warning(
@@ -372,6 +425,51 @@ async def plan_with_llm(
             }
 
 
+def _merge_tool_preference_arguments(plan: StudentAgentPlan) -> StudentAgentPlan:
+    """模型有时会把偏好写进 recommend_selection_plans 的参数而非顶层 preferences，
+    导致教师/模块偏好在后端评分时丢失。此处合并兜底：顶层已填字段优先，
+    未填字段用工具参数补齐。
+
+    lookup_student_rules 同理：模型偶尔把 rule_topics 写进 arguments 而非顶层
+    rule_topics 字段，会导致安全校验拒绝计划（"业务规则咨询必须提供受控规则主题"），
+    并让执行阶段拿不到主题。此处归一化兜底。"""
+    for request in plan.tool_requests:
+        if request.name == "lookup_student_rules" and not plan.rule_topics:
+            arg_topics = request.arguments.get("rule_topics")
+            if isinstance(arg_topics, list) and arg_topics:
+                valid = [t for t in arg_topics if isinstance(t, str)]
+                if valid:
+                    plan = plan.model_copy(update={"rule_topics": valid})
+        if request.name != "recommend_selection_plans":
+            continue
+        raw = request.arguments.get("preference")
+        if isinstance(raw, str):
+            raw = json.loads(raw) if raw.strip() else None
+        if not isinstance(raw, dict):
+            continue
+        try:
+            arg_preferences = SelectionPreferences.model_validate(raw)
+        except ValidationError:
+            continue
+        updates: dict[str, object] = {}
+        for field in SelectionPreferences.model_fields:
+            current_value = getattr(plan.preferences, field)
+            fallback_value = getattr(arg_preferences, field)
+            if (
+                current_value in (None, False, [])
+                and fallback_value not in (None, False, [])
+            ):
+                updates[field] = fallback_value
+        if not updates:
+            continue
+        plan = plan.model_copy(
+            update={
+                "preferences": plan.preferences.model_copy(update=updates)
+            }
+        )
+    return plan
+
+
 async def validate_plan(
     state: StudentConsultationState,
 ) -> dict[str, object]:
@@ -380,6 +478,7 @@ async def validate_plan(
     plan = state.get("plan")
     if plan is None:
         return {"model_error": "模型没有生成执行计划。"}
+    plan = _merge_tool_preference_arguments(plan)
     reference = plan.entity_reference
     if (
         plan.operation_stage == "PLAN_DRAFT"
@@ -400,9 +499,13 @@ async def validate_plan(
     names = {request.name for request in plan.tool_requests}
     action_tools = {"preview_deselection", "prepare_adjustment_entry"}
     allowed_for_intent = REQUIRED_TOOL_BY_INTENT.get(plan.intent, set())
-    if not plan.needs_clarification and plan.intent in REQUIRED_TOOL_BY_INTENT and not names.intersection(
-        allowed_for_intent
+    if (
+        not plan.needs_clarification
+        and plan.intent in REQUIRED_TOOL_BY_INTENT
+        and not names.intersection(allowed_for_intent)
+        and plan.term_fact_query == "NONE"
     ):
+        # 学期事实(周次/选课窗口)由上下文确定性回答,无需工具调用。
         errors.append("当前意图缺少必须的只读工具调用。")
     if plan.intent == "UNKNOWN" and names:
         errors.append("UNKNOWN意图不应调用业务工具。")
@@ -418,6 +521,14 @@ async def validate_plan(
         errors.append("推荐方案草稿不得调用已选课退选或调整工具。")
     if plan.request_mode == "SAFETY_REFUSAL" and names:
         errors.append("安全拒绝场景不得调用业务工具。")
+    if plan.term_fact_query != "NONE":
+        # 学期事实(周次/选课窗口)由上下文确定性回答,不允许模型附加工具或规则主题。
+        if names:
+            errors.append("学期事实查询不得调用业务工具。")
+        if plan.rule_topics:
+            errors.append("学期事实查询不应携带公共规则主题。")
+        if plan.intent != "BASIC_INFO_QUERY":
+            errors.append("学期事实查询的意图应为基本信息查询。")
     if plan.intent == "QUERY_CURRENT_SELECTION" and names.difference(
         {"get_training_plan_context"}
     ):
@@ -444,6 +555,11 @@ async def validate_plan(
         if forbidden:
             errors.append("工具参数包含模型无权提供的字段。")
     if errors:
+        logger.warning(
+            "Planner plan rejected errors=%s plan=%s",
+            errors,
+            plan.model_dump(mode="json"),
+        )
         return {
             "plan_validation_errors": errors,
             "model_error": "模型执行计划未通过安全校验。",
@@ -769,6 +885,15 @@ async def build_grounding_bundle(
         immutable_facts["base_context_selection"] = state.get(
             "resolved_entities", {}
         )
+    base = state.get("base_context") or {}
+    if isinstance(base, dict):
+        # 周次与选课窗口是可信上下文事实,随 grounding bundle 交给 composer,
+        # 使"现在是第几周""选课截止时间"类问题无需工具调用也能有据回答。
+        immutable_facts["term_schedule"] = {
+            "current_week": base.get("term", {}).get("current_week"),
+            "total_weeks": base.get("term", {}).get("total_weeks"),
+            "selection_window": base.get("selection_window"),
+        }
     allowed_recommendations: list[object] = []
     unknowns: list[str] = []
     for result in state.get("tool_results", []):
@@ -791,6 +916,9 @@ async def build_grounding_bundle(
 def _deterministic_answer(state: StudentConsultationState) -> str:
     if state.get("unknowns"):
         return "；".join(state["unknowns"])
+    plan = state.get("plan")
+    if plan is not None and plan.term_fact_query != "NONE":
+        return _format_term_fact_answer(state, plan.term_fact_query)
     if state.get("intent") == "QUERY_CURRENT_SELECTION":
         return _format_current_selection_answer(state.get("resolved_entities", {}))
     for result in state.get("tool_results", []):
@@ -846,6 +974,56 @@ def _deterministic_answer(state: StudentConsultationState) -> str:
         if result.get("name") == "prepare_adjustment_entry":
             return str(data.get("message") or "请核对下方匹配到的原实验。")
     return "当前规则库中未找到相关说明。"
+
+
+def _format_term_fact_answer(
+    state: StudentConsultationState, kind: str
+) -> str:
+    """学期事实(周次/选课窗口)的确定性回答,不经过 LLM。
+
+    数据来自 base_context(Redis 缓存 30 分钟),窗口为低频配置,
+    滞后窗口可接受;时间统一转北京时间呈现。
+    """
+
+    base = state.get("base_context") or {}
+    term = base.get("term") or {}
+    if kind == "CURRENT_WEEK":
+        current_week = term.get("current_week")
+        total_weeks = term.get("total_weeks")
+        if current_week is None or total_weeks is None:
+            return "当前学期信息尚未就绪，请稍后再试。"
+        return f"当前是第{current_week}教学周（本学期共{total_weeks}周）。"
+
+    window = base.get("selection_window")
+    if not isinstance(window, dict) or not window.get("start_at"):
+        return "当前尚未配置选课窗口，暂时无法选课。"
+
+    def _beijing(value: str) -> str:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(SHANGHAI).strftime("%m月%d日 %H:%M")
+
+    start_at = _beijing(window["start_at"])
+    end_at = _beijing(window["end_at"])
+    withdraw_raw = window.get("withdraw_end_at")
+    withdraw_end = _beijing(withdraw_raw) if withdraw_raw else None
+    now = datetime.now(SHANGHAI)
+    if window.get("start_at") and now < datetime.fromisoformat(str(window["start_at"])):
+        state_label = "选课尚未开始"
+    elif window.get("end_at") and now <= datetime.fromisoformat(str(window["end_at"])):
+        state_label = "当前正在选课开放时间内"
+    elif withdraw_raw and now <= datetime.fromisoformat(str(withdraw_raw)):
+        state_label = "选课已截止，但仍可退选"
+    else:
+        state_label = "选课与退选均已结束"
+    parts = [
+        f"选课开放时间：{start_at} 至 {end_at}。",
+    ]
+    if withdraw_end:
+        parts.append(f"退选截止时间：{withdraw_end}。")
+    parts.append(f"当前状态：{state_label}。")
+    return "".join(parts)
 
 
 def _format_remaining_projects_answer(data: dict[str, object]) -> str:
@@ -1041,7 +1219,11 @@ async def compose_clarification(
     answer = (
         state.get("clarification_question")
         or (plan.clarification_question if plan else None)
-        or "请补充具体课程、项目或场次信息。"
+        or (
+            "未能识别到您的问题，请您重新组织语言。"
+            if plan is not None and plan.intent == "UNKNOWN"
+            else "请补充具体课程、项目或场次信息。"
+        )
     )
     _emit("delta", {"text": answer})
     return {"answer_buffer": answer, "answer": answer}
@@ -1134,6 +1316,10 @@ async def compose_answer_stream(
         or any(
             result.get("name") == "prepare_adjustment_entry"
             for result in state.get("tool_results", [])
+        )
+        or (
+            state.get("plan") is not None
+            and state["plan"].term_fact_query != "NONE"
         )
     ):
         # Exact schedule facts are rendered by the backend. The frontend still

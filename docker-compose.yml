@@ -1,0 +1,101 @@
+# 生产/演示部署编排:postgres + redis + app(后端托管前端)
+# 与 backend/docker-compose.yml(仅开发基础设施)相互独立。
+#
+# 配置复用 backend/.env(通过 env_file 注入,无需在根目录新建 .env)。
+# 注意:APP_ENV=production 要求 backend/.env 中存在 JWT_SECRET_KEY,
+# 若你的 .env 没有,请追加一行:JWT_SECRET_KEY=<随机串>
+# (生成命令:python -c "import secrets; print(secrets.token_urlsafe(48))")
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: physics-lab-postgres
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      # POSTGRES_PASSWORD 由 env_file(backend/.env)注入,不要在此重复声明
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-physics_lab}
+      TZ: Asia/Shanghai
+    volumes:
+      - physics_lab_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - physics_lab_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: physics-lab-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - physics_lab_redis_data:/data
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - physics_lab_network
+
+  app:
+    build: .
+    container_name: physics-lab-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: ./backend/.env
+    environment:
+      # 以下显式值优先于 env_file,强制容器内地址与模型默认值
+      APP_ENV: production
+      TZ: Asia/Shanghai
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-physics_lab}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      # 默认 Qwen3-14B(dashscope);如需换 DeepSeek,改这里为 deepseek
+      MODEL_PROVIDER: dashscope
+    command: sh -c "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status==200 else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    networks:
+      - physics_lab_network
+
+volumes:
+  physics_lab_postgres_data:
+  physics_lab_redis_data:
+
+networks:
+  physics_lab_network:
+    driver: bridge

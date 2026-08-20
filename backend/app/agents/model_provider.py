@@ -1,3 +1,4 @@
+import httpx
 from langchain_openai import ChatOpenAI
 
 from app.core.config.settings import get_settings
@@ -51,6 +52,11 @@ def get_chat_model() -> ChatOpenAI:
         "max_tokens": settings.deepseek_max_tokens,
         "timeout": settings.deepseek_timeout_seconds,
         "max_retries": settings.deepseek_max_retries,
+        # 忽略环境代理(HTTP_PROXY 等):代理不可达会导致模型调用整体失败。
+        # langchain-openai 1.1.x 中 http_client 供同步客户端、http_async_client
+        # 供异步客户端使用,两者都需显式传入。
+        "http_client": httpx.Client(trust_env=False),
+        "http_async_client": httpx.AsyncClient(trust_env=False),
     }
     if extra_body is not None:
         model_options["extra_body"] = extra_body

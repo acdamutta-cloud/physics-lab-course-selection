@@ -70,3 +70,16 @@ backend/reports/
 .agents/
 .DS_Store
 Thumbs.db
+
+# =========================
+# =========================
+# 非代码文档（PRD/使用指南/技术文档等）不入库
+# =========================
+/【V1.*
+/项目*
+*.xlsx
+
+/PRD模板/
+
+backend/token.txt
+backend/token.json

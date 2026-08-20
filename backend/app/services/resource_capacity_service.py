@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -174,3 +177,66 @@ def relocation_requirement(selected_count: int, effective_capacity: int) -> dict
         "retained_count": selected_count - required,
         "required_relocation_count": required,
     }
+
+
+# resource_impact 结果缓存：全量影响计算扫描数千场次（单次 0.3-0.9s），
+# 列表页与审核/生成方案接口会反复调用，用短 TTL 缓存 + 写操作显式失效。
+# key 带 issue.status——状态流转（审核/结案）自动换 key 失效。
+# variant 区分 full（含 affected_sessions 明细，供生成方案接口）与
+# lite（仅统计，供列表页，避免 2000+ 场次明细被序列化进响应）。
+_IMPACT_CACHE_TTL_SECONDS = 120
+_impact_logger = logging.getLogger(__name__)
+
+
+def _impact_cache_key(issue_id: UUID, status: str, variant: str = "full") -> str:
+    return f"resource-impact:{issue_id}:{status}:{variant}"
+
+
+async def get_cached_resource_impact(
+    issue_id: UUID, status: str, variant: str = "full"
+) -> dict[str, Any] | None:
+    """Return cached resource_impact result; None on miss or Redis failure."""
+    try:
+        from app.db.redis_client import get_redis_client
+
+        raw = await get_redis_client().get(_impact_cache_key(issue_id, status, variant))
+        if raw is None:
+            return None
+        return json.loads(raw)
+    except Exception:
+        _impact_logger.debug("resource_impact cache read failed", exc_info=True)
+        return None
+
+
+async def cache_resource_impact(
+    issue_id: UUID, status: str, impact: dict[str, Any], variant: str = "full"
+) -> None:
+    """Store resource_impact result; Redis failure degrades gracefully."""
+    try:
+        from app.db.redis_client import get_redis_client
+
+        await get_redis_client().setex(
+            _impact_cache_key(issue_id, status, variant),
+            _IMPACT_CACHE_TTL_SECONDS,
+            json.dumps(impact, ensure_ascii=False),
+        )
+    except Exception:
+        _impact_logger.debug("resource_impact cache write failed", exc_info=True)
+
+
+async def invalidate_resource_impact_cache(
+    issue_id: UUID, status: str
+) -> None:
+    """Drop cached impact after a write that changes capacity/shortage.
+
+    Both variants are dropped: a write that changes selected_count or
+    capacity invalidates the full detail and the list-page stats alike.
+    """
+    try:
+        from app.db.redis_client import get_redis_client
+
+        redis_client = get_redis_client()
+        for variant in ("full", "lite"):
+            await redis_client.delete(_impact_cache_key(issue_id, status, variant))
+    except Exception:
+        _impact_logger.debug("resource_impact cache invalidate failed", exc_info=True)
