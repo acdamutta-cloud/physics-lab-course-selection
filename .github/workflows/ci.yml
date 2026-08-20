@@ -108,7 +108,9 @@ jobs:
         run: docker compose exec -T app python -m scripts.verify_operation_guide_search
       - name: Show service logs on failure
         if: failure()
-        run: docker compose logs --tail 200
+        run: |
+          docker compose ps
+          docker compose logs --no-color --tail 120 app
       - name: Remove isolated CI services and volumes
         if: always()
         run: docker compose down -v
